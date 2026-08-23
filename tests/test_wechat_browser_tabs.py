@@ -103,36 +103,28 @@ class WechatBrowserWindowEnumerationTests(unittest.TestCase):
 
         self.assertFalse(adapter._wait_until_document_title_changes(selected))
 
-    def test_close_falls_back_to_browser_back_when_ctrl_w_does_not_return(self) -> None:
-        """Ctrl+W 无效时应使用 Alt+Left 返回公众号主页。"""
-        selected = BrowserTabInfo(
-            tab_id="document:853206",
-            owner_handle=853206,
-            title="生猪盘面小调研",
-            rect=(100, 100, 1200, 900),
-            is_active=True,
-        )
-        returned = False
-        actions: list[str] = []
+    def test_keyboard_activation_preserves_existing_document_focus(self) -> None:
+        """窗口已在前台时不能用顶层 SetFocus 覆盖文章 Document 焦点。"""
+        class User32:
+            def __init__(self) -> None:
+                self.focused: list[int] = []
 
-        def return_to_home(_handle: int) -> None:
-            nonlocal returned
-            actions.append("back")
-            returned = True
+            @staticmethod
+            def GetForegroundWindow() -> int:
+                return 853206
 
-        adapter = browser_tabs.UiaWechatBrowserTabAdapter(
-            enumerate_windows=lambda: [make_window()],
-            document_keyboard_closer=lambda _handle: actions.append("ctrl-w"),
-            document_page_returner=return_to_home,
-            document_return_timeout_seconds=0.1,
-            monotonic=iter((0.0, 1.0, 2.0)).__next__,
+            def SetFocus(self, handle: int) -> None:
+                self.focused.append(handle)
+
+        user32 = User32()
+
+        browser_tabs._activate_keyboard_target(
+            user32,
+            853206,
             sleep=lambda _seconds: None,
         )
-        adapter.active_tab = lambda: None if returned else selected
 
-        adapter.close_tab(selected, home_window_handle=853206)
-
-        self.assertEqual(actions, ["ctrl-w", "back"])
+        self.assertEqual(user32.focused, [])
 
 
 if __name__ == "__main__":

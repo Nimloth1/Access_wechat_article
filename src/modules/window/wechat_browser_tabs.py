@@ -27,8 +27,6 @@ from src.modules.window.window_models import BrowserTabInfo
 WM_KEYDOWN = 0x0100
 WM_KEYUP = 0x0101
 VK_CONTROL = 0x11
-VK_MENU = 0x12
-VK_LEFT = 0x25
 VK_W = 0x57
 INPUT_KEYBOARD = 1
 KEYEVENTF_KEYUP = 0x0002
@@ -303,9 +301,7 @@ class UiaWechatBrowserTabAdapter:
         self._max_depth = max(1, int(max_depth))
         self._max_nodes = max(1, int(max_nodes_per_window))
         self._enumerate_windows = enumerate_windows
-        self._document_page_returner = (
-            document_page_returner or active_document_closer or _post_alt_left
-        )
+        self._document_page_returner = document_page_returner or active_document_closer
         self._document_keyboard_closer = document_keyboard_closer or _post_ctrl_w
         self._document_return_timeout_seconds = max(0.1, float(document_return_timeout_seconds))
         self._monotonic = monotonic
@@ -370,10 +366,8 @@ class UiaWechatBrowserTabAdapter:
         _activate_tab_control(selected.control)
         self._document_keyboard_closer(selected.owner_handle)
         if selected.tab_id.startswith("document:"):
-            returned = self._wait_until_document_title_changes(selected)
-            if not returned:
-                self._document_page_returner(selected.owner_handle)
-                self._wait_until_document_title_changes(selected)
+            if not self._wait_until_document_title_changes(selected):
+                raise RuntimeError("Ctrl+W 已发送，但文章标签仍处于活动状态")
         return
 
     def _require_close_owner_window(self, owner_handle: int) -> Any:
@@ -712,11 +706,6 @@ def _post_ctrl_w(handle: int) -> None:
     _send_ctrl_w_to_foreground(handle)
 
 
-def _post_alt_left(handle: int) -> None:
-    """向微信内置浏览器发送 Alt+Left，返回公众号主页。"""
-    _send_keyboard_chord_to_foreground(handle, VK_MENU, VK_LEFT)
-
-
 def _send_ctrl_w_to_foreground(
     handle: int,
     *,
@@ -742,33 +731,6 @@ def _send_ctrl_w_to_foreground(
         raise RuntimeError(
             "发送 Ctrl+W 真实键盘输入失败："
             f"SendInput={sent}/{len(inputs)}; GetLastError={last_error}"
-        )
-
-
-def _send_keyboard_chord_to_foreground(
-    handle: int,
-    modifier: int,
-    key: int,
-    *,
-    user32: Any | None = None,
-    sleep: Callable[[float], None] = time.sleep,
-) -> None:
-    """激活目标窗口并发送一个两键快捷键。"""
-    if platform.system() != "Windows":
-        raise OSError("键盘快捷键仅支持 Windows")
-    hwnd = int(handle or 0)
-    if hwnd <= 0:
-        raise ValueError("目标窗口句柄无效")
-    user32 = user32 or ctypes.windll.user32
-    _activate_keyboard_target(user32, hwnd, sleep=sleep)
-    if not _foreground_belongs_to_handle(user32, hwnd):
-        raise RuntimeError("无法激活微信文章窗口，快捷键未发送")
-    inputs = _keyboard_chord_inputs(modifier, key)
-    sent = int(user32.SendInput(len(inputs), inputs, ctypes.sizeof(_INPUT)) or 0)
-    if sent != len(inputs):
-        raise RuntimeError(
-            f"快捷键发送不完整：SendInput={sent}/{len(inputs)}; "
-            f"GetLastError={_last_windows_error(user32)}"
         )
 
 
@@ -802,6 +764,10 @@ def _activate_keyboard_target(
     kernel32: Any | None = None,
     sleep: Callable[[float], None],
 ) -> None:
+    # UIA 已经把焦点放到文章 Document 时，不能再 SetFocus 到顶层 HWND，
+    # 否则 Ctrl+W 会失去 Chromium 标签页这个键盘目标。
+    if _foreground_belongs_to_handle(user32, handle):
+        return
     # Ctrl+W 是前台快捷键，必须先让微信内置浏览器成为键盘输入目标。
     try:
         user32.ShowWindow(int(handle), SW_RESTORE)
