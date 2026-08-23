@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 import importlib.metadata
 import json
+import mimetypes
 from pathlib import Path
 import platform
 import re
@@ -1189,6 +1190,13 @@ def ensure_dev_server_port_available(
 
 def mount_webview_static_files(app: FastAPI, webview_dir: Path = WEBVIEW_DIR) -> None:
     """让开发后端也能直接返回已经构建好的 Vue 静态页面。"""
+    mimetypes.add_type("application/javascript", ".js")
+    mimetypes.add_type("application/javascript", ".mjs")
+    mimetypes.add_type("text/css", ".css")
+    mimetypes.add_type("font/woff", ".woff")
+    mimetypes.add_type("font/woff2", ".woff2")
+    mimetypes.add_type("image/svg+xml", ".svg")
+
     index_html = webview_dir / "index.html"
     if not index_html.exists():
         return
