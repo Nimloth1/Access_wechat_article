@@ -403,7 +403,10 @@ class UiaWechatBrowserTabAdapter:
                 return
             now = self._monotonic()
             if now >= deadline:
-                raise RuntimeError("文章页返回后标题未变化，拒绝报告已关闭")
+                # 部分微信版本在 Ctrl+W 返回公众号主页后不会及时刷新
+                # DocumentControl.Name。关闭命令已经成功派发时，不能仅凭这个
+                # 缓存标题丢弃已捕获的文章内容。
+                return
             self._sleep(min(0.05, max(0.0, deadline - now)))
 
     def _wechat_chrome_windows(self) -> list[Any]:

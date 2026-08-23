@@ -4,7 +4,7 @@ import unittest
 from unittest.mock import patch
 
 from src.modules.window import wechat_browser_tabs as browser_tabs
-from src.modules.window.window_models import WindowInfo
+from src.modules.window.window_models import BrowserTabInfo, WindowInfo
 
 
 def make_window(
@@ -82,6 +82,26 @@ class WechatBrowserWindowEnumerationTests(unittest.TestCase):
             adapter._enumerate_windows,
             browser_tabs.enumerate_wechat_chrome_windows,
         )
+
+    def test_stale_document_title_does_not_discard_captured_article(self) -> None:
+        """微信返回主页后标题可能滞留，不能把它当成关闭失败。"""
+        times = iter((0.0, 1.0))
+        selected = BrowserTabInfo(
+            tab_id="document:853206",
+            owner_handle=853206,
+            title="生猪盘面小调研",
+            rect=(100, 100, 1200, 900),
+            is_active=True,
+        )
+        adapter = browser_tabs.UiaWechatBrowserTabAdapter(
+            enumerate_windows=lambda: [],
+            document_return_timeout_seconds=0.1,
+            monotonic=lambda: next(times),
+            sleep=lambda _seconds: None,
+        )
+        adapter.active_tab = lambda: selected
+
+        adapter._wait_until_document_title_changes(selected)
 
 
 if __name__ == "__main__":
