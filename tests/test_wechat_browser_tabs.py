@@ -126,6 +126,20 @@ class WechatBrowserWindowEnumerationTests(unittest.TestCase):
 
         self.assertEqual(user32.focused, [])
 
+    def test_ctrl_w_is_sent_directly_to_article_document_control(self) -> None:
+        """优先向文章控件发键，避免快捷键落到微信顶层窗口。"""
+        class DocumentControl:
+            def __init__(self) -> None:
+                self.keys: list[str] = []
+
+            def SendKeys(self, keys: str) -> None:
+                self.keys.append(keys)
+
+        control = DocumentControl()
+
+        self.assertTrue(browser_tabs._send_ctrl_w_to_control(control))
+        self.assertEqual(control.keys, ["{Ctrl}w"])
+
 
 if __name__ == "__main__":
     unittest.main()

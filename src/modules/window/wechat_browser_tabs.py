@@ -364,7 +364,8 @@ class UiaWechatBrowserTabAdapter:
         # 关闭文章标签统一发给微信内置浏览器窗口，不再调用标签关闭按钮 Invoke、
         # UIA Click、中键点击或 WM_CLOSE，避免误触其它应用或关闭主页窗口。
         _activate_tab_control(selected.control)
-        self._document_keyboard_closer(selected.owner_handle)
+        if not _send_ctrl_w_to_control(selected.control):
+            self._document_keyboard_closer(selected.owner_handle)
         if selected.tab_id.startswith("document:"):
             if not self._wait_until_document_title_changes(selected):
                 raise RuntimeError("Ctrl+W 已发送，但文章标签仍处于活动状态")
@@ -704,6 +705,20 @@ class _INPUT(ctypes.Structure):
 def _post_ctrl_w(handle: int) -> None:
     """兼容旧调用名：关闭文章页时发送真实 Ctrl+W 键盘输入。"""
     _send_ctrl_w_to_foreground(handle)
+
+
+def _send_ctrl_w_to_control(control: Any) -> bool:
+    """直接向当前文章 DocumentControl 发送 Ctrl+W。"""
+    if control is None:
+        return False
+    send_keys = getattr(control, "SendKeys", None)
+    if not callable(send_keys):
+        return False
+    try:
+        send_keys("{Ctrl}w")
+        return True
+    except Exception:
+        return False
 
 
 def _send_ctrl_w_to_foreground(
