@@ -363,9 +363,14 @@ class UiaWechatBrowserTabAdapter:
 
         # 关闭文章标签统一发给微信内置浏览器窗口，不再调用标签关闭按钮 Invoke、
         # UIA Click、中键点击或 WM_CLOSE，避免误触其它应用或关闭主页窗口。
-        _activate_tab_control(selected.control)
-        if not _send_ctrl_w_to_control(selected.control):
-            self._document_keyboard_closer(selected.owner_handle)
+        closed_with_button = (
+            selected.tab_id.startswith("document:")
+            and _invoke_direct_close_button(selected.control)
+        )
+        if not closed_with_button:
+            _activate_tab_control(selected.control)
+            if not _send_ctrl_w_to_control(selected.control):
+                self._document_keyboard_closer(selected.owner_handle)
         if selected.tab_id.startswith("document:"):
             if not self._wait_until_document_title_changes(selected):
                 raise RuntimeError("Ctrl+W 已发送，但文章标签仍处于活动状态")
@@ -652,6 +657,32 @@ def _control_has_direct_title_and_close(
         for item in children
     }
     return expected in direct_names and any(_is_close_button_control(item) for item in children)
+
+
+def _invoke_direct_close_button(tab_row: Any) -> bool:
+    """只调用已匹配文章标题的标签行中的关闭按钮，避免误关顶层窗口。"""
+    if tab_row is None:
+        return False
+    try:
+        children = list(tab_row.GetChildren() or [])
+    except Exception:
+        return False
+    close_button = next(
+        (item for item in children if _is_close_button_control(item)),
+        None,
+    )
+    if close_button is None:
+        return False
+    for method_name in ("Invoke", "Click"):
+        method = getattr(close_button, method_name, None)
+        if not callable(method):
+            continue
+        try:
+            method()
+            return True
+        except Exception:
+            continue
+    return False
 
 
 _ULONG_PTR = ctypes.c_ulonglong

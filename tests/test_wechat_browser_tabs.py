@@ -140,6 +140,42 @@ class WechatBrowserWindowEnumerationTests(unittest.TestCase):
         self.assertTrue(browser_tabs._send_ctrl_w_to_control(control))
         self.assertEqual(control.keys, ["{Ctrl}w"])
 
+    def test_article_tab_close_invokes_only_direct_close_button(self) -> None:
+        """只允许调用已匹配文章标签行的直接子级关闭按钮。"""
+        class Control:
+            def __init__(self, name: str, control_type: str = "TextControl") -> None:
+                self.Name = name
+                self.ControlTypeName = control_type
+                self.invoked = 0
+                self.children: list[Control] = []
+
+            def GetChildren(self) -> list[Control]:
+                return self.children
+
+            def Invoke(self) -> None:
+                self.invoked += 1
+
+        title = Control("降波了")
+        tab_close = Control("关闭", "ButtonControl")
+        window_close = Control("关闭", "ButtonControl")
+        tab_row = Control("")
+        tab_row.children = [title, tab_close]
+        window_root = Control("")
+        window_root.children = [window_close, tab_row]
+
+        self.assertTrue(browser_tabs._invoke_direct_close_button(tab_row))
+        self.assertEqual(tab_close.invoked, 1)
+        self.assertEqual(window_close.invoked, 0)
+
+    def test_article_tab_close_falls_back_when_direct_button_is_unavailable(self) -> None:
+        """标签行中没有关闭按钮时保留快捷键兜底路径。"""
+        class TabRow:
+            @staticmethod
+            def GetChildren() -> list[object]:
+                return []
+
+        self.assertFalse(browser_tabs._invoke_direct_close_button(TabRow()))
+
 
 if __name__ == "__main__":
     unittest.main()
