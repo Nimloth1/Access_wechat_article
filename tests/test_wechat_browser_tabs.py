@@ -103,6 +103,34 @@ class WechatBrowserWindowEnumerationTests(unittest.TestCase):
 
         self.assertFalse(adapter._wait_until_document_title_changes(selected))
 
+    def test_transient_document_title_change_does_not_confirm_close(self) -> None:
+        """标题短暂变化后恢复时不能把仍打开的文章误判为已关闭。"""
+        times = iter((0.0, 0.01, 0.02, 1.0))
+        selected = BrowserTabInfo(
+            tab_id="document:853206",
+            owner_handle=853206,
+            title="降波了",
+            rect=(100, 100, 1200, 900),
+            is_active=True,
+        )
+        temporary = BrowserTabInfo(
+            tab_id=selected.tab_id,
+            owner_handle=selected.owner_handle,
+            title="加载中",
+            rect=selected.rect,
+            is_active=True,
+        )
+        states = iter((temporary, selected, selected, selected))
+        adapter = browser_tabs.UiaWechatBrowserTabAdapter(
+            enumerate_windows=lambda: [],
+            document_return_timeout_seconds=0.1,
+            monotonic=lambda: next(times),
+            sleep=lambda _seconds: None,
+        )
+        adapter.active_tab = lambda: next(states)
+
+        self.assertFalse(adapter._wait_until_document_title_changes(selected))
+
     def test_keyboard_activation_preserves_existing_document_focus(self) -> None:
         """窗口已在前台时不能用顶层 SetFocus 覆盖文章 Document 焦点。"""
         class User32:
@@ -152,7 +180,7 @@ class WechatBrowserWindowEnumerationTests(unittest.TestCase):
             def GetChildren(self) -> list[Control]:
                 return self.children
 
-            def Invoke(self) -> None:
+            def Click(self) -> None:
                 self.invoked += 1
 
         title = Control("降波了")

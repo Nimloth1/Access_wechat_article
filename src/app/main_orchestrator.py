@@ -133,7 +133,10 @@ def create_capture_task_manager(
         comment_job_manager_factory=lambda: CommentJobManager(
             write_coordinator=write_coordinator,
             max_concurrent_processes=config.comment.max_concurrent_processes,
-            ready_timeout_seconds=min(5.0, config.comment.request_timeout_seconds),
+            ready_timeout_seconds=max(
+                10.0,
+                min(30.0, config.comment.request_timeout_seconds),
+            ),
             result_timeout_seconds=_comment_result_timeout_seconds(config),
         ),
         collected_lookup=CollectedArticleLookupService(),

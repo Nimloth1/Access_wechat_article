@@ -361,19 +361,23 @@ class UiaWechatBrowserTabAdapter:
         if not selected.is_active and not selected.tab_id.startswith("window:"):
             raise RuntimeError("拒绝关闭非活动文章标签，避免 Ctrl+W 关闭错误标签")
 
-        # 关闭文章标签统一发给微信内置浏览器窗口，不再调用标签关闭按钮 Invoke、
-        # UIA Click、中键点击或 WM_CLOSE，避免误触其它应用或关闭主页窗口。
-        closed_with_button = (
+        # 仅点击已匹配文章标题的标签行内关闭按钮；窗口级快捷键只作兜底，
+        # 不使用顶层关闭按钮、中键点击或 WM_CLOSE，避免关闭主页窗口。
+        close_button_dispatched = (
             selected.tab_id.startswith("document:")
             and _invoke_direct_close_button(selected.control)
         )
-        if not closed_with_button:
+        if selected.tab_id.startswith("document:"):
+            if close_button_dispatched and self._wait_until_document_title_changes(
+                selected,
+                timeout_seconds=min(1.0, self._document_return_timeout_seconds),
+            ):
+                return
             _activate_tab_control(selected.control)
             if not _send_ctrl_w_to_control(selected.control):
                 self._document_keyboard_closer(selected.owner_handle)
-        if selected.tab_id.startswith("document:"):
             if not self._wait_until_document_title_changes(selected):
-                raise RuntimeError("Ctrl+W 已发送，但文章标签仍处于活动状态")
+                raise RuntimeError("关闭按钮和 Ctrl+W 均已尝试，但文章标签仍处于活动状态")
         return
 
     def _require_close_owner_window(self, owner_handle: int) -> Any:
@@ -393,9 +397,20 @@ class UiaWechatBrowserTabAdapter:
             raise RuntimeError("文章标签所属微信内置浏览器窗口区域无效，拒绝关闭标签")
         return owner
 
-    def _wait_until_document_title_changes(self, selected: BrowserTabInfo) -> bool:
+    def _wait_until_document_title_changes(
+        self,
+        selected: BrowserTabInfo,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> bool:
         expected = normalize_article_title(selected.title)
-        deadline = self._monotonic() + self._document_return_timeout_seconds
+        timeout = (
+            self._document_return_timeout_seconds
+            if timeout_seconds is None
+            else max(0.1, float(timeout_seconds))
+        )
+        deadline = self._monotonic() + timeout
+        stable_change_count = 0
         while True:
             current = self.active_tab()
             if current is not None and current.tab_id != selected.tab_id:
@@ -406,7 +421,11 @@ class UiaWechatBrowserTabAdapter:
                     None,
                 )
             if current is None or normalize_article_title(current.title) != expected:
-                return True
+                stable_change_count += 1
+                if stable_change_count >= 3:
+                    return True
+            else:
+                stable_change_count = 0
             now = self._monotonic()
             if now >= deadline:
                 return False
@@ -673,7 +692,8 @@ def _invoke_direct_close_button(tab_row: Any) -> bool:
     )
     if close_button is None:
         return False
-    for method_name in ("Invoke", "Click"):
+    # Chromium 的 UIA Invoke 可能返回成功但不触发页面动作；Click 会走真实坐标输入。
+    for method_name in ("Click", "Invoke"):
         method = getattr(close_button, method_name, None)
         if not callable(method):
             continue
