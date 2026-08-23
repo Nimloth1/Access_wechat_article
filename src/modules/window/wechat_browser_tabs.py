@@ -16,6 +16,8 @@ from src.modules.window.wechat_home_window_finder import (
     EXPLICIT_HOME_TITLES,
     WECHAT_CHROME_CLASS_MARKER,
     WECHAT_HOME_PROCESS,
+    attach_uia_control,
+    enumerate_win32_windows,
     enumerate_uia_windows,
     rect_to_tuple,
 )
@@ -40,6 +42,30 @@ _TEMPORARY_TAB_TITLE_KEYS = {
     "新标签页",
 }
 _MIN_TRUNCATED_PREFIX_LENGTH = 10
+
+
+def enumerate_wechat_chrome_windows() -> list[Any]:
+    """先用 Win32 筛选微信窗口，再按句柄挂接 UIA 控件。"""
+    candidates = [
+        window
+        for window in enumerate_win32_windows()
+        if window.process_name.lower() == WECHAT_HOME_PROCESS
+        and WECHAT_CHROME_CLASS_MARKER in window.class_name.lower()
+        and window.visible
+        and not window.is_minimized
+        and window.has_valid_rect
+    ]
+    if not candidates:
+        candidates = [
+            window
+            for window in enumerate_uia_windows()
+            if window.process_name.lower() == WECHAT_HOME_PROCESS
+            and WECHAT_CHROME_CLASS_MARKER in window.class_name.lower()
+            and window.visible
+            and not window.is_minimized
+            and window.has_valid_rect
+        ]
+    return [attach_uia_control(window) for window in candidates]
 
 
 class BrowserTabAdapter(Protocol):
@@ -264,7 +290,7 @@ class UiaWechatBrowserTabAdapter:
         *,
         max_depth: int = 8,
         max_nodes_per_window: int = 1500,
-        enumerate_windows: Callable[[], list[Any]] = enumerate_uia_windows,
+        enumerate_windows: Callable[[], list[Any]] = enumerate_wechat_chrome_windows,
         active_document_closer: Callable[[int], None] | None = None,
         document_page_returner: Callable[[int], None] | None = None,
         document_keyboard_closer: Callable[[int], None] | None = None,
