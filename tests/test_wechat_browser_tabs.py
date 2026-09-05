@@ -154,6 +154,39 @@ class WechatBrowserWindowEnumerationTests(unittest.TestCase):
 
         self.assertEqual(user32.focused, [])
 
+    def test_missing_or_loading_document_never_confirms_close(self) -> None:
+        """连续读不到网页或持续加载不能当成文章关闭成功。"""
+        from dataclasses import replace
+
+        selected = BrowserTabInfo(
+            tab_id="document:853206", owner_handle=853206, title="文章甲",
+            rect=(100, 100, 1200, 900), is_active=True,
+        )
+        for title in (None, "", "加载中", "微信", "about:blank"):
+            with self.subTest(title=title):
+                ticks = iter((0.0, 0.01, 0.02, 0.03, 1.0))
+                adapter = browser_tabs.UiaWechatBrowserTabAdapter(
+                    enumerate_windows=lambda: [], monotonic=lambda: next(ticks),
+                    sleep=lambda _: None, document_return_timeout_seconds=0.1,
+                )
+                adapter.active_tab = lambda: None if title is None else replace(selected, title=title)
+                self.assertFalse(adapter._wait_until_document_title_changes(selected))
+
+    def test_readable_home_document_confirms_close(self) -> None:
+        """只有稳定读到返回页面的实际标题才确认关闭。"""
+        from dataclasses import replace
+
+        selected = BrowserTabInfo(
+            tab_id="document:853206", owner_handle=853206, title="文章甲",
+            rect=(100, 100, 1200, 900), is_active=True,
+        )
+        ticks = iter((0.0, 0.01, 0.02))
+        adapter = browser_tabs.UiaWechatBrowserTabAdapter(
+            enumerate_windows=lambda: [], monotonic=lambda: next(ticks), sleep=lambda _: None,
+        )
+        adapter.active_tab = lambda: replace(selected, title="求实处")
+        self.assertTrue(adapter._wait_until_document_title_changes(selected))
+
     def test_ctrl_w_is_sent_directly_to_article_document_control(self) -> None:
         """优先向文章控件发键，避免快捷键落到微信顶层窗口。"""
         class DocumentControl:

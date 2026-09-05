@@ -36,7 +36,7 @@ class WechatHomeWindowMinimized(RuntimeError):
         super().__init__("微信主页窗口处于最小化状态")
 
 
-def is_wechat_home_candidate(window: WindowInfo, *, article_count: int) -> bool:
+def is_wechat_home_candidate(window: WindowInfo) -> bool:
     """判断窗口是否是可操作的公众号主页，而不是聊天窗或文章详情页。"""
     title = window.title.strip()
     normalized_title = title.lower()
@@ -48,27 +48,23 @@ def is_wechat_home_candidate(window: WindowInfo, *, article_count: int) -> bool:
         return False
     if title in EXPLICIT_HOME_TITLES:
         return True
-    return normalized_title in GENERIC_WECHAT_TITLES and article_count > 0
+    return normalized_title in GENERIC_WECHAT_TITLES
 
 
-def score_wechat_home_candidate(window: WindowInfo, *, article_count: int) -> int:
-    if not is_wechat_home_candidate(window, article_count=article_count):
+def score_wechat_home_candidate(window: WindowInfo) -> int:
+    if not is_wechat_home_candidate(window):
         return -1
-    score = 10_000 if window.title.strip() in EXPLICIT_HOME_TITLES else 1_000
-    return score + min(max(0, int(article_count)), 20) * 10
+    return 10_000 if window.title.strip() in EXPLICIT_HOME_TITLES else 1_000
 
 
 def find_wechat_home_window(
     *,
     enumerate_windows: Callable[[], Iterable[WindowInfo]] | None = None,
-    article_counter: Callable[[WindowInfo], int] | None = None,
     timeout_seconds: float | None = None,
-    use_article_probe: bool = True,
     monotonic: Callable[[], float] = time.monotonic,
 ) -> WindowInfo | None:
     """选择最可信的微信公众账号主页窗口。"""
     enumerate_callback = enumerate_windows or enumerate_desktop_windows
-    count_articles = article_counter or _default_article_counter
     deadline = (
         monotonic() + max(0.0, float(timeout_seconds))
         if timeout_seconds is not None
@@ -88,20 +84,10 @@ def find_wechat_home_window(
             continue
         if not _is_visible_for_operation(window):
             continue
-        if title in EXPLICIT_HOME_TITLES:
-            candidates.append((score_wechat_home_candidate(window, article_count=0), window))
+        if title not in EXPLICIT_HOME_TITLES and normalized_title not in GENERIC_WECHAT_TITLES:
             continue
-        if normalized_title not in GENERIC_WECHAT_TITLES:
-            continue
-        if not use_article_probe:
-            candidates.append((1_000, window))
-            continue
-        try:
-            article_count = max(0, int(count_articles(window)))
-        except Exception:
-            article_count = 0
-        _raise_if_deadline_expired(deadline, monotonic)
-        score = score_wechat_home_candidate(window, article_count=article_count)
+        # 此时尚未激活窗口或挂接 UIA；主页内容由后续读取流程确认。
+        score = score_wechat_home_candidate(window)
         if score >= 0:
             candidates.append((score, window))
     if not candidates:
@@ -303,15 +289,6 @@ def _window_rect(user32: Any, handle: int) -> tuple[int, int, int, int]:
     if not user32.GetWindowRect(handle, ctypes.byref(rect)):
         return (0, 0, 0, 0)
     return (int(rect.left), int(rect.top), int(rect.right), int(rect.bottom))
-
-
-def _default_article_counter(window: WindowInfo) -> int:
-    try:
-        from src.modules.window.article_card_reader import UiaArticleCardReader
-
-        return len(UiaArticleCardReader().read(window))
-    except Exception:
-        return 0
 
 
 def _process_name(process_id: int) -> str:

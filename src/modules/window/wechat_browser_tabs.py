@@ -411,6 +411,7 @@ class UiaWechatBrowserTabAdapter:
         )
         deadline = self._monotonic() + timeout
         stable_change_count = 0
+        previous_title = ""
         while True:
             current = self.active_tab()
             if current is not None and current.tab_id != selected.tab_id:
@@ -420,12 +421,21 @@ class UiaWechatBrowserTabAdapter:
                     (item for item in self.list_tabs() if item.tab_id == selected.tab_id),
                     None,
                 )
-            if current is None or normalize_article_title(current.title) != expected:
-                stable_change_count += 1
+            current_title = normalize_article_title(current.title) if current is not None else ""
+            # UIA 暂时消失或只返回微信外壳不代表已回到主页，否则下一次点击会落在文章内。
+            readable_return = (
+                bool(current_title)
+                and current_title != expected
+                and _article_title_match_key(current_title) not in _TEMPORARY_TAB_TITLE_KEYS
+                and current_title.lower() not in {"微信", "wechat", "weixin"}
+            )
+            if readable_return:
+                stable_change_count = stable_change_count + 1 if current_title == previous_title else 1
                 if stable_change_count >= 3:
                     return True
             else:
                 stable_change_count = 0
+            previous_title = current_title
             now = self._monotonic()
             if now >= deadline:
                 return False

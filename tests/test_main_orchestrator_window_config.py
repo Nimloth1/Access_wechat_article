@@ -13,7 +13,6 @@ class MainOrchestratorWindowConfigTests(unittest.TestCase):
         config = SimpleNamespace(
             window=SimpleNamespace(
                 home_find_timeout_seconds=3.0,
-                home_find_use_article_probe=False,
             ),
             proxy=SimpleNamespace(
                 host="127.0.0.1",
@@ -60,7 +59,6 @@ class MainOrchestratorWindowConfigTests(unittest.TestCase):
         window_factory.find_home_window.assert_called_once_with(
             reader=article_reader,
             timeout_seconds=3.0,
-            use_article_probe=False,
         )
 
 

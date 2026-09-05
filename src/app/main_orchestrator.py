@@ -124,7 +124,6 @@ def create_capture_task_manager(
         home_finder=lambda: window_factory.find_home_window(
             reader=article_reader,
             timeout_seconds=config.window.home_find_timeout_seconds,
-            use_article_probe=config.window.home_find_use_article_probe,
         ),
         home_reader=window_factory.create_home_reader(),
         cursor_factory=create_cursor,

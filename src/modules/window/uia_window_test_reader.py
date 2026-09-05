@@ -488,11 +488,17 @@ def _article_cards_from_date_group(
     max_depth: int,
     max_nodes: int,
 ) -> tuple[tuple[UiaWindowTestArticleCard, ...], int]:
-    date_row = _safe_related_control(control, "GetFirstChildControl")
+    date_row = (
+        control if _direct_date_text_child(control) is not None
+        else _safe_related_control(control, "GetFirstChildControl")
+    )
     current = _safe_related_control(date_row, "GetNextSiblingControl")
     cards: list[UiaWindowTestArticleCard] = []
     node_count = 0
     while current is not None and len(cards) < _ARTICLE_CARD_GROUP_LIMIT:
+        # 新版主页把日期行与文章卡片平铺为兄弟节点，日期行不是文章。
+        if _direct_date_text_child(current) is not None:
+            break
         if (
             str(_safe_get(current, "ControlTypeName", "") or "").lower()
             == "groupcontrol"
@@ -617,8 +623,11 @@ def _date_group_header_from_control(
     if not _valid_rect(group_rect):
         return None
 
-    date_row = _safe_related_control(control, "GetFirstChildControl")
-    date_leaf = _direct_date_text_child(date_row)
+    date_leaf = _direct_date_text_child(control)
+    flat_layout = date_leaf is not None
+    date_row = control if flat_layout else _safe_related_control(control, "GetFirstChildControl")
+    if date_leaf is None:
+        date_leaf = _direct_date_text_child(date_row)
     if date_leaf is None:
         return None
     article_card = _safe_related_control(date_row, "GetNextSiblingControl")
@@ -631,6 +640,24 @@ def _date_group_header_from_control(
         )
     ):
         return None
+
+    # 旧版是一组内一个日期；新版是日期行、卡片、日期行、卡片平铺。
+    # 若旧版候选内出现第二个日期行，它其实是整张列表，必须继续向下查找。
+    sibling = article_card
+    for _ in range(_ARTICLE_CARD_GROUP_LIMIT):
+        if sibling is None:
+            break
+        if _direct_date_text_child(sibling) is not None:
+            if not flat_layout:
+                return None
+            break
+        sibling_rect = rect_to_tuple(_safe_get(sibling, "BoundingRectangle", None))
+        if flat_layout and _valid_rect(sibling_rect):
+            group_rect = (
+                min(group_rect[0], sibling_rect[0]), min(group_rect[1], sibling_rect[1]),
+                max(group_rect[2], sibling_rect[2]), max(group_rect[3], sibling_rect[3]),
+            )
+        sibling = _safe_related_control(sibling, "GetNextSiblingControl")
 
     date_text = normalize_uia_text(str(_safe_get(date_leaf, "Name", "") or ""))
     parsed_date = normalize_home_date_text(date_text)
