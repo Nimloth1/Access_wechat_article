@@ -1,0 +1,12 @@
+{
+  "chats": [],
+  "since": "2026-08-01",
+  "max_messages": 100,
+  "images": true,
+  "files": true,
+  "forwards": true,
+  "max_depth": 3,
+  "max_forward_messages": 1000,
+  "download_timeout": 30,
+  "dry_run": true
+}
