@@ -100,14 +100,21 @@ class MainFlowCoordinator:
                     self._drain_updates(handle, state)
                     self._scanner.mark_processed(session, target)
                     if not foreground.foreground_done:
-                        raise RuntimeError("单篇任务未确认主页可以继续")
+                        raise RuntimeError(
+                            foreground.error_detail or foreground.message
+                            or "单篇任务未确认主页可以继续"
+                        )
                     if command.single_task_interval_seconds > 0:
                         self._sleep(command.single_task_interval_seconds)
+                    # 返回主页后布局可能变化，下一篇必须使用新快照的坐标。
+                    break
 
                 if context.cancel_token.is_set() or _target_limit_reached(
                     state, command.target_count
                 ):
                     break
+                if dispatched:
+                    continue
                 if bool(getattr(batch, "boundary_reached", False)):
                     break
                 self._set_action(state, "正在滚动主页")

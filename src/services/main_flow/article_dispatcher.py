@@ -864,7 +864,15 @@ class ArticleDispatcher:
             receipt = _merge_receipt(previous, update.to_receipt())
             handle.latest_receipt = receipt
             handle.updates.append(update)
-            if update.foreground_done or update.status == "skipped_collected":
+            if (
+                update.foreground_done
+                or update.status == "skipped_collected"
+                or (
+                    update.status in {"failed", "cancelled"}
+                    and update.phase in {"foreground", "finished"}
+                    and not handle.foreground_event.is_set()
+                )
+            ):
                 handle.foreground_receipt = receipt
                 handle.foreground_event.set()
             if update.phase == "finished":

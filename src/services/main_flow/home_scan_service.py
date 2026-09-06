@@ -229,6 +229,9 @@ class HomeScanService:
                         )
                         continue
                     if self._expand_more_articles(session, target):
+                        # 展开会改变后续卡片位置，丢弃展开前收集的坐标。
+                        result.clear()
+                        batch_fingerprints.clear()
                         skipped_count += 1
                         expansion_count += 1
                         expanded_more = True
@@ -241,14 +244,14 @@ class HomeScanService:
                         account_name=session.account_name,
                         home_window_id=str(session.window.handle),
                         snapshot_id=session.last_snapshot_id,
-                        sequence=session.next_sequence,
+                        sequence=session.next_sequence + len(result),
                     )
                 else:
                     converted = self._to_home_target(
                         target,
                         account_name=session.account_name,
                         snapshot_id=session.last_snapshot_id,
-                        sequence=session.next_sequence,
+                        sequence=session.next_sequence + len(result),
                     )
                 if (
                     converted is None
@@ -259,11 +262,11 @@ class HomeScanService:
                     continue
                 result.append(converted)
                 batch_fingerprints.add(converted.fingerprint)
-                session.next_sequence += 1
             if boundary_reached or not expanded_more:
                 break
 
-        session.boundary_reached = boundary_reached
+        # 边界所在屏可能仍有多篇待采集，逐篇刷新时不能提前封闭会话。
+        session.boundary_reached = boundary_reached and not result
         self._emit(
             "home-scan",
             f"第 {session.scan_number} 次主页读取：识别 {len(result)} 条可处理文章",
@@ -353,6 +356,7 @@ class HomeScanService:
 
     def mark_processed(self, session: HomeScanSession, target: HomeArticleTarget) -> None:
         session.processed_fingerprints.add(target.fingerprint)
+        session.next_sequence = max(session.next_sequence, target.sequence + 1)
         if session.cursor is None:
             return
         for item in session.last_article_targets:
