@@ -1,9 +1,10 @@
 # encoding: UTF-8
 # version: 1.0 @20260906: 增加聊天附件下载、范围控制与诊断入口;
+# version: 1.1 @20260907: 增加兼容控件读取、文件菜单和翻页焦点核验;
 """独立运行聊天附件任务；不启动公众号代理服务。"""
 from __future__ import annotations
 
-__version__ = 'v1.0'
+__version__ = 'v1.1'
 __platform__ = 'nt'
 __pc__ = ['PW', 'AW', 'BW', 'UU', 'PM']
 __py__ = 'py3.13+'
@@ -48,6 +49,8 @@ def event_message(event: dict) -> str:
         return prefix + reasons.get(event.get('reason'), str(event.get('reason', '')))
     if kind in ('error', 'fatal_error'):
         return prefix + '任务停止：' + event['detail']
+    if kind == 'scan_progress':
+        return prefix + f"已扫描 {event['scanned']} 条" + ('内部消息' if event.get('path') else '消息')
     if kind == 'finished':
         counts = event['counts']
         return (f"任务结束：扫描外层 {counts.get('messages', 0)} 条、转发内部 {counts.get('forward_messages', 0)} 条；"
@@ -60,6 +63,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """解析命令行；不带参数时显示操作窗口。"""
     parser = argparse.ArgumentParser(description='微信聊天附件下载（F9 随时停止）')
     parser.add_argument('--diagnose', action='store_true', help='只检查微信控件是否可读')
+    parser.add_argument('--compatibility', action='store_true', help='临时启用已核验微信版本的控件读取，结束时恢复')
     parser.add_argument('--config', type=Path, help='任务 JSON 配置文件')
     parser.add_argument('--chat', action='append', help='精确对话名称，可重复；不填使用当前对话')
     parser.add_argument('--since', help='向前扫描截止日期 YYYY-MM-DD，包含当天')
@@ -76,7 +80,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.config:
         task_flags = {'--chat', '--since', '--max-messages', '--no-images', '--no-files',
-                      '--no-forwards', '--max-depth', '--max-forward-messages', '--download-timeout', '--dry-run'}
+                      '--no-forwards', '--max-depth', '--max-forward-messages', '--download-timeout', '--dry-run', '--compatibility'}
         if any(arg.split('=', 1)[0] in task_flags for arg in argv):
             parser.error('--config 不能与单独的任务参数混用，请修改 JSON 配置')
     return args
@@ -89,7 +93,7 @@ def options_from_dict(values: dict) -> AttachmentOptions:
     if unknown:
         raise ValueError('未知配置项：' + ', '.join(sorted(unknown)))
     values = dict(values)
-    for key in ('images', 'files', 'forwards', 'dry_run'):
+    for key in ('images', 'files', 'forwards', 'dry_run', 'compatibility'):
         if key in values and type(values[key]) is not bool:
             raise ValueError(f'{key} 必须为 true 或 false')
     for key in ('max_messages', 'max_depth', 'max_forward_messages'):
@@ -148,7 +152,8 @@ def execute(options: AttachmentOptions, stop: Event, notify=print) -> dict:
 
             try:
                 adapter = WechatChatAdapter(stop)
-                return ChatAttachmentService(adapter, emit).run(options)
+                with adapter.compatibility(options.compatibility):
+                    return ChatAttachmentService(adapter, emit).run(options)
             except Exception as exc:
                 emit({'event': 'fatal_error', 'detail': str(exc)})
                 raise
@@ -183,8 +188,10 @@ def show_gui() -> None:
     choices = ttk.Frame(frame)
     choices.pack(fill='x', pady=8)
     images, files, forwards, dry = [tk.BooleanVar(value=True) for _ in range(4)]
+    compatibility = tk.BooleanVar(value=True)
     for text, var in [('图片原图', images), ('文件', files), ('展开合并转发', forwards), ('仅扫描候选', dry)]:
         ttk.Checkbutton(choices, text=text, variable=var).pack(side='left', padx=(0, 10))
+    ttk.Checkbutton(frame, text='启用兼容读取（仅已核验微信版本；任务结束恢复运行时标志）', variable=compatibility).pack(anchor='w')
     ttk.Label(frame, text='转发最多 3 层，每个对话内部合计最多 1,000 条；仅扫描时不进入转发。').pack(anchor='w')
     controls = ttk.Frame(frame)
     controls.pack(fill='x', pady=10)
@@ -208,7 +215,8 @@ def show_gui() -> None:
         try:
             options = options_from_dict({'chats': chats.get('1.0', 'end').strip().splitlines(),
                 'since': since.get().strip(), 'max_messages': int(maximum.get()),
-                'images': images.get(), 'files': files.get(), 'forwards': forwards.get(), 'dry_run': dry.get()})
+                'images': images.get(), 'files': files.get(), 'forwards': forwards.get(), 'dry_run': dry.get(),
+                'compatibility': compatibility.get()})
         except (ValueError, TypeError) as exc:
             messagebox.showerror('设置有误', str(exc))
             return
@@ -223,7 +231,10 @@ def show_gui() -> None:
                 import uiautomation as auto
                 with auto.UIAutomationInitializerInThread():
                     if diagnose:
-                        queue.put(WechatChatAdapter(stop).diagnose()['detail'])
+                        with task_lock():
+                            adapter = WechatChatAdapter(stop)
+                            with adapter.compatibility(options.compatibility):
+                                queue.put(adapter.diagnose()['detail'])
                     else:
                         execute(options, stop, queue.put)
             except Exception as exc:
@@ -270,13 +281,17 @@ def show_gui() -> None:
 
 def main() -> int:
     """程序入口；诊断不可运行或任务出错时返回非零状态。"""
+    sys.stdout.reconfigure(line_buffering=True)
     print('\nChatAttachments %s' % __version__)
     args = parse_args()
     try:
         if os.name != 'nt':
             raise RuntimeError('聊天附件操作仅支持 Windows')
         if args.diagnose:
-            result = WechatChatAdapter().diagnose()
+            with task_lock():
+                adapter = WechatChatAdapter()
+                with adapter.compatibility(args.compatibility):
+                    result = adapter.diagnose()
             print(json.dumps(result, ensure_ascii=False, indent=2))
             return 0 if result['ready'] else 2
         if not args.run and not args.config:
@@ -292,7 +307,7 @@ def main() -> int:
             values = {'chats': args.chat or [], 'since': args.since, 'max_messages': args.max_messages,
                 'images': not args.no_images, 'files': not args.no_files, 'forwards': not args.no_forwards,
                 'max_depth': args.max_depth, 'max_forward_messages': args.max_forward_messages,
-                'download_timeout': args.download_timeout, 'dry_run': args.dry_run}
+                'download_timeout': args.download_timeout, 'dry_run': args.dry_run, 'compatibility': args.compatibility}
         result = execute(options_from_dict(values), Event())
         return 2 if result.get('errors') or result.get('cancelled') else 0
     except (RuntimeError, ValueError, OSError, TypeError) as exc:

@@ -106,6 +106,15 @@ class ChatAttachmentServiceTests(unittest.TestCase):
         with self.assertRaises(ChatAutomationError):
             older_prefix(ChatPage((msg('b'),)), ChatPage((msg('a'),)))
 
+    def test_runtime_ids_distinguish_identical_messages_across_pages(self):
+        """重复内容可通过稳定实例标识衔接，但替换后的实例不能沿用。"""
+        first = ChatMessage('same', 'image', TODAY, ((1,), None))
+        second = ChatMessage('same', 'image', TODAY, ((2,), None))
+        earlier = ChatMessage('same', 'image', TODAY, ((0,), None))
+        self.assertEqual(older_prefix(ChatPage((first, second)), ChatPage((earlier, first))), 1)
+        with self.assertRaises(ChatAutomationError):
+            older_prefix(ChatPage((first, second)), ChatPage((earlier,)))
+
     def test_unchanged_page_is_not_reported_as_history_end(self):
         """滚动失败不等同于到达历史起点。"""
         page = ChatPage((msg('a'),))
@@ -231,6 +240,8 @@ class ConfigurationAndRecognitionTests(unittest.TestCase):
         self.assertIsNone(message_day('12:30', TODAY))
         self.assertEqual(message_day('昨天 12:30', TODAY), date(2026, 9, 5))
         self.assertEqual(message_day('2025年1月2日 12:30', TODAY), date(2025, 1, 2))
+        self.assertEqual(message_day('星期四 12:30', TODAY), date(2026, 9, 3))
+        self.assertEqual(message_day('12月31日 12:30', date(2026, 1, 2)), date(2025, 12, 31))
         self.assertIsNone(message_day('2026-02-30', TODAY))
         self.assertIsNone(message_day('会议时间2020-01-01', TODAY))
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, timedelta
 import hashlib
@@ -12,6 +13,8 @@ import time
 from typing import Any
 
 from src.modules.window.home_window_activation import WindowsHomeWindowGuard
+from src.modules.window.article_date_filter import normalize_home_date_text
+from src.modules.window.wechat_accessibility import temporary_accessibility
 from src.modules.window.wechat_home_window_finder import attach_uia_control, enumerate_desktop_windows, rect_to_tuple
 from src.services.chat_attachment_service import ChatAutomationError, ChatMessage, ChatPage
 
@@ -55,6 +58,9 @@ def message_day(text: str, today: date, inherited: date | None = None) -> date |
     for label, days in (("今天", 0), ("昨天", 1), ("前天", 2)):
         if re.fullmatch(label + r"(?:\s+\d{1,2}:\d{2})?", text):
             return today - timedelta(days=days)
+    calendar = re.fullmatch(r'((?:星期[一二三四五六日天])|(?:\d{1,2}月\d{1,2}日))(?:\s+\d{1,2}:\d{2})?', text)
+    if calendar:
+        return normalize_home_date_text(calendar.group(1), today=today)
     # 不将缺少年份/日期的时刻擅自补成今天，以免越过用户边界。
     if re.fullmatch(r"\d{1,2}:\d{2}", text):
         return inherited
@@ -103,6 +109,16 @@ class WechatChatAdapter:
             self.stop.set()
         return self.stop.is_set()
 
+    @contextmanager
+    def compatibility(self, enabled: bool):
+        """显式选择时启用当前进程兼容读取，任务结束恢复运行时标志。"""
+        if not enabled:
+            yield
+            return
+        self.diagnose()
+        with temporary_accessibility(self.main.control.ProcessId):
+            yield
+
     def _pause(self, seconds: float) -> None:
         """短间隔等待以响应取消。"""
         deadline = time.monotonic() + seconds
@@ -118,11 +134,26 @@ class WechatChatAdapter:
             raise ChatAutomationError("微信窗口不可见或已最小化")
         return attach_uia_control(current)
 
+    def _activate(self, context: ChatContext) -> None:
+        """桌面不可交互时停止，在获得前台窗口后才允许输入或调用控件。"""
+        user32 = ctypes.WinDLL('user32', use_last_error=True)
+        user32.OpenInputDesktop.argtypes = [ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
+        user32.OpenInputDesktop.restype = ctypes.c_void_p
+        user32.CloseDesktop.argtypes = [ctypes.c_void_p]
+        desktop = user32.OpenInputDesktop(0, False, 0x100)
+        if not desktop:
+            raise ChatAutomationError('桌面不可交互，请解锁 Windows 并保持登录会话连接后重试')
+        user32.CloseDesktop(desktop)
+        self.guard.activate(context.window)
+        if not user32.GetForegroundWindow():
+            raise ChatAutomationError('未能获得可交互的前台窗口，停止操作')
+
     def diagnose(self) -> dict:
         """仅检查控件可读性，不点击、切换对话或收集聊天正文。"""
         windows = [w for w in enumerate_desktop_windows()
                    if w.process_name.lower() in {"weixin.exe", "wechat.exe"}
-                   and w.title in {"微信", "Weixin", "WeChat"} and w.visible and not w.is_minimized]
+                   and w.title in {"微信", "Weixin", "WeChat"} and w.visible and not w.is_minimized
+                   and w.rect[2] - w.rect[0] >= 400 and w.rect[3] - w.rect[1] >= 400]
         self.main = attach_uia_control(unique(windows, "微信主窗口"))
         nodes = walk(self.main.control)
         lists = [n for n in nodes if n.ControlTypeName == "ListControl" and n.Name in MESSAGE_LIST_NAMES]
@@ -152,21 +183,23 @@ class WechatChatAdapter:
         return unique([n for n in nodes if n.ControlTypeName == "ListControl" and
                        n.Name in MESSAGE_LIST_NAMES], "消息列表")
 
-    def _click(self, context: ChatContext, control: Any, *, double: bool = False) -> None:
+    def _click(self, context: ChatContext, control: Any) -> None:
         """激活并核验点击坐标所属窗口；取消时不点击。"""
         if self.cancelled():
             raise ChatAutomationError("已取消")
         self._nodes(context)
-        self.guard.activate(context.window)
+        self._activate(context)
+        if control.ControlTypeName in {'ButtonControl', 'ListItemControl', 'MenuItemControl'}:
+            invoke = control.GetPattern(self.auto.PatternId.InvokePattern)
+            if invoke is not None:
+                invoke.Invoke()
+                return
         rect = rect_to_tuple(control.BoundingRectangle)
         x, y = (rect[0] + rect[2]) // 2, (rect[1] + rect[3]) // 2
         from types import SimpleNamespace
         self.guard.ensure_target_clickable(context.window, SimpleNamespace(
             home_window_handle=context.window.handle, click_x=x, click_y=y))
-        if double:
-            control.DoubleClick(simulateMove=False)
-        else:
-            control.Click(simulateMove=False)
+        control.Click(simulateMove=False)
 
     def open_chat(self, name: str | None) -> ChatContext:
         """选择当前对话或精确搜索指定对话；不向聊天输入框输入文字。"""
@@ -180,7 +213,11 @@ class WechatChatAdapter:
             return context
         search = unique([n for n in nodes if n.ControlTypeName == "EditControl" and
                          n.ClassName == "mmui::XValidatorTextEdit" and n.Name in {"搜索", "Search", "搜尋"}], "对话搜索框")
-        self._click(context, search)
+        self._activate(context)
+        search.SetFocus()
+        self._pause(0.2)
+        if not self._focus_within(search):
+            raise ChatAutomationError('未确认焦点在对话搜索框，未输入搜索内容')
         pattern = search.GetValuePattern()
         if pattern is None:
             raise ChatAutomationError("搜索框不支持明确设置内容，未输入文字")
@@ -191,17 +228,23 @@ class WechatChatAdapter:
         matches = [row for row in results.GetChildren() if row.ControlTypeName == "ListItemControl" and
                    any(n.Name.strip() == name for n in walk(row))]
         self._click(context, unique(matches, f"对话“{name}”"))
-        self._pause(0.5)
-        context.name = name
-        self._nodes(context)
-        return context
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not self.cancelled():
+            context.window = self._window(context.window)
+            titles = [n for n in walk(context.window.control)
+                      if n.AutomationId.endswith("current_chat_name_label")]
+            if len(titles) == 1 and titles[0].Name.strip() == name:
+                context.name = name
+                return context
+            self._pause(0.2)
+        raise ChatAutomationError("未在等待时间内确认目标对话已打开")
 
     def chat_name(self, context: ChatContext) -> str:
         """返回已经核验的对话名称。"""
         return context.name
 
     def read_page(self, context: ChatContext) -> ChatPage:
-        """读取完整可见消息行；不把同内容不同消息合并。"""
+        """读取与视口相交的消息行，保留跨页长消息作为衔接锚点。"""
         listing = self._list(context)
         viewport = rect_to_tuple(listing.BoundingRectangle)
         messages = []
@@ -216,11 +259,12 @@ class WechatChatAdapter:
                         inherited = parsed
                 continue
             # 时间分隔条不是聊天消息，不能消耗用户指定的条数。
-            if row.ClassName == "mmui::ChatItemView" and message_day(row.Name, self.today, inherited):
+            if row.ClassName == "mmui::ChatItemView":
+                # 时间行即使格式未知也不算聊天消息，并清除旧日期避免误归属。
                 inherited = message_day(row.Name, self.today, inherited)
                 continue
             bounds = rect_to_tuple(row.BoundingRectangle)
-            if row.IsOffscreen or bounds[1] < viewport[1] or bounds[3] > viewport[3] or bounds[3] <= bounds[1]:
+            if row.IsOffscreen or bounds[3] <= viewport[1] or bounds[1] >= viewport[3] or bounds[3] <= bounds[1]:
                 continue
             kind, bubble = attachment_kind(nodes)
             # 不解析消息正文里的日期，防止把正文当作聊天时间。
@@ -228,9 +272,7 @@ class WechatChatAdapter:
             # 整条消息文本作为重叠锚点；下载状态按钮不进入锚点。
             content = row.Name or "\n".join(n.Name for n in nodes if n.ClassName.startswith("mmui::Chat"))
             if kind == "file":
-                content = "\n".join(line for line in content.splitlines()
-                                    if line.strip() not in DOWNLOAD_NAMES | AVAILABLE_NAMES |
-                                    {"未下载", "已下载", "下载完成", "下载中", "Downloaded"})
+                content = "\n".join(content.splitlines()[:2])
             signature = hashlib.sha256((row.ClassName + "\n" + content).encode("utf-8")).hexdigest()
             messages.append(ChatMessage(signature, kind, day, (tuple(row.GetRuntimeId()), bubble)))
         at_start = False
@@ -254,20 +296,72 @@ class WechatChatAdapter:
     def scroll_older(self, context: ChatContext) -> None:
         """在消息列表内小幅向上滚动，保留翻页重叠锚点。"""
         listing = self._list(context)
-        self.guard.activate(context.window)
+        self._activate(context)
         if self.cancelled():
             return
         pattern = listing.GetScrollPattern()
-        if pattern is None or not pattern.VerticallyScrollable:
-            raise ChatAutomationError("消息列表不支持可验证的滚动，已停止")
-        pattern.Scroll(self.auto.ScrollAmount.NoAmount, self.auto.ScrollAmount.SmallDecrement)
-        self._pause(0.6)
+        if pattern is not None and pattern.VerticallyScrollable:
+            pattern.Scroll(self.auto.ScrollAmount.NoAmount, self.auto.ScrollAmount.SmallDecrement)
+            self._pause(0.6)
+            return
+        # 当前微信消息列表未实现 ScrollPattern，焦点核验后使用列表键盘导航。
+        visible = self.read_page(context).messages
+        if not visible:
+            raise ChatAutomationError('没有可定位的消息，未发送滚动按键')
+        first_id = visible[0].control[0]
+        first_row = unique([r for r in listing.GetChildren() if tuple(r.GetRuntimeId()) == first_id], '滚动起点消息')
+        first_row.GetSelectionItemPattern().Select()
+        first_row.SetFocus()
+        self._pause(0.2)
+        if not self._focus_within(listing):
+            raise ChatAutomationError("未确认焦点在消息列表，未发送滚动按键")
+        before = tuple((m.signature, m.control[0]) for m in visible)
+        selected = tuple((m.signature, m.control[0]) for m in self.read_page(context).messages)
+        if selected != before:
+            # 选中跨页消息本身可能改变视口，交给服务先核验这次移动，不能再叠加翻页。
+            return
+        for _ in range(4):
+            if self.cancelled():
+                return
+            # 从当前页最早消息只前进一条，保留长消息的跨页重叠。
+            self._send_keys(context, listing, '{Up}')
+            self._pause(0.4)
+            after = tuple((m.signature, m.control[0]) for m in self.read_page(context).messages)
+            if after != before:
+                return
+        raise ChatAutomationError("消息列表没有向前移动，未确认已读完历史")
+
+    def _send_keys(self, context: ChatContext, control: Any, keys: str) -> None:
+        """核验现有焦点后输入；Control.SendKeys 会再次改焦点，不能用于此处。"""
+        self._nodes(context)
+        self._activate(context)
+        if self.cancelled() or not self._focus_within(control):
+            raise ChatAutomationError('输入前焦点已离开目标控件或任务已停止，未发送按键')
+        self.auto.SendKeys(keys)
+
+    def _focus_within(self, control: Any) -> bool:
+        """列表焦点可以落在其选中消息上，但不能落入聊天输入框。"""
+        target = tuple(control.GetRuntimeId())
+        focused = self.auto.GetFocusedControl()
+        for _ in range(8):
+            if focused is None:
+                return False
+            if tuple(focused.GetRuntimeId()) == target:
+                return True
+            focused = focused.GetParentControl()
+        return False
 
     def _child_window(self, context: ChatContext, message: ChatMessage, class_name: str) -> ChatContext:
         """只接管本次点击新产生、同微信进程的指定类型窗口。"""
         before = {w.handle for w in enumerate_desktop_windows()}
         bubble = self._fresh_target(context, message)
-        self._click(context, bubble, double=(class_name == PREVIEW_CLASS))
+        if self.cancelled():
+            raise ChatAutomationError('已取消')
+        self._activate(context)
+        invoke = bubble.GetPattern(self.auto.PatternId.InvokePattern)
+        if invoke is None:
+            raise ChatAutomationError('附件消息不支持明确打开操作')
+        invoke.Invoke()
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline and not self.cancelled():
             matches = []
@@ -276,7 +370,7 @@ class WechatChatAdapter:
                 if w.handle in before or not w.visible or w.process_name.lower() not in {"weixin.exe", "wechat.exe"}:
                     continue
                 candidate = attach_uia_control(w)
-                if candidate.control.ProcessId == parent_pid and candidate.control.ClassName == class_name:
+                if candidate.control.ProcessId == parent_pid and any(n.ClassName == class_name for n in walk(candidate.control)):
                     matches.append(candidate)
             if matches:
                 return ChatContext(unique(matches, "附件子窗口"), context.name, True)
@@ -363,8 +457,57 @@ class WechatChatAdapter:
                        n.Name.strip() in DOWNLOAD_NAMES and not n.IsOffscreen]
             if not clicked:
                 if not buttons:
-                    return "unconfirmed"
+                    return self._file_menu_download(context, message, timeout)
                 self._click(context, unique(buttons, "文件下载按钮"))
                 clicked = True
             self._pause(0.25)
         return "cancelled" if self.cancelled() else "unconfirmed"
+
+    def _file_menu(self, context: ChatContext, message: ChatMessage) -> list[Any]:
+        """通过已选中文件行的键盘菜单定位下载入口，避免点击整行空白区。"""
+        bubble = self._fresh_target(context, message)
+        self._activate(context)
+        if self.cancelled():
+            return []
+        bubble.GetSelectionItemPattern().Select()
+        bubble.SetFocus()
+        self._pause(0.2)
+        focused = self.auto.GetFocusedControl()
+        if focused is None or tuple(focused.GetRuntimeId()) != tuple(bubble.GetRuntimeId()):
+            raise ChatAutomationError("未确认焦点在文件消息上，未打开菜单")
+        self._send_keys(context, bubble, '{Shift}({F10})')
+        self._pause(0.15)
+        return [n for n in self._nodes(context) if n.ControlTypeName == 'MenuItemControl'
+                and n.ClassName == 'mmui::XMenuView' and not n.IsOffscreen]
+
+    def _dismiss_menu(self, context: ChatContext) -> None:
+        """只有当前对话中仍有本任务菜单时才发送退出菜单的按键。"""
+        if any(n.ControlTypeName == 'MenuItemControl' and n.ClassName == 'mmui::XMenuView'
+               for n in self._nodes(context)):
+            self._activate(context)
+            self.auto.SendKeys('{Esc}')
+
+    def _file_menu_download(self, context: ChatContext, message: ChatMessage, timeout: float) -> str:
+        """用明确的下载菜单项操作，已可用文件不打开。"""
+        deadline = time.monotonic() + timeout
+        clicked = False
+        while not self.cancelled() and time.monotonic() < deadline:
+            try:
+                items = self._file_menu(context, message)
+                names = {item.Name.strip() for item in items}
+                if names & {'在文件夹中显示', 'Show in Folder'}:
+                    return 'confirmed' if clicked else 'available'
+                downloads = [item for item in items if item.Name.strip() in DOWNLOAD_NAMES]
+                if not clicked:
+                    if not downloads:
+                        return 'unconfirmed'
+                    item = unique(downloads, '文件下载菜单')
+                    invoke = item.GetPattern(self.auto.PatternId.InvokePattern)
+                    if invoke is None:
+                        raise ChatAutomationError('下载菜单不支持明确调用')
+                    invoke.Invoke()
+                    clicked = True
+            finally:
+                self._dismiss_menu(context)
+            self._pause(1)
+        return 'cancelled' if self.cancelled() else 'unconfirmed'

@@ -24,6 +24,7 @@ class AttachmentOptions:
     max_forward_messages: int = 1000
     download_timeout: float = 30.0
     dry_run: bool = False
+    compatibility: bool = False
 
     def __post_init__(self) -> None:
         """校验边界，0 条仅在给定日期时表示不限数量。"""
@@ -68,8 +69,14 @@ class ChatAdapter(Protocol):
 
 def older_prefix(previous: ChatPage, current: ChatPage) -> int:
     """返回新页前部新增消息数；无重叠或重复锚点不猜测。"""
-    old = [m.signature for m in previous.messages]
-    new = [m.signature for m in current.messages]
+    def identity(message: ChatMessage) -> tuple:
+        """同次 UIA 会话使用消息实例标识，缺少标识时才使用语义锚点。"""
+        control = message.control
+        instance = control[0] if isinstance(control, tuple) and len(control) == 2 else None
+        return message.signature, instance
+
+    old = [identity(m) for m in previous.messages]
+    new = [identity(m) for m in current.messages]
     if not old or not new:
         raise ChatAutomationError("消息列表变空，无法确认翻页位置")
     if old == new:
@@ -170,6 +177,7 @@ class ChatAttachmentService:
                         raise ChatAutomationError(f"未知附件状态：{status}")
                     self.counts[status] += 1
                     self._event("attachment", chat=chat, path=item_path, kind=message.kind, status=status)
+            self._event("scan_progress", chat=chat, path=path, scanned=scanned)
             if page.at_start:
                 return "history_start"
             if not path and options.max_messages and scanned >= options.max_messages:
