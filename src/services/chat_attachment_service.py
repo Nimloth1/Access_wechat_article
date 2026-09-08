@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import date, datetime
+import traceback
 from typing import Any, Callable, Protocol
 
 
@@ -133,7 +134,7 @@ class ChatAttachmentService:
                     self._event("cancelled", chat=requested or "当前对话")
                     break
                 self.counts["errors"] += 1
-                self._event("error", chat=requested or "当前对话", detail=str(exc))
+                self._event("error", chat=requested or "当前对话", detail=str(exc), traceback=traceback.format_exc(limit=8))
                 # 窗口归属或导航异常后，不再自动切换其他对话。
                 break
         result = dict(self.counts)

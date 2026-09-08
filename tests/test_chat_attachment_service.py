@@ -129,7 +129,9 @@ class ChatAttachmentServiceTests(unittest.TestCase):
         adapter = FakeAdapter({'当前': [page, page]})
         result, events = self.run_task(adapter)
         self.assertEqual(result['errors'], 1)
-        self.assertTrue(any(e['event'] == 'error' for e in events))
+        error = next(e for e in events if e['event'] == 'error')
+        self.assertIn('ChatAutomationError', error['traceback'])
+        self.assertIn('older_prefix', error['traceback'])
 
     def test_verified_forward_start_may_return_unchanged_page(self):
         """适配器确认有限转发起点后，相同页面应结束而非重复处理。"""

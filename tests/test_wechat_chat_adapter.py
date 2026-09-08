@@ -171,10 +171,54 @@ class WechatChatAdapterTests(unittest.TestCase):
         adapter._fresh_target = lambda *args: bubble
         adapter._bubble_point = lambda *args: (80, 50)
         adapter._file_receipt = Mock()
-        adapter._file_menu_download = Mock(return_value='confirmed')
+        adapter._wait_file = Mock(return_value='confirmed')
+        adapter._file_menu_download = Mock(side_effect=AssertionError('接收后不可右键核验'))
         self.assertEqual(adapter._download_file(None, None, 1), 'confirmed')
         bubble.Click.assert_called_once()
         adapter._file_receipt.assert_called_with(None, 'report.pdf', accept=False)
+
+    def test_file_wait_handles_delayed_receipt_without_opening_menu(self):
+        """下载中途出现接收窗口也只操作匹配弹窗，完成标记出现后返回。"""
+        adapter = self.adapter(None)
+        adapter.cancelled = lambda: False
+        adapter._pause = Mock()
+        adapter._file_receipt = Mock()
+        adapter._fresh_target = Mock(side_effect=[
+            Node('文件\nreport.pdf\n未下载'), Node('文件\nreport.pdf\n下载中 50%'),
+            Node(children=(Node('已下载', kind='TextControl'),)),
+        ])
+        adapter._file_menu = Mock(side_effect=AssertionError('下载期间不可打开菜单'))
+        self.assertEqual(adapter._wait_file(None, None, 'report.pdf', 5), 'confirmed')
+        self.assertEqual(adapter._file_receipt.call_count, 3)
+        adapter._file_receipt.assert_called_with(None, 'report.pdf', accept=True)
+
+    def test_missing_marker_disappearance_requires_stability_and_is_not_confirmation(self):
+        """标记短暂消失后恢复下载中会重置等待，稳定消失也不声称完成。"""
+        adapter = self.adapter(None)
+        now = [0.0]
+        adapter.cancelled = lambda: False
+        adapter._pause = lambda seconds: now.__setitem__(0, now[0] + seconds)
+        adapter._file_receipt = Mock()
+        empty = Node('文件\nreport.pdf\n2.8M')
+        states = [empty, Node('下载中 50%')] + [empty] * 5
+        adapter._fresh_target = Mock(side_effect=states)
+        with patch('src.modules.window.wechat_chat_adapter.time.monotonic', side_effect=lambda: now[0]):
+            self.assertEqual(adapter._wait_file(None, None, 'report.pdf', 5), 'unconfirmed')
+        self.assertEqual(adapter._fresh_target.call_count, 7)
+
+    def test_file_wait_stops_on_expiry_timeout_and_cancel(self):
+        """无完成证据不得无限等待；取消时不再触碰接收窗口。"""
+        for label, cancel, expected in [('已过期', False, 'expired'), ('未下载', False, 'unconfirmed'), ('未下载', True, 'cancelled')]:
+            adapter = self.adapter(None)
+            now = [0.0]
+            adapter.cancelled = lambda: cancel
+            adapter._pause = lambda seconds: now.__setitem__(0, now[0] + seconds)
+            adapter._file_receipt = Mock()
+            adapter._fresh_target = lambda *args: Node(label)
+            with patch('src.modules.window.wechat_chat_adapter.time.monotonic', side_effect=lambda: now[0]):
+                self.assertEqual(adapter._wait_file(None, None, 'report.pdf', 1), expected)
+            if cancel:
+                adapter._file_receipt.assert_not_called()
 
     def test_viewer_limits_clicks_and_always_closes_preview(self):
         """N 次上一张之外保留起始图片，取消和异常均关闭本次预览。"""

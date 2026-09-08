@@ -709,7 +709,7 @@ class WechatChatAdapter:
                         x, y = self._bubble_point(context, message, bubble)
                         try:
                             bubble.Click(x=x, y=y, simulateMove=False, waitTime=0.2)
-                            return self._file_menu_download(context, message, max(1, deadline - time.monotonic()), clicked=True)
+                            return self._wait_file(context, message, lines[1], max(1, deadline - time.monotonic()))
                         finally:
                             self._file_receipt(context, lines[1], accept=False)
                     return self._file_menu_download(context, message, timeout)
@@ -717,6 +717,33 @@ class WechatChatAdapter:
                 clicked = True
             self._pause(0.25)
         return "cancelled" if self.cancelled() else "unconfirmed"
+
+    def _wait_file(self, context: ChatContext, message: ChatMessage, filename: str, timeout: float) -> str:
+        """单击接收后只轮询状态与匹配弹窗，不在下载期间右键文件争抢焦点。"""
+        deadline = time.monotonic() + timeout
+        ready_since = None
+        while time.monotonic() < deadline and not self.cancelled():
+            self._file_receipt(context, filename, accept=True)
+            nodes = walk(self._fresh_target(context, message))
+            labels = {n.Name.strip() for n in nodes}
+            if any('过期' in label or 'expired' in label.lower() for label in labels):
+                return 'expired'
+            if labels & {'下载完成', '已下载', 'Downloaded'}:
+                return 'confirmed'
+            if any(n.ControlTypeName == 'ButtonControl' and n.Name.strip() in AVAILABLE_NAMES
+                   and not n.IsOffscreen for n in nodes):
+                return 'confirmed'
+            pending = any(re.search(r'(?:^|\s)未下载(?:\s|$)|下载中|接收中|\d+(?:\.\d+)?%', label)
+                          for label in labels)
+            if pending:
+                ready_since = None
+            elif ready_since is None:
+                ready_since = time.monotonic()
+            elif time.monotonic() - ready_since >= 1:
+                # 标记消失不等于磁盘文件完整；留出弹窗异步出现的时间后记待核验。
+                return 'unconfirmed'
+            self._pause(0.25)
+        return 'cancelled' if self.cancelled() else 'unconfirmed'
 
     def _file_menu(self, context: ChatContext, message: ChatMessage) -> list[Any]:
         """在已核验文件正文内打开右键菜单，避开整行空白区。"""
