@@ -13,7 +13,7 @@ from threading import Event
 import time
 from typing import Any
 
-from src.modules.window.home_window_activation import WindowsHomeWindowGuard
+from src.modules.window.home_window_activation import HomeWindowNotClickableError, WindowsHomeWindowGuard
 from src.modules.window.article_date_filter import normalize_home_date_text
 from src.modules.window.wechat_accessibility import temporary_accessibility
 from src.modules.window.wechat_home_window_finder import attach_uia_control, enumerate_desktop_windows, rect_to_tuple
@@ -216,10 +216,22 @@ class WechatChatAdapter:
         self._activate(target_context)
         rect = rect_to_tuple(control.BoundingRectangle)
         x, y = (rect[0] + rect[2]) // 2, (rect[1] + rect[3]) // 2
-        from types import SimpleNamespace
-        self.guard.ensure_target_clickable(target_context.window, SimpleNamespace(
-            home_window_handle=target_context.window.handle, click_x=x, click_y=y))
+        self._check_point(target_context, x, y)
         control.Click(simulateMove=False)
+
+    def _check_point(self, context: ChatContext, x: int, y: int) -> None:
+        """核验附件坐标归属；遮挡错误纳入任务摘要，并记录前台应用以便诊断。"""
+        from types import SimpleNamespace
+        try:
+            self.guard.ensure_target_clickable(context.window, SimpleNamespace(
+                home_window_handle=context.window.handle, click_x=x, click_y=y))
+        except HomeWindowNotClickableError as exc:
+            foreground = ctypes.windll.user32.GetForegroundWindow()
+            windows = [w for w in enumerate_desktop_windows() if w.handle == foreground]
+            detail = f'{windows[0].process_name} / {windows[0].class_name}' if windows else '不可识别'
+            raise ChatAutomationError(
+                f'附件操作位置被遮挡或窗口已变化，已停止；前台应用：{detail}；'
+                f'目标窗口 {context.window.handle}；{str(exc).replace("文章坐标", "操作坐标").replace("微信主页", "目标微信窗口")}') from exc
 
     def open_chat(self, name: str | None) -> ChatContext:
         """选择当前对话或精确搜索指定对话；不向聊天输入框输入文字。"""
@@ -448,17 +460,24 @@ class WechatChatAdapter:
 
     def _wheel(self, context: ChatContext, *, older: bool, steps: int = 1) -> None:
         """只在已核验消息视口内部发送滚轮，重新校验窗口和取消状态。"""
-        listing = self._list(context)
-        self._activate(context)
-        if self.cancelled():
-            raise ChatAutomationError('已取消')
-        bounds = rect_to_tuple(listing.BoundingRectangle)
-        from types import SimpleNamespace
-        self.guard.ensure_target_clickable(context.window, SimpleNamespace(
-            home_window_handle=context.window.handle,
-            click_x=(bounds[0] + bounds[2]) // 2, click_y=(bounds[1] + bounds[3]) // 2))
-        action = listing.WheelUp if older else listing.WheelDown
-        action(wheelTimes=steps, waitTime=0.1)
+        for attempt in range(2):
+            self._activate(context)
+            # 文件下载可能唤起查看器；重新激活后再读取布局，不能复用失焦前的位置。
+            listing = self._list(context)
+            if self.cancelled():
+                raise ChatAutomationError('已取消')
+            bounds = rect_to_tuple(listing.BoundingRectangle)
+            try:
+                self._check_point(context, (bounds[0] + bounds[2]) // 2, (bounds[1] + bounds[3]) // 2)
+            except ChatAutomationError:
+                if attempt:
+                    raise
+                # 此时尚未发送滚轮；只允许等待并重新激活核验一次，仍遮挡就停止。
+                self._pause(0.25)
+                continue
+            action = listing.WheelUp if older else listing.WheelDown
+            action(wheelTimes=steps, waitTime=0.1)
+            return
 
     def _focus_within(self, control: Any) -> bool:
         """列表焦点可以落在其选中消息上，但不能落入聊天输入框。"""
@@ -542,9 +561,7 @@ class WechatChatAdapter:
                 ctypes.windll.user32.GetDpiForWindow(context.window.handle) != dpi):
             raise ChatAutomationError('截图后消息位置或窗口缩放已改变，未点击')
         self._activate(context)
-        from types import SimpleNamespace
-        self.guard.ensure_target_clickable(context.window, SimpleNamespace(
-            home_window_handle=context.window.handle, click_x=left + x, click_y=top + y))
+        self._check_point(context, left + x, top + y)
         if self.cancelled():
             raise ChatAutomationError('已取消')
         return left + x - row[0], top + y - row[1]

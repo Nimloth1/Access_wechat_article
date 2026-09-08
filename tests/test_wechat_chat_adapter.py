@@ -6,6 +6,7 @@ import unittest
 from unittest.mock import MagicMock, Mock, patch
 
 from src.modules.window.wechat_chat_adapter import ChatContext, ORIGINAL_NAMES, WechatChatAdapter
+from src.modules.window.home_window_activation import HomeWindowNotClickableError
 from src.services.chat_attachment_service import ChatAutomationError, ChatMessage, ChatPage
 
 
@@ -223,6 +224,64 @@ class WechatChatAdapterTests(unittest.TestCase):
         adapter.read_page = Mock(side_effect=[ChatPage((first,)), ChatPage((first,)), ChatPage((earlier, first))])
         adapter.scroll_older(ChatContext(None, 'A'))
         self.assertEqual(adapter._wheel.call_count, 2)
+
+    def test_wheel_rechecks_fresh_layout_after_transient_obstruction(self):
+        """临时遮挡时尚未滚动；重新激活并读取新位置后只发送一次滚轮。"""
+        first = Node(rect=(0, 0, 400, 500))
+        second = Node(rect=(100, 100, 500, 600))
+        first.WheelUp, second.WheelUp = Mock(), Mock()
+        adapter = self.adapter(None)
+        adapter._list = Mock(side_effect=[first, second])
+        adapter._activate = Mock()
+        adapter._pause = Mock()
+        adapter.cancelled = lambda: False
+        adapter._check_point = Mock(side_effect=[ChatAutomationError('遮挡'), None])
+        context = ChatContext(None, 'A', True)
+        adapter._wheel(context, older=True)
+        self.assertEqual([c.args[1:] for c in adapter._check_point.call_args_list], [(200, 250), (300, 350)])
+        self.assertEqual(adapter._activate.call_count, 2)
+        first.WheelUp.assert_not_called()
+        second.WheelUp.assert_called_once_with(wheelTimes=1, waitTime=0.1)
+
+    def test_persistent_obstruction_or_cancellation_never_sends_wheel(self):
+        """持续遮挡最多核验两次，重试前取消也不能继续滚动。"""
+        for cancel in (False, True):
+            listing = Node()
+            listing.WheelDown = Mock()
+            adapter = self.adapter(listing)
+            adapter._activate = Mock()
+            adapter._pause = Mock()
+            adapter.cancelled = Mock(side_effect=[False, cancel])
+            adapter._check_point = Mock(side_effect=ChatAutomationError('遮挡'))
+            with self.assertRaises(ChatAutomationError):
+                adapter._wheel(ChatContext(None, 'A'), older=False)
+            self.assertEqual(adapter._check_point.call_count, 1 if cancel else 2)
+            listing.WheelDown.assert_not_called()
+
+    def test_wheel_action_error_is_not_retried(self):
+        """滚轮已调用后结果不明时不重试，防止重复滚动漏消息。"""
+        listing = Node()
+        listing.WheelUp = Mock(side_effect=ChatAutomationError('结果不明'))
+        adapter = self.adapter(listing)
+        adapter._activate = Mock()
+        adapter.cancelled = lambda: False
+        adapter._check_point = Mock()
+        with self.assertRaises(ChatAutomationError):
+            adapter._wheel(ChatContext(None, 'A'), older=True)
+        listing.WheelUp.assert_called_once()
+
+    def test_obstruction_becomes_task_error_with_foreground_application(self):
+        """共享文章模块的遮挡异常转成任务错误，保留计数并显示前台应用。"""
+        adapter = self.adapter(None)
+        adapter.guard = SimpleNamespace(ensure_target_clickable=Mock(
+            side_effect=HomeWindowNotClickableError('文章坐标不在微信主页可点击层级')))
+        user32 = SimpleNamespace(GetForegroundWindow=Mock(return_value=2))
+        window = SimpleNamespace(handle=2, process_name='viewer.exe', class_name='Viewer')
+        with patch('ctypes.windll', SimpleNamespace(user32=user32), create=True), patch(
+                'src.modules.window.wechat_chat_adapter.enumerate_desktop_windows', return_value=[window]):
+            with self.assertRaisesRegex(ChatAutomationError, 'viewer.exe') as error:
+                adapter._check_point(ChatContext(SimpleNamespace(handle=1), 'A'), 10, 20)
+        self.assertNotIn('文章坐标', str(error.exception))
 
     def test_forward_stationary_scroll_marks_start_but_outer_does_not(self):
         """有限转发的稳定边缘可确认起点，外层懒加载不能据此报告全部完成。"""
