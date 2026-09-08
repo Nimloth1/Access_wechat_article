@@ -1,10 +1,11 @@
 # encoding: UTF-8
 # version: 1.0 @20260906: 增加聊天附件下载、范围控制与诊断入口;
 # version: 1.1 @20260907: 增加兼容控件读取、文件菜单和翻页焦点核验;
+# version: 1.2 @20260908: 实机适配滚轮、图片气泡、转发遍历与文件接收;
 """独立运行聊天附件任务；不启动公众号代理服务。"""
 from __future__ import annotations
 
-__version__ = 'v1.1'
+__version__ = 'v1.2'
 __platform__ = 'nt'
 __pc__ = ['PW', 'AW', 'BW', 'UU', 'PM']
 __py__ = 'py3.13+'
@@ -55,7 +56,8 @@ def event_message(event: dict) -> str:
         counts = event['counts']
         return (f"任务结束：扫描外层 {counts.get('messages', 0)} 条、转发内部 {counts.get('forward_messages', 0)} 条；"
                 f"确认完成 {counts.get('confirmed', 0)}，已可用 {counts.get('available', 0)}，"
-                f"待核验 {counts.get('unconfirmed', 0)}，错误 {counts.get('errors', 0)}。")
+                f"待核验 {counts.get('unconfirmed', 0)}，日期不明跳过 {counts.get('unknown_date', 0)}，"
+                f"错误 {counts.get('errors', 0)}。")
     return prefix + {'chat_started': '开始扫描', 'cancelled': '已停止'}.get(kind, kind)
 
 
@@ -172,7 +174,7 @@ def show_gui() -> None:
     frame = ttk.Frame(root, padding=16)
     frame.pack(fill='both', expand=True)
     ttk.Label(frame, text='先在微信打开对话；任务从当前消息位置向前扫描。').pack(anchor='w')
-    ttk.Label(frame, text='下载到微信自身缓存。请勿与公众号采集同时运行；F9 可停止。').pack(anchor='w', pady=(0, 12))
+    ttk.Label(frame, text='下载到微信自身缓存，文档可能自动打开。请勿与公众号采集同时运行；F9 可停止。').pack(anchor='w', pady=(0, 12))
     ttk.Label(frame, text='指定对话（每行一个完整名称；留空使用当前对话）').pack(anchor='w')
     chats = tk.Text(frame, height=3, width=70)
     chats.pack(fill='x', pady=5)

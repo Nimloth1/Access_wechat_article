@@ -123,6 +123,31 @@ class ChatAttachmentServiceTests(unittest.TestCase):
         self.assertEqual(result['errors'], 1)
         self.assertTrue(any(e['event'] == 'error' for e in events))
 
+    def test_verified_forward_start_may_return_unchanged_page(self):
+        """适配器确认有限转发起点后，相同页面应结束而非重复处理。"""
+        adapter = FakeAdapter({'当前': [ChatPage((msg('f', 'forward'),), True)],
+            's': [ChatPage((msg('1'),)), ChatPage((msg('1'),), True)]}, {'f': 's'})
+        result, _ = self.run_task(adapter)
+        self.assertEqual(result['forward_messages'], 1)
+        self.assertNotIn('errors', result)
+
+    def test_download_revealing_older_rows_does_not_scroll_past_them(self):
+        """处理露出边缘的附件导致视口移动后，先处理新行再继续翻页。"""
+        adapter = FakeAdapter({'当前': [ChatPage(tuple(map(msg, 'cd'))),
+            ChatPage(tuple(map(msg, 'abc')), True)]})
+        download = adapter.download
+        def move_when_oldest_is_processed(context, message, timeout):
+            """模拟定位气泡时向上滚动。"""
+            status = download(context, message, timeout)
+            if message.signature == 'c':
+                adapter.positions[context] = 1
+            return status
+        adapter.download = move_when_oldest_is_processed
+        result, _ = self.run_task(adapter)
+        self.assertEqual([key for _, key in adapter.downloaded], list('dcba'))
+        self.assertEqual(result['messages'], 4)
+        self.assertNotIn('errors', result)
+
     def test_limit_counts_text_and_does_not_scroll_after_limit(self):
         """条数指所有外层消息，不是附件数或点击数。"""
         adapter = FakeAdapter({'当前': [ChatPage((msg('old'), msg('image'), msg('text', 'text')))]})
@@ -252,6 +277,10 @@ class ConfigurationAndRecognitionTests(unittest.TestCase):
         self.assertEqual(attachment_kind([text]), ('text', None))
         bubble = SimpleNamespace(ClassName='mmui::ChatBubbleItemView', Name='文件\nreport.pdf')
         self.assertEqual(attachment_kind([bubble]), ('file', bubble))
+        image = SimpleNamespace(ClassName='mmui::ChatBubbleReferItemView', Name='图片 2026年9月8日 07:57')
+        self.assertEqual(attachment_kind([image]), ('image', image))
+        forward = SimpleNamespace(ClassName='mmui::ChatBubbleItemView', Name='聊天记录Leada的聊天记录')
+        self.assertEqual(attachment_kind([forward]), ('forward', forward))
 
 
 if __name__ == '__main__':

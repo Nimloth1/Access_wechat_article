@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, timedelta
 import hashlib
+from pathlib import Path
 import re
 from threading import Event
 import time
@@ -69,11 +70,12 @@ def message_day(text: str, today: date, inherited: date | None = None) -> date |
 
 def attachment_kind(nodes: list[Any]) -> tuple[str, Any | None]:
     """只从消息气泡识别类型，正文提到“图片/文件”不触发点击。"""
-    bubbles = [n for n in nodes if n.ClassName == "mmui::ChatBubbleItemView"]
+    bubbles = [n for n in nodes if n.ClassName in {"mmui::ChatBubbleItemView", "mmui::ChatBubbleReferItemView"}]
     for bubble in bubbles:
         label = bubble.Name.strip()
-        for kind, prefixes in (("forward", ("聊天记录", "聊天記錄", "Chat History")),
-                               ("image", ("图片", "圖片", "Image")),
+        if label.startswith(('聊天记录', '聊天記錄', 'Chat History')):
+            return 'forward', bubble
+        for kind, prefixes in (("image", ("图片", "圖片", "Image")),
                                ("file", ("文件", "檔案", "File"))):
             if any(label == p or label.startswith(p + "\n") or label.startswith(p + " ") or
                    label.startswith(p + "：") or label.startswith(p + ":") for p in prefixes):
@@ -86,6 +88,7 @@ class ChatContext:
     window: Any
     name: str
     forwarded: bool = False
+    reached_start: bool = False
 
 
 class WechatChatAdapter:
@@ -183,22 +186,33 @@ class WechatChatAdapter:
         return unique([n for n in nodes if n.ControlTypeName == "ListControl" and
                        n.Name in MESSAGE_LIST_NAMES], "消息列表")
 
-    def _click(self, context: ChatContext, control: Any) -> None:
-        """激活并核验点击坐标所属窗口；取消时不点击。"""
-        if self.cancelled():
+    def _click(self, context: ChatContext, control: Any, *, cleanup: bool = False) -> None:
+        """核验窗口归属后点击；任务取消时仅允许关闭本任务的接收窗口。"""
+        if self.cancelled() and not cleanup:
             raise ChatAutomationError("已取消")
         self._nodes(context)
-        self._activate(context)
-        if control.ControlTypeName in {'ButtonControl', 'ListItemControl', 'MenuItemControl'}:
-            invoke = control.GetPattern(self.auto.PatternId.InvokePattern)
-            if invoke is not None:
-                invoke.Invoke()
-                return
+        target_context = context
+        handle = control.GetTopLevelControl().NativeWindowHandle
+        if handle and handle != context.window.handle:
+            owner = handle
+            for _ in range(8):
+                owner = ctypes.windll.user32.GetWindow(owner, 4)  # GW_OWNER
+                if owner == context.window.handle:
+                    break
+                if not owner:
+                    raise ChatAutomationError('操作控件不属于本次对话窗口')
+            else:
+                raise ChatAutomationError('无法确认弹出窗口归属')
+            window = unique([w for w in enumerate_desktop_windows() if w.handle == handle], '控件弹出窗口')
+            target_context = ChatContext(self._window(window), context.name, True)
+            if target_context.window.control.ProcessId != context.window.control.ProcessId:
+                raise ChatAutomationError('控件窗口进程改变')
+        self._activate(target_context)
         rect = rect_to_tuple(control.BoundingRectangle)
         x, y = (rect[0] + rect[2]) // 2, (rect[1] + rect[3]) // 2
         from types import SimpleNamespace
-        self.guard.ensure_target_clickable(context.window, SimpleNamespace(
-            home_window_handle=context.window.handle, click_x=x, click_y=y))
+        self.guard.ensure_target_clickable(target_context.window, SimpleNamespace(
+            home_window_handle=target_context.window.handle, click_x=x, click_y=y))
         control.Click(simulateMove=False)
 
     def open_chat(self, name: str | None) -> ChatContext:
@@ -275,11 +289,11 @@ class WechatChatAdapter:
                 content = "\n".join(content.splitlines()[:2])
             signature = hashlib.sha256((row.ClassName + "\n" + content).encode("utf-8")).hexdigest()
             messages.append(ChatMessage(signature, kind, day, (tuple(row.GetRuntimeId()), bubble)))
-        at_start = False
+        at_start = context.reached_start
         pattern = listing.GetScrollPattern()
         if pattern is not None:
             # 外层到达滚动顶部可能仍在加载更早记录，不能当作历史结束。
-            at_start = context.forwarded and (not pattern.VerticallyScrollable or pattern.VerticalScrollPercent == 0)
+            at_start = at_start or (context.forwarded and (not pattern.VerticallyScrollable or pattern.VerticalScrollPercent == 0))
         if not messages and listing.GetChildren():
             raise ChatAutomationError("消息列表有内容，但未识别到完整可见消息行，停止以免漏扫")
         return ChatPage(tuple(messages), at_start)
@@ -304,40 +318,46 @@ class WechatChatAdapter:
             pattern.Scroll(self.auto.ScrollAmount.NoAmount, self.auto.ScrollAmount.SmallDecrement)
             self._pause(0.6)
             return
-        # 当前微信消息列表未实现 ScrollPattern，焦点核验后使用列表键盘导航。
-        visible = self.read_page(context).messages
-        if not visible:
-            raise ChatAutomationError('没有可定位的消息，未发送滚动按键')
-        first_id = visible[0].control[0]
-        first_row = unique([r for r in listing.GetChildren() if tuple(r.GetRuntimeId()) == first_id], '滚动起点消息')
-        first_row.GetSelectionItemPattern().Select()
-        first_row.SetFocus()
-        self._pause(0.2)
-        if not self._focus_within(listing):
-            raise ChatAutomationError("未确认焦点在消息列表，未发送滚动按键")
-        before = tuple((m.signature, m.control[0]) for m in visible)
-        selected = tuple((m.signature, m.control[0]) for m in self.read_page(context).messages)
-        if selected != before:
-            # 选中跨页消息本身可能改变视口，交给服务先核验这次移动，不能再叠加翻页。
-            return
-        for _ in range(4):
+        # 微信未提供 ScrollPattern 时，使用视口内小幅滚轮，不依赖消息方向键。
+        before = tuple((m.signature, m.control[0]) for m in self.read_page(context).messages)
+        position = self._page_position(context)
+        stationary = 0
+        for _ in range(200):
             if self.cancelled():
                 return
-            # 从当前页最早消息只前进一条，保留长消息的跨页重叠。
-            self._send_keys(context, listing, '{Up}')
+            self._wheel(context, older=True)
             self._pause(0.4)
             after = tuple((m.signature, m.control[0]) for m in self.read_page(context).messages)
             if after != before:
                 return
+            current_position = self._page_position(context)
+            stationary = stationary + 1 if current_position == position else 0
+            position = current_position
+            if stationary >= 3:
+                if context.forwarded:
+                    context.reached_start = True
+                    return
+                break
         raise ChatAutomationError("消息列表没有向前移动，未确认已读完历史")
 
-    def _send_keys(self, context: ChatContext, control: Any, keys: str) -> None:
-        """核验现有焦点后输入；Control.SendKeys 会再次改焦点，不能用于此处。"""
-        self._nodes(context)
+    def _page_position(self, context: ChatContext) -> tuple:
+        """包含行几何位置，区分长消息内部滚动和真正停止移动。"""
+        return tuple((tuple(row.GetRuntimeId()), rect_to_tuple(row.BoundingRectangle))
+                     for row in self._list(context).GetChildren())
+
+    def _wheel(self, context: ChatContext, *, older: bool, steps: int = 1) -> None:
+        """只在已核验消息视口内部发送滚轮，重新校验窗口和取消状态。"""
+        listing = self._list(context)
         self._activate(context)
-        if self.cancelled() or not self._focus_within(control):
-            raise ChatAutomationError('输入前焦点已离开目标控件或任务已停止，未发送按键')
-        self.auto.SendKeys(keys)
+        if self.cancelled():
+            raise ChatAutomationError('已取消')
+        bounds = rect_to_tuple(listing.BoundingRectangle)
+        from types import SimpleNamespace
+        self.guard.ensure_target_clickable(context.window, SimpleNamespace(
+            home_window_handle=context.window.handle,
+            click_x=(bounds[0] + bounds[2]) // 2, click_y=(bounds[1] + bounds[3]) // 2))
+        action = listing.WheelUp if older else listing.WheelDown
+        action(wheelTimes=steps, waitTime=0.1)
 
     def _focus_within(self, control: Any) -> bool:
         """列表焦点可以落在其选中消息上，但不能落入聊天输入框。"""
@@ -358,10 +378,7 @@ class WechatChatAdapter:
         if self.cancelled():
             raise ChatAutomationError('已取消')
         self._activate(context)
-        invoke = bubble.GetPattern(self.auto.PatternId.InvokePattern)
-        if invoke is None:
-            raise ChatAutomationError('附件消息不支持明确打开操作')
-        invoke.Invoke()
+        self._open_bubble(context, message, bubble)
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline and not self.cancelled():
             matches = []
@@ -377,6 +394,60 @@ class WechatChatAdapter:
             self._pause(0.2)
         raise ChatAutomationError("未确认新附件窗口，停止任务；请手动检查当前微信界面")
 
+    def _bubble_point(self, context: ChatContext, message: ChatMessage, bubble: Any) -> tuple[int, int]:
+        """在已识别附件正文内定位可见内容，避开整行中心的空白和头像。"""
+        if message.kind not in {'image', 'forward', 'file'}:
+            raise ChatAutomationError('只允许定位附件气泡')
+        listing = self._list(context)
+        viewport = rect_to_tuple(listing.BoundingRectangle)
+        row = rect_to_tuple(bubble.BoundingRectangle)
+        # 倒序扫描时最早一条可能刚露出底边；先让正文进入视口再定位。
+        for _ in range(20):
+            visible_height = min(row[3] - 8, viewport[3]) - max(row[1] + 36, viewport[1])
+            if visible_height >= 64 or row[1] >= viewport[1]:
+                break
+            self._wheel(context, older=True)
+            self._pause(0.3)
+            bubble = self._fresh_target(context, message)
+            listing = self._list(context)
+            viewport = rect_to_tuple(listing.BoundingRectangle)
+            row = rect_to_tuple(bubble.BoundingRectangle)
+        top, bottom = max(row[1] + 36, viewport[1]), min(row[3] - 8, viewport[3])
+        left, right = max(row[0] + 64, viewport[0]), min(row[2] - 64, viewport[2])
+        if right - left < 24 or bottom - top < 24:
+            raise ChatAutomationError('附件可见内容不足，请调整起始位置后重试')
+        # 仅在已核验消息的正文区域采样；不持久化图像，不调用外部识别服务。
+        with listing.ToBitmap(x=left - viewport[0], y=top - viewport[1],
+                              width=right - left, height=bottom - top) as bitmap:
+            background = bitmap.GetPixelColor(bitmap.Width - 1, bitmap.Height - 1)
+            scores = []
+            for y in range(12, bitmap.Height - 11, 12):
+                for x in range(12, bitmap.Width - 11, 12):
+                    score = sum(sum(abs(((bitmap.GetPixelColor(x + dx, y + dy) >> shift) & 255) -
+                                        ((background >> shift) & 255)) for shift in (0, 8, 16))
+                                for dx in (-8, 0, 8) for dy in (-8, 0, 8))
+                    scores.append((score, x, y))
+            score, x, y = max(scores, default=(0, 0, 0))
+            if score < 450:
+                raise ChatAutomationError('未能在附件消息内定位可见内容，未点击')
+        fresh = self._fresh_target(context, message)
+        if rect_to_tuple(fresh.BoundingRectangle) != row:
+            raise ChatAutomationError('截图后消息位置已改变，未点击')
+        self._activate(context)
+        from types import SimpleNamespace
+        self.guard.ensure_target_clickable(context.window, SimpleNamespace(
+            home_window_handle=context.window.handle, click_x=left + x, click_y=top + y))
+        if self.cancelled():
+            raise ChatAutomationError('已取消')
+        return left + x - row[0], top + y - row[1]
+
+    def _open_bubble(self, context: ChatContext, message: ChatMessage, bubble: Any) -> None:
+        """仅双击图片和转发正文；文件不经过这个入口。"""
+        if message.kind not in {'image', 'forward'}:
+            raise ChatAutomationError('不允许双击文件')
+        x, y = self._bubble_point(context, message, bubble)
+        bubble.DoubleClick(x=x, y=y, simulateMove=False, waitTime=0.2)
+
     def open_forward(self, context: ChatContext, message: ChatMessage) -> ChatContext:
         """进入合并转发，先定位列表底部，再按倒序遍历。"""
         child = self._child_window(context, message, FORWARD_CLASS)
@@ -386,6 +457,20 @@ class WechatChatAdapter:
             if pattern is not None and pattern.VerticallyScrollable:
                 pattern.SetScrollPercent(-1, 100)
                 self._pause(0.5)
+            elif pattern is None:
+                # 有限的转发窗口从底部处理，避免最后一条只露出发送者时就被计入并点击。
+                position = self._page_position(child)
+                stationary = 0
+                for _ in range(100):
+                    self._wheel(child, older=False, steps=10)
+                    self._pause(0.3)
+                    current = self._page_position(child)
+                    stationary = stationary + 1 if current == position else 0
+                    position = current
+                    if stationary >= 2:
+                        break
+                else:
+                    raise ChatAutomationError('未确认转发记录底部，停止扫描')
             return child
         except Exception:
             self.close_forward(child, context)
@@ -409,10 +494,12 @@ class WechatChatAdapter:
     def _buttons(self, context: ChatContext, names: set[str]) -> list[Any]:
         """只查找明确可见的按钮，不把正文当作操作入口。"""
         return [n for n in self._nodes(context) if n.ControlTypeName == "ButtonControl" and
-                n.Name.strip() in names and not n.IsOffscreen]
+                (n.Name.strip() in names or (names == ORIGINAL_NAMES and any(
+                    re.fullmatch(re.escape(label) + r'\s*[（(]\s*\d+(?:\.\d+)?\s*(?:[KMG]?B|字节)\s*[）)]',
+                                 n.Name.strip(), re.IGNORECASE) for label in names))) and not n.IsOffscreen]
 
     def download(self, context: ChatContext, message: ChatMessage, timeout: float) -> str:
-        """图片使用原图按钮；文件只点击下载按钮，不打开文件。"""
+        """图片寻找原图按钮，文件下载后核验菜单；微信可能自动打开文档。"""
         if message.kind == "file":
             return self._download_file(context, message, timeout)
         child = self._child_window(context, message, PREVIEW_CLASS)
@@ -439,7 +526,7 @@ class WechatChatAdapter:
             self.close_forward(child, context)
 
     def _download_file(self, context: ChatContext, message: ChatMessage, timeout: float) -> str:
-        """通过气泡内明确的下载按钮下载；不双击，以免执行已下载附件。"""
+        """使用下载按钮或未下载文档的单击入口；已可用文件不再打开。"""
         deadline = time.monotonic() + timeout
         clicked = False
         while time.monotonic() < deadline and not self.cancelled():
@@ -457,6 +544,18 @@ class WechatChatAdapter:
                        n.Name.strip() in DOWNLOAD_NAMES and not n.IsOffscreen]
             if not clicked:
                 if not buttons:
+                    lines = self._fresh_target(context, message).Name.splitlines()
+                    # 本机微信未下载文档没有下载菜单，单击会下载后交给关联查看器。
+                    # 只允许普通文档/压缩包；程序、脚本、快捷方式不使用这个回退入口。
+                    if '未下载' in lines and len(lines) >= 2 and Path(lines[1]).suffix.lower() in {
+                            '.pdf', '.docx', '.xlsx', '.pptx', '.txt', '.csv', '.zip', '.rar', '.7z'}:
+                        bubble = self._fresh_target(context, message)
+                        x, y = self._bubble_point(context, message, bubble)
+                        try:
+                            bubble.Click(x=x, y=y, simulateMove=False, waitTime=0.2)
+                            return self._file_menu_download(context, message, max(1, deadline - time.monotonic()), clicked=True)
+                        finally:
+                            self._file_receipt(context, lines[1], accept=False)
                     return self._file_menu_download(context, message, timeout)
                 self._click(context, unique(buttons, "文件下载按钮"))
                 clicked = True
@@ -464,18 +563,13 @@ class WechatChatAdapter:
         return "cancelled" if self.cancelled() else "unconfirmed"
 
     def _file_menu(self, context: ChatContext, message: ChatMessage) -> list[Any]:
-        """通过已选中文件行的键盘菜单定位下载入口，避免点击整行空白区。"""
+        """在已核验文件正文内打开右键菜单，避开整行空白区。"""
         bubble = self._fresh_target(context, message)
         self._activate(context)
         if self.cancelled():
             return []
-        bubble.GetSelectionItemPattern().Select()
-        bubble.SetFocus()
-        self._pause(0.2)
-        focused = self.auto.GetFocusedControl()
-        if focused is None or tuple(focused.GetRuntimeId()) != tuple(bubble.GetRuntimeId()):
-            raise ChatAutomationError("未确认焦点在文件消息上，未打开菜单")
-        self._send_keys(context, bubble, '{Shift}({F10})')
+        x, y = self._bubble_point(context, message, bubble)
+        bubble.RightClick(x=x, y=y, simulateMove=False, waitTime=0.1)
         self._pause(0.15)
         return [n for n in self._nodes(context) if n.ControlTypeName == 'MenuItemControl'
                 and n.ClassName == 'mmui::XMenuView' and not n.IsOffscreen]
@@ -487,11 +581,13 @@ class WechatChatAdapter:
             self._activate(context)
             self.auto.SendKeys('{Esc}')
 
-    def _file_menu_download(self, context: ChatContext, message: ChatMessage, timeout: float) -> str:
+    def _file_menu_download(self, context: ChatContext, message: ChatMessage, timeout: float, *, clicked: bool = False) -> str:
         """用明确的下载菜单项操作，已可用文件不打开。"""
         deadline = time.monotonic() + timeout
-        clicked = False
         while not self.cancelled() and time.monotonic() < deadline:
+            if clicked:
+                filename = self._fresh_target(context, message).Name.splitlines()[1]
+                self._file_receipt(context, filename, accept=True)
             try:
                 items = self._file_menu(context, message)
                 names = {item.Name.strip() for item in items}
@@ -502,12 +598,23 @@ class WechatChatAdapter:
                     if not downloads:
                         return 'unconfirmed'
                     item = unique(downloads, '文件下载菜单')
-                    invoke = item.GetPattern(self.auto.PatternId.InvokePattern)
-                    if invoke is None:
-                        raise ChatAutomationError('下载菜单不支持明确调用')
-                    invoke.Invoke()
+                    self._click(context, item)
                     clicked = True
             finally:
                 self._dismiss_menu(context)
             self._pause(1)
         return 'cancelled' if self.cancelled() else 'unconfirmed'
+
+    def _file_receipt(self, context: ChatContext, filename: str, *, accept: bool) -> None:
+        """处理本次文件的接收窗口；精确匹配文件名，退出时只取消这个窗口。"""
+        dialogs = [n for n in self._nodes(context) if n.ClassName == 'mmui::XDialog'
+                   and any(c.ControlTypeName == 'TextControl' and c.Name == filename for c in walk(n))]
+        if not dialogs:
+            return
+        dialog = unique(dialogs, '文件接收窗口')
+        if accept and self.cancelled():
+            return
+        label = '接收文件' if accept else '取消'
+        button = unique([n for n in walk(dialog) if n.ControlTypeName == 'ButtonControl' and n.Name == label], label)
+        self._click(context, button, cleanup=not accept)
+        self._pause(0.5)

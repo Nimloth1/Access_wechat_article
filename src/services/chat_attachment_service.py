@@ -135,6 +135,8 @@ class ChatAttachmentService:
             page = self.adapter.read_page(context)
             if not page.messages:
                 return "empty"
+            if previous is not None and page.at_start and page.messages == previous.messages:
+                return "history_start"
             count = len(page.messages) if previous is None else older_prefix(previous, page)
             for message in reversed(page.messages[:count]):
                 if self.adapter.cancelled():
@@ -177,7 +179,8 @@ class ChatAttachmentService:
                         raise ChatAutomationError(f"未知附件状态：{status}")
                     self.counts[status] += 1
                     self._event("attachment", chat=chat, path=item_path, kind=message.kind, status=status)
-            self._event("scan_progress", chat=chat, path=path, scanned=scanned)
+            if count:
+                self._event("scan_progress", chat=chat, path=path, scanned=scanned)
             if page.at_start:
                 return "history_start"
             if not path and options.max_messages and scanned >= options.max_messages:
@@ -185,5 +188,8 @@ class ChatAttachmentService:
             if path and budget[0] <= 0:
                 return "forward_message_limit"
             previous = page
+            # 为点击刚露出的气泡而小幅滚动时，先处理因此新出现的消息，不能再叠加翻页。
+            if self.adapter.read_page(context).messages != page.messages:
+                continue
             self.adapter.scroll_older(context)
         return "cancelled"

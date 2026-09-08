@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
-from src.modules.window.wechat_chat_adapter import ChatContext, WechatChatAdapter
+from src.modules.window.wechat_chat_adapter import ChatContext, ORIGINAL_NAMES, WechatChatAdapter
 from src.services.chat_attachment_service import ChatAutomationError, ChatMessage, ChatPage
 
 
@@ -99,37 +99,80 @@ class WechatChatAdapterTests(unittest.TestCase):
         adapter._click = lambda *args, **kwargs: self.fail('不应点击附件文件')
         self.assertEqual(adapter._download_file(None, None, 1), 'unconfirmed')
 
-    def test_key_input_keeps_verified_row_focus_and_rechecks_before_each_key(self):
-        """不能调用会重新聚焦列表的 Control.SendKeys；焦点离开后不再输入。"""
-        adapter = self.adapter(None)
-        adapter._nodes = Mock()
-        adapter._activate = Mock()
-        adapter.cancelled = lambda: False
-        adapter._focus_within = Mock(side_effect=[True, False])
-        adapter.auto = SimpleNamespace(SendKeys=Mock())
-        control = SimpleNamespace(SendKeys=Mock(side_effect=AssertionError('焦点不应重置')))
-        adapter._send_keys(None, control, '{Up}')
-        with self.assertRaises(ChatAutomationError):
-            adapter._send_keys(None, control, '{Up}')
-        adapter.auto.SendKeys.assert_called_once_with('{Up}')
-
-    def test_selection_that_moves_viewport_does_not_also_scroll(self):
-        """选中长消息已改变视口时先核验重叠，防止额外向上移动丢失锚点。"""
-        row = Node('old', identity=1)
-        row.GetSelectionItemPattern = lambda: SimpleNamespace(Select=lambda: None)
-        row.SetFocus = lambda: None
-        listing = Node(kind='ListControl', children=(row,))
+    def test_scroll_waits_through_long_message_and_returns_when_new_row_appears(self):
+        """长消息滚动中身份未变化仍继续，出现新行后立即交给服务核验衔接。"""
+        listing = Node(kind='ListControl')
         adapter = self.adapter(listing)
         adapter._activate = Mock()
         adapter.cancelled = lambda: False
-        adapter._focus_within = lambda control: True
         adapter._pause = lambda seconds: None
-        adapter._send_keys = Mock(side_effect=AssertionError('不应叠加滚动'))
+        adapter._wheel = Mock()
+        adapter._page_position = Mock(side_effect=[(100,), (80,)])
         first = ChatMessage('one', 'text', None, ((1,), None))
         earlier = ChatMessage('zero', 'text', None, ((2,), None))
-        adapter.read_page = Mock(side_effect=[ChatPage((first,)), ChatPage((earlier, first))])
+        adapter.read_page = Mock(side_effect=[ChatPage((first,)), ChatPage((first,)), ChatPage((earlier, first))])
         adapter.scroll_older(ChatContext(None, 'A'))
-        adapter._send_keys.assert_not_called()
+        self.assertEqual(adapter._wheel.call_count, 2)
+
+    def test_forward_stationary_scroll_marks_start_but_outer_does_not(self):
+        """有限转发的稳定边缘可确认起点，外层懒加载不能据此报告全部完成。"""
+        for forwarded in (True, False):
+            adapter = self.adapter(Node(kind='ListControl'))
+            adapter._activate = Mock()
+            adapter.cancelled = lambda: False
+            adapter._pause = lambda seconds: None
+            adapter._wheel = Mock()
+            adapter._page_position = lambda context: (100,)
+            adapter.read_page = lambda context: ChatPage((ChatMessage('one', 'text', None, ((1,), None)),))
+            context = ChatContext(None, 'A', forwarded)
+            if forwarded:
+                adapter.scroll_older(context)
+                self.assertTrue(context.reached_start)
+            else:
+                with self.assertRaises(ChatAutomationError):
+                    adapter.scroll_older(context)
+
+    def test_program_file_never_uses_single_click_download_fallback(self):
+        """未下载程序没有明确下载入口时也不点击，避免微信下载后自动运行。"""
+        adapter = self.adapter(None)
+        adapter.cancelled = lambda: False
+        adapter._fresh_target = lambda *args: Node('文件\nsetup.exe\n未下载')
+        adapter._file_menu_download = lambda *args: 'unconfirmed'
+        adapter._bubble_point = Mock(side_effect=AssertionError('不应定位可执行文件'))
+        self.assertEqual(adapter._download_file(None, None, 1), 'unconfirmed')
+
+    def test_file_cannot_use_image_double_click_entry(self):
+        """即使调用者传错入口，也不能把文件作为图片双击打开。"""
+        adapter = self.adapter(None)
+        with self.assertRaises(ChatAutomationError):
+            adapter._open_bubble(None, ChatMessage('file', 'file', None), Mock())
+
+    def test_original_button_accepts_size_suffix_but_not_unrelated_text(self):
+        """原图按钮可以包含文件大小，但普通说明或正文不是下载入口。"""
+        button = Node('查看原图（1.2 MB）', kind='ButtonControl')
+        other = Node('查看原图说明', kind='ButtonControl')
+        text = Node('查看原图', kind='TextControl')
+        adapter = self.adapter(None)
+        adapter._nodes = lambda context: [button, other, text]
+        self.assertEqual(adapter._buttons(None, ORIGINAL_NAMES), [button])
+
+    def test_receipt_requires_exact_filename_and_cancels_only_matching_dialog(self):
+        """接收和取消操作都限定在本次文件名匹配的对话框内。"""
+        filename = Node('report.pdf', kind='TextControl')
+        accept = Node('接收文件', kind='ButtonControl')
+        cancel = Node('取消', kind='ButtonControl')
+        dialog = Node(cls='mmui::XDialog', children=(filename, accept, cancel))
+        adapter = self.adapter(None)
+        adapter._nodes = lambda context: [dialog]
+        adapter._click = Mock()
+        adapter._pause = lambda seconds: None
+        adapter.cancelled = lambda: False
+        adapter._file_receipt(None, 'other.pdf', accept=True)
+        adapter._click.assert_not_called()
+        adapter._file_receipt(None, 'report.pdf', accept=True)
+        adapter._click.assert_called_with(None, accept, cleanup=False)
+        adapter._file_receipt(None, 'report.pdf', accept=False)
+        adapter._click.assert_called_with(None, cancel, cleanup=True)
 
     def test_locked_desktop_stops_before_window_activation(self):
         """输入桌面不可访问时不尝试激活微信或发送按键。"""
