@@ -25,6 +25,9 @@ class AttachmentOptions:
     download_timeout: float = 30.0
     dry_run: bool = False
     compatibility: bool = False
+    image_route: str = 'messages'
+    previous_clicks: int = 100
+    image_interval: float = 1.0
 
     def __post_init__(self) -> None:
         """校验边界，0 条仅在给定日期时表示不限数量。"""
@@ -38,6 +41,12 @@ class AttachmentOptions:
             raise ValueError("至少选择图片或文件")
         if len(set(self.chats)) != len(self.chats) or any(not x.strip() for x in self.chats):
             raise ValueError("对话名称不能为空或重复")
+        if self.image_route not in {'messages', 'viewer'}:
+            raise ValueError('图片路线必须为 messages 或 viewer')
+        if self.previous_clicks < 0 or not 0.2 <= self.image_interval <= 60:
+            raise ValueError('上一张次数不能为负，图片间隔须在 0.2 至 60 秒之间')
+        if self.image_route == 'viewer' and (self.since is not None or not self.images):
+            raise ValueError('连续图片路线必须选择图片并清空截止日期；该路线只处理图片')
 
 
 @dataclass(frozen=True)
@@ -65,18 +74,22 @@ class ChatAdapter(Protocol):
     def open_forward(self, context: Any, message: ChatMessage) -> Any: ...
     def close_forward(self, child: Any, parent: Any) -> None: ...
     def cancelled(self) -> bool: ...
+    def resolve_day(self, context: Any, message: ChatMessage) -> date | None: ...
+    def prepare_dates(self, context: Any) -> None: ...
+    def browse_images(self, context: Any, message: ChatMessage, clicks: int,
+                      interval: float, progress: Callable[[str], None]) -> str: ...
+
+
+def page_identity(page: ChatPage) -> tuple:
+    """页面身份不包含后续补全的日期；控件实例仍参与衔接核验。"""
+    return tuple((m.signature, m.control[0] if isinstance(m.control, tuple) and len(m.control) == 2 else None)
+                 for m in page.messages)
 
 
 def older_prefix(previous: ChatPage, current: ChatPage) -> int:
     """返回新页前部新增消息数；无重叠或重复锚点不猜测。"""
-    def identity(message: ChatMessage) -> tuple:
-        """同次 UIA 会话使用消息实例标识，缺少标识时才使用语义锚点。"""
-        control = message.control
-        instance = control[0] if isinstance(control, tuple) and len(control) == 2 else None
-        return message.signature, instance
-
-    old = [identity(m) for m in previous.messages]
-    new = [identity(m) for m in current.messages]
+    old = page_identity(previous)
+    new = page_identity(current)
     if not old or not new:
         raise ChatAutomationError("消息列表变空，无法确认翻页位置")
     if old == new:
@@ -108,6 +121,8 @@ class ChatAttachmentService:
                 break
             try:
                 context = self.adapter.open_chat(requested)
+                if options.since:
+                    self.adapter.prepare_dates(context)
                 name = self.adapter.chat_name(context)
                 self._event("chat_started", chat=name)
                 budget = [options.max_forward_messages]
@@ -135,7 +150,7 @@ class ChatAttachmentService:
             page = self.adapter.read_page(context)
             if not page.messages:
                 return "empty"
-            if previous is not None and page.at_start and page.messages == previous.messages:
+            if previous is not None and page.at_start and page_identity(page) == page_identity(previous):
                 return "history_start"
             count = len(page.messages) if previous is None else older_prefix(previous, page)
             for message in reversed(page.messages[:count]):
@@ -153,11 +168,33 @@ class ChatAttachmentService:
                 # 外层时间决定整张合并转发是否在范围内。
                 if not path and options.since:
                     if message.day is None:
+                        self._event('date_resolving', chat=chat, path=item_path)
+                    day = message.day or self.adapter.resolve_day(context, message)
+                    if self.adapter.cancelled():
+                        return 'cancelled'
+                    if day is None:
                         self.counts["unknown_date"] += 1
                         self._event("skipped", chat=chat, path=item_path, reason="unknown_date")
                         continue
-                    if message.day < options.since:
+                    if message.day is None:
+                        self._event('date_resolved', chat=chat, path=item_path, day=day.isoformat())
+                    if day < options.since:
                         return "date_boundary"
+                if options.image_route == 'viewer':
+                    if message.kind != 'image':
+                        continue
+                    if options.dry_run:
+                        self.counts['candidate'] += 1
+                        self._event('candidate', chat=chat, path=item_path, kind='image')
+                        return 'viewer_candidate'
+                    viewer_counts: Counter = Counter()
+                    def progress(status: str) -> None:
+                        """记录预览和点击次数，不推断下载完成或图片唯一性。"""
+                        self.counts[status] += 1
+                        viewer_counts[status] += 1
+                        self._event('viewer_progress', chat=chat, status=status, count=viewer_counts[status])
+                    return self.adapter.browse_images(context, message, options.previous_clicks,
+                                                      options.image_interval, progress)
                 if message.kind == "forward" and options.forwards:
                     if options.dry_run:
                         self._event("candidate", chat=chat, path=item_path, kind="forward")
@@ -169,13 +206,14 @@ class ChatAttachmentService:
                     else:
                         child = self.adapter.open_forward(context, message)
                         try:
+                            self._event('forward_started', chat=chat, path=item_path)
                             reason = self._scan(child, options, chat, item_path, budget)
                             self._event("forward_stopped", chat=chat, path=item_path, reason=reason)
                         finally:
                             self.adapter.close_forward(child, context)
                 elif (message.kind == "image" and options.images) or (message.kind == "file" and options.files):
                     status = "candidate" if options.dry_run else self.adapter.download(context, message, options.download_timeout)
-                    if status not in {"candidate", "confirmed", "available", "unconfirmed", "expired", "failed", "cancelled"}:
+                    if status not in {"candidate", "confirmed", "available", "unconfirmed", "expired", "failed", "cancelled", "skipped_file"}:
                         raise ChatAutomationError(f"未知附件状态：{status}")
                     self.counts[status] += 1
                     self._event("attachment", chat=chat, path=item_path, kind=message.kind, status=status)
@@ -189,7 +227,7 @@ class ChatAttachmentService:
                 return "forward_message_limit"
             previous = page
             # 为点击刚露出的气泡而小幅滚动时，先处理因此新出现的消息，不能再叠加翻页。
-            if self.adapter.read_page(context).messages != page.messages:
+            if page_identity(self.adapter.read_page(context)) != page_identity(page):
                 continue
             self.adapter.scroll_older(context)
         return "cancelled"

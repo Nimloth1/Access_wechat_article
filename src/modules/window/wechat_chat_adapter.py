@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import ctypes
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, timedelta
 import hashlib
 from pathlib import Path
@@ -17,7 +17,7 @@ from src.modules.window.home_window_activation import WindowsHomeWindowGuard
 from src.modules.window.article_date_filter import normalize_home_date_text
 from src.modules.window.wechat_accessibility import temporary_accessibility
 from src.modules.window.wechat_home_window_finder import attach_uia_control, enumerate_desktop_windows, rect_to_tuple
-from src.services.chat_attachment_service import ChatAutomationError, ChatMessage, ChatPage
+from src.services.chat_attachment_service import ChatAutomationError, ChatMessage, ChatPage, older_prefix, page_identity
 
 
 MESSAGE_LIST_NAMES = {"消息", "Messages", "訊息"}
@@ -50,6 +50,8 @@ def unique(nodes: list[Any], label: str) -> Any:
 def message_day(text: str, today: date, inherited: date | None = None) -> date | None:
     """解析完整日期或明确相对日期；纯时刻只使用已知日期归属。"""
     text = text.strip()
+    # 点击时间标签后，微信会显示“9月8日 星期二 12:09”。
+    text = re.sub(r'(?<=日)\s+星期[一二三四五六日天](?=\s|$)', '', text)
     match = re.fullmatch(r"(\d{4})[年/.-](\d{1,2})[月/.-](\d{1,2})日?(?:\s+\d{1,2}:\d{2})?", text)
     if match:
         try:
@@ -89,6 +91,10 @@ class ChatContext:
     name: str
     forwarded: bool = False
     reached_start: bool = False
+    dates: dict[tuple, date] = field(default_factory=dict)
+    expanded_dates: set[tuple] = field(default_factory=set)
+    identities: dict[tuple, tuple] = field(default_factory=dict)
+    resolve_dates: bool = False
 
 
 class WechatChatAdapter:
@@ -260,6 +266,8 @@ class WechatChatAdapter:
     def read_page(self, context: ChatContext) -> ChatPage:
         """读取与视口相交的消息行，保留跨页长消息作为衔接锚点。"""
         listing = self._list(context)
+        if context.resolve_dates:
+            self._expand_dates(context, listing)
         viewport = rect_to_tuple(listing.BoundingRectangle)
         messages = []
         inherited = None
@@ -275,20 +283,24 @@ class WechatChatAdapter:
             # 时间分隔条不是聊天消息，不能消耗用户指定的条数。
             if row.ClassName == "mmui::ChatItemView":
                 # 时间行即使格式未知也不算聊天消息，并清除旧日期避免误归属。
-                inherited = message_day(row.Name, self.today, inherited)
+                inherited = message_day(row.Name, self.today, None if context.resolve_dates else inherited)
                 continue
             bounds = rect_to_tuple(row.BoundingRectangle)
             if row.IsOffscreen or bounds[3] <= viewport[1] or bounds[1] >= viewport[3] or bounds[3] <= bounds[1]:
                 continue
             kind, bubble = attachment_kind(nodes)
             # 不解析消息正文里的日期，防止把正文当作聊天时间。
-            day = inherited
+            raw_identity = tuple(row.GetRuntimeId())
+            identity = context.identities.get(raw_identity, raw_identity)
+            day = inherited or context.dates.get(identity)
+            if day is not None:
+                context.dates[identity] = day
             # 整条消息文本作为重叠锚点；下载状态按钮不进入锚点。
             content = row.Name or "\n".join(n.Name for n in nodes if n.ClassName.startswith("mmui::Chat"))
             if kind == "file":
                 content = "\n".join(content.splitlines()[:2])
             signature = hashlib.sha256((row.ClassName + "\n" + content).encode("utf-8")).hexdigest()
-            messages.append(ChatMessage(signature, kind, day, (tuple(row.GetRuntimeId()), bubble)))
+            messages.append(ChatMessage(signature, kind, day, (identity, bubble)))
         at_start = context.reached_start
         pattern = listing.GetScrollPattern()
         if pattern is not None:
@@ -297,6 +309,95 @@ class WechatChatAdapter:
         if not messages and listing.GetChildren():
             raise ChatAutomationError("消息列表有内容，但未识别到完整可见消息行，停止以免漏扫")
         return ChatPage(tuple(messages), at_start)
+
+    def prepare_dates(self, context: ChatContext) -> None:
+        """按日期运行时启用时间行展开；按条数运行不产生日期探查动作。"""
+        context.resolve_dates = True
+
+    def _expand_dates(self, context: ChatContext, listing: Any = None) -> None:
+        """单击可见的缩略时间行，读取微信展开的日期；同一行只尝试一次。"""
+        listing = self._list(context) if listing is None else listing
+        viewport = rect_to_tuple(listing.BoundingRectangle)
+        for row in listing.GetChildren():
+            if row.ClassName != 'mmui::ChatItemView':
+                continue
+            identity = tuple(row.GetRuntimeId())
+            bounds = rect_to_tuple(row.BoundingRectangle)
+            if (identity in context.expanded_dates or row.IsOffscreen or
+                    bounds[1] < viewport[1] or bounds[3] > viewport[3] or
+                    re.search(r'\d+[年月/-]\d+', row.Name)):
+                continue
+            self._click(context, row)
+            context.expanded_dates.add(identity)
+            deadline = time.monotonic() + 1
+            while message_day(row.Name, self.today) is None and time.monotonic() < deadline and not self.cancelled():
+                self._pause(0.1)
+            if message_day(row.Name, self.today) is None:
+                raise ChatAutomationError('点击时间标签后仍未读到完整日期，停止以免错误归属')
+
+    def resolve_day(self, context: ChatContext, message: ChatMessage) -> date | None:
+        """补全日期；必要时向前寻找相邻时间行，再原路滚回并核验消息位置。"""
+        target = message.control[0]
+        if target in context.dates:
+            return context.dates[target]
+        self._expand_dates(context)
+        original = self.read_page(context)
+        if target in context.dates:
+            return context.dates[target]
+        # 只传播连续且尚无日期分隔的区间；每次滚动都核验相邻消息重叠。
+        pending = {m.control[0] for m in original.messages if m.day is None}
+        original_layout = self._message_layout(context, original)
+        previous = original
+        steps, stationary = 0, 0
+        position = self._page_position(context)
+        try:
+            for _ in range(80):
+                if self.cancelled():
+                    return None
+                self._wheel(context, older=True)
+                steps += 1
+                self._pause(0.2)
+                self._expand_dates(context)
+                current = self.read_page(context)
+                if page_identity(current) != page_identity(previous):
+                    older_prefix(previous, current)
+                dates = {m.day for m in current.messages if m.control[0] in pending and m.day is not None}
+                if len(dates) > 1:
+                    raise ChatAutomationError('补全日期时区间出现多个日期，停止以免错误归属')
+                if dates:
+                    found = dates.pop()
+                    context.dates.update({key: found for key in pending})
+                    return found
+                pending.update(m.control[0] for m in current.messages if m.day is None)
+                current_position = self._page_position(context)
+                stationary = stationary + 1 if current_position == position else 0
+                if stationary >= 3:
+                    break
+                previous, position = current, current_position
+            return None
+        finally:
+            if not self.cancelled():
+                for _ in range(steps):
+                    self._wheel(context, older=False)
+                    self._pause(0.2)
+                restored = self.read_page(context)
+                if page_identity(restored) != page_identity(original):
+                    # 滚出视口的控件可能被重建；完整有序内容和逐行位置均恢复才重新绑定。
+                    if self._message_layout(context, restored) != original_layout:
+                        raise ChatAutomationError('补全日期后未能恢复原消息位置，停止以免漏扫')
+                    for old, new in zip(original.messages, restored.messages):
+                        old_id, new_id = old.control[0], new.control[0]
+                        for raw, canonical in list(context.identities.items()):
+                            if canonical == new_id:
+                                context.identities[raw] = old_id
+                        context.identities[new_id] = old_id
+                        if new.day:
+                            context.dates[old_id] = new.day
+
+    def _message_layout(self, context: ChatContext, page: ChatPage) -> tuple:
+        """读取各消息有序内容与矩形，用于日期探查后的整页返回核验。"""
+        rectangles = {context.identities.get(key, key): bounds for key, bounds in self._page_position(context)}
+        return tuple((m.signature, rectangles[m.control[0]]) for m in page.messages)
 
     def _fresh_target(self, context: ChatContext, message: ChatMessage) -> Any:
         """返回操作前重新定位的气泡；布局重建不凭旧坐标继续。"""
@@ -525,6 +626,34 @@ class WechatChatAdapter:
         finally:
             self.close_forward(child, context)
 
+    def browse_images(self, context: ChatContext, message: ChatMessage, clicks: int,
+                      interval: float, progress: Any) -> str:
+        """打开一张图片后连续点击上一张；仅记录动作，不推断日期和原图完成。"""
+        child = self._child_window(context, message, PREVIEW_CLASS)
+        try:
+            progress('preview_opened')
+            for index in range(clicks + 1):
+                if self.cancelled():
+                    return 'cancelled'
+                originals = self._buttons(child, ORIGINAL_NAMES)
+                if originals:
+                    self._click(child, unique(originals, '查看原图按钮'))
+                self._pause(interval)
+                if self.cancelled():
+                    return 'cancelled'
+                if index == clicks:
+                    return 'previous_limit'
+                buttons = self._buttons(child, {'上一张', '上一張', 'Previous'})
+                if not buttons:
+                    return 'previous_unavailable'
+                button = unique(buttons, '上一张按钮')
+                if not button.IsEnabled:
+                    return 'previous_unavailable'
+                self._click(child, button)
+                progress('previous_clicked')
+        finally:
+            self.close_forward(child, context)
+
     def _download_file(self, context: ChatContext, message: ChatMessage, timeout: float) -> str:
         """使用下载按钮或未下载文档的单击入口；已可用文件不再打开。"""
         deadline = time.monotonic() + timeout
@@ -543,11 +672,14 @@ class WechatChatAdapter:
             buttons = [n for n in nodes if n.ControlTypeName == "ButtonControl" and
                        n.Name.strip() in DOWNLOAD_NAMES and not n.IsOffscreen]
             if not clicked:
+                missing = any(re.search(r'(?:^|\s)未下载(?:\s|$)', n.Name) for n in nodes)
+                if not missing and not buttons:
+                    return 'skipped_file'
                 if not buttons:
                     lines = self._fresh_target(context, message).Name.splitlines()
                     # 本机微信未下载文档没有下载菜单，单击会下载后交给关联查看器。
                     # 只允许普通文档/压缩包；程序、脚本、快捷方式不使用这个回退入口。
-                    if '未下载' in lines and len(lines) >= 2 and Path(lines[1]).suffix.lower() in {
+                    if missing and len(lines) >= 2 and Path(lines[1]).suffix.lower() in {
                             '.pdf', '.docx', '.xlsx', '.pptx', '.txt', '.csv', '.zip', '.rar', '.7z'}:
                         bubble = self._fresh_target(context, message)
                         x, y = self._bubble_point(context, message, bubble)

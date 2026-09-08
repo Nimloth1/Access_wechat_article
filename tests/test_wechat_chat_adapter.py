@@ -64,6 +64,60 @@ class WechatChatAdapterTests(unittest.TestCase):
         self.assertIsNone(page.messages[0].day)
         self.assertEqual(page.messages[1].day, date(2026, 9, 5))
 
+    def test_date_scan_clicks_short_time_once_and_reads_expanded_label(self):
+        """按日期扫描展开时间标签一次，使用控件文字而非正文或 OCR。"""
+        header = Node('10:00', cls='mmui::ChatItemView')
+        row = Node('message', identity=2)
+        listing = Node(kind='ListControl', children=(header, row), rect=(0, 0, 400, 500))
+        adapter = self.adapter(listing)
+        adapter._pause = Mock()
+        adapter._click = Mock(side_effect=lambda context, node: setattr(node, 'Name', '9月5日 星期六 10:00'))
+        context = ChatContext(None, 'A', resolve_dates=True)
+        self.assertEqual(adapter.read_page(context).messages[0].day, date(2026, 9, 5))
+        adapter.read_page(context)
+        adapter._click.assert_called_once_with(context, header)
+
+    def test_date_probe_rebinds_rebuilt_rows_only_after_full_layout_match(self):
+        """探查日期后仅在有序内容和位置均恢复时接受重建控件。"""
+        for same_layout in (True, False):
+            adapter = self.adapter(None)
+            context = ChatContext(None, 'A')
+            original = ChatPage((ChatMessage('a', 'image', None, ((1,), None)),))
+            dated = ChatPage((ChatMessage('a', 'image', date(2026, 9, 5), ((1,), None)),))
+            restored = ChatPage((ChatMessage('a', 'image', None, ((2,), None)),))
+            adapter.read_page = Mock(side_effect=[original, dated, restored])
+            adapter._expand_dates = Mock()
+            adapter._message_layout = Mock(side_effect=[('original',), ('original' if same_layout else 'changed',)])
+            adapter._page_position = Mock(return_value=('position',))
+            adapter._wheel = Mock()
+            adapter._pause = Mock()
+            adapter.cancelled = lambda: False
+            if same_layout:
+                self.assertEqual(adapter.resolve_day(context, original.messages[0]), date(2026, 9, 5))
+                self.assertEqual(context.identities[(2,)], (1,))
+            else:
+                with self.assertRaises(ChatAutomationError):
+                    adapter.resolve_day(context, original.messages[0])
+                self.assertFalse(context.identities)
+            self.assertEqual([c.kwargs['older'] for c in adapter._wheel.call_args_list], [True, False])
+
+    def test_date_probe_never_accepts_lost_page_overlap(self):
+        """向前找日期时跳过消息必须报错，不能把远处日期赋给目标。"""
+        adapter = self.adapter(None)
+        original = ChatPage((ChatMessage('a', 'image', None, ((1,), None)),))
+        unrelated = ChatPage((ChatMessage('b', 'image', date(2026, 9, 5), ((2,), None)),))
+        adapter.read_page = Mock(side_effect=[original, unrelated, original])
+        adapter._expand_dates = Mock()
+        adapter._message_layout = Mock(return_value=('layout',))
+        adapter._page_position = Mock(return_value=('position',))
+        adapter._wheel = Mock()
+        adapter._pause = Mock()
+        adapter.cancelled = lambda: False
+        context = ChatContext(None, 'A')
+        with self.assertRaises(ChatAutomationError):
+            adapter.resolve_day(context, original.messages[0])
+        self.assertFalse(context.dates)
+
     def test_partial_row_is_counted_without_using_row_center(self):
         """跨页长消息保留作重叠锚点；附件打开使用控件 Invoke 而非行中心。"""
         partial = Node('partial', rect=(0, -10, 300, 100))
@@ -97,7 +151,63 @@ class WechatChatAdapterTests(unittest.TestCase):
         adapter._fresh_target = lambda *args: Node('附件.exe')
         adapter._file_menu_download = lambda *args: 'unconfirmed'
         adapter._click = lambda *args, **kwargs: self.fail('不应点击附件文件')
-        self.assertEqual(adapter._download_file(None, None, 1), 'unconfirmed')
+        self.assertEqual(adapter._download_file(None, None, 1), 'skipped_file')
+
+    def test_file_without_missing_marker_never_opens_menu(self):
+        """没有未下载标记直接跳过，不浪费右键菜单核验动作。"""
+        adapter = self.adapter(None)
+        adapter.cancelled = lambda: False
+        adapter._fresh_target = lambda *args: Node('文件\nreport.pdf\n2.8M')
+        adapter._file_menu_download = Mock(side_effect=AssertionError('不应打开菜单'))
+        self.assertEqual(adapter._download_file(None, None, 1), 'skipped_file')
+
+    def test_missing_marker_on_size_line_triggers_document_download(self):
+        """大小和未下载在同一行时仍能识别，已下载文件不进入此入口。"""
+        bubble = Node('文件\nreport.pdf\n2.8M 未下载')
+        bubble.Click = Mock()
+        adapter = self.adapter(None)
+        adapter.cancelled = lambda: False
+        adapter._fresh_target = lambda *args: bubble
+        adapter._bubble_point = lambda *args: (80, 50)
+        adapter._file_receipt = Mock()
+        adapter._file_menu_download = Mock(return_value='confirmed')
+        self.assertEqual(adapter._download_file(None, None, 1), 'confirmed')
+        bubble.Click.assert_called_once()
+        adapter._file_receipt.assert_called_with(None, 'report.pdf', accept=False)
+
+    def test_viewer_limits_clicks_and_always_closes_preview(self):
+        """N 次上一张之外保留起始图片，取消和异常均关闭本次预览。"""
+        for failure in (False, True):
+            adapter = self.adapter(None)
+            adapter._child_window = Mock(return_value='preview')
+            adapter._buttons = lambda context, names: [] if names == ORIGINAL_NAMES else [SimpleNamespace(IsEnabled=True)]
+            adapter._pause = Mock()
+            adapter.cancelled = lambda: False
+            adapter._click = Mock(side_effect=ChatAutomationError('failed') if failure else None)
+            adapter.close_forward = Mock()
+            progress = Mock()
+            if failure:
+                with self.assertRaises(ChatAutomationError):
+                    adapter.browse_images('parent', None, 3, 1, progress)
+            else:
+                self.assertEqual(adapter.browse_images('parent', None, 3, 1, progress), 'previous_limit')
+                self.assertEqual(adapter._click.call_count, 3)
+                self.assertEqual(adapter._pause.call_count, 4)
+                self.assertEqual([c.args[0] for c in progress.call_args_list],
+                                 ['preview_opened'] + ['previous_clicked'] * 3)
+            adapter.close_forward.assert_called_once_with('preview', 'parent')
+
+    def test_viewer_disabled_previous_stops_without_clicking(self):
+        """上一张到边界不可用时不继续空点。"""
+        adapter = self.adapter(None)
+        adapter._child_window = lambda *args: 'preview'
+        adapter._buttons = lambda context, names: [] if names == ORIGINAL_NAMES else [SimpleNamespace(IsEnabled=False)]
+        adapter._pause = Mock()
+        adapter.cancelled = lambda: False
+        adapter._click = Mock()
+        adapter.close_forward = Mock()
+        self.assertEqual(adapter.browse_images(None, None, 3, 1, Mock()), 'previous_unavailable')
+        adapter._click.assert_not_called()
 
     def test_scroll_waits_through_long_message_and_returns_when_new_row_appears(self):
         """长消息滚动中身份未变化仍继续，出现新行后立即交给服务核验衔接。"""

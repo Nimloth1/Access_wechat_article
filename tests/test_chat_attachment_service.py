@@ -2,7 +2,7 @@
 """附件任务的边界与恢复测试，模拟多屏真实消息序列。"""
 from datetime import date
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from chat_attachments import options_from_dict, parse_args
 from src.services.chat_attachment_service import (
@@ -73,6 +73,14 @@ class FakeAdapter:
     def cancelled(self):
         """返回模拟停止状态。"""
         return self.stop
+
+    def resolve_day(self, context, message):
+        """默认无法补全日期，具体测试可替换解析结果。"""
+        return None
+
+    def prepare_dates(self, context):
+        """模拟适配器不需要操作日期标签。"""
+        pass
 
 
 class ChatAttachmentServiceTests(unittest.TestCase):
@@ -170,6 +178,35 @@ class ChatAttachmentServiceTests(unittest.TestCase):
         self.assertEqual(adapter.downloaded, [('当前', 'new'), ('当前', 'boundary')])
         self.assertEqual(result['unknown_date'], 1)
         self.assertTrue(any(e.get('reason') == 'date_boundary' for e in events))
+
+    def test_expanded_date_allows_forward_and_respects_boundary(self):
+        """未知日期补全后，范围内进入转发，范围外直接停止。"""
+        for resolved in (TODAY, date(2020, 1, 1)):
+            adapter = FakeAdapter({'当前': [ChatPage((msg('f', 'forward', None),), True)],
+                                   '子': [ChatPage((msg('file', 'file'),), True)]}, {'f': '子'})
+            adapter.resolve_day = Mock(return_value=resolved)
+            result, _ = self.run_task(adapter, since=TODAY)
+            self.assertEqual(len(adapter.downloaded), int(resolved == TODAY))
+            self.assertNotIn('unknown_date', result)
+
+    def test_viewer_route_opens_once_and_ignores_file_and_forward(self):
+        """连续模式找到图片后只运行一次预览任务，不进入转发或打开文件。"""
+        adapter = FakeAdapter({'当前': [ChatPage((msg('image'), msg('f', 'forward'), msg('file', 'file')))]})
+        adapter.browse_images = Mock(return_value='previous_limit')
+        result, _ = self.run_task(adapter, image_route='viewer', previous_clicks=3, image_interval=1.5)
+        self.assertEqual(result['messages'], 3)
+        self.assertEqual(adapter.downloaded, [])
+        self.assertEqual(adapter.closed, [])
+        self.assertEqual(adapter.browse_images.call_count, 1)
+        self.assertEqual(adapter.browse_images.call_args.args[2:4], (3, 1.5))
+
+    def test_viewer_dry_run_never_opens_preview(self):
+        """连续图片路线的试扫描只找起始候选。"""
+        adapter = FakeAdapter({'当前': [ChatPage((msg('image'),))]})
+        adapter.browse_images = Mock()
+        result, _ = self.run_task(adapter, image_route='viewer', dry_run=True)
+        adapter.browse_images.assert_not_called()
+        self.assertEqual(result['candidate'], 1)
 
     def test_forward_uses_outer_date_and_separate_budget(self):
         """范围内转发卡片可包含较早的内部消息，内部不消耗外层条数。"""
@@ -269,6 +306,17 @@ class ConfigurationAndRecognitionTests(unittest.TestCase):
         self.assertEqual(message_day('12月31日 12:30', date(2026, 1, 2)), date(2025, 12, 31))
         self.assertIsNone(message_day('2026-02-30', TODAY))
         self.assertIsNone(message_day('会议时间2020-01-01', TODAY))
+        self.assertEqual(message_day('9月8日 星期二 12:09', date(2026, 9, 8)), date(2026, 9, 8))
+        self.assertEqual(message_day('2025年9月8日 星期一 12:09', TODAY), date(2025, 9, 8))
+
+    def test_viewer_config_rejects_date_and_invalid_limits(self):
+        """连续图片不能悄悄忽略日期，也不接受错误的次数或等待时间。"""
+        for values in ({'image_route': 'viewer', 'since': '2026-09-01'},
+                       {'image_route': 'viewer', 'images': False}, {'previous_clicks': -1},
+                       {'previous_clicks': True}, {'image_interval': float('nan')},
+                       {'image_interval': '1'}, {'image_route': 'unknown'}):
+            with self.subTest(values=values), self.assertRaises(ValueError):
+                options_from_dict(values)
 
     def test_text_about_files_is_not_an_attachment(self):
         """类型识别必须同时匹配结构和标签。"""
