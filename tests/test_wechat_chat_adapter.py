@@ -3,7 +3,7 @@
 from datetime import date
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 from src.modules.window.wechat_chat_adapter import ChatContext, ORIGINAL_NAMES, WechatChatAdapter
 from src.services.chat_attachment_service import ChatAutomationError, ChatMessage, ChatPage
@@ -256,6 +256,56 @@ class WechatChatAdapterTests(unittest.TestCase):
         adapter = self.adapter(None)
         with self.assertRaises(ChatAutomationError):
             adapter._open_bubble(None, ChatMessage('file', 'file', None), Mock())
+
+    def test_attachment_point_excludes_sender_at_each_window_scale(self):
+        """模拟头像比附件更深色的消息，100/150/200% 下均只能选中正文。"""
+        for dpi in (96, 144, 192):
+            for kind in ('image', 'forward', 'file'):
+                with self.subTest(dpi=dpi, kind=kind):
+                    scale = dpi / 96
+                    row = (100, 200, 100 + round(740 * scale), 200 + round(200 * scale))
+                    bubble = Node(rect=row)
+                    listing = Node(kind='ListControl', rect=(row[0], row[1], row[2], row[3] + 100))
+                    adapter = self.adapter(listing)
+                    adapter._activate = Mock()
+                    adapter._fresh_target = lambda *args: bubble
+                    adapter.cancelled = lambda: False
+                    adapter.guard = SimpleNamespace(ensure_target_clickable=Mock())
+                    context = ChatContext(SimpleNamespace(handle=1), 'A')
+
+                    def capture(**crop):
+                        """生成局部像素：头像/昵称黑色，附件灰色，其余白色。"""
+                        adapter._activate.assert_called()
+                        bitmap = MagicMock()
+                        bitmap.Width, bitmap.Height = crop['width'], crop['height']
+                        bitmap.__enter__.return_value = bitmap
+
+                        def pixel(x, y):
+                            """按消息中的逻辑位置返回颜色，以复现固定像素裁剪误点。"""
+                            x, y = (crop['x'] + x) / scale, (crop['y'] + y) / scale
+                            if (20 <= x <= 56 and 8 <= y <= 44) or (64 <= x <= 160 and 8 <= y <= 26):
+                                return 0
+                            return 0xBBBBBB if 64 <= x <= 280 and 36 <= y <= 180 else 0xFFFFFF
+
+                        bitmap.GetPixelColor.side_effect = pixel
+                        return bitmap
+
+                    listing.ToBitmap = capture
+                    user32 = SimpleNamespace(GetDpiForWindow=Mock(return_value=dpi))
+                    with patch('ctypes.windll', SimpleNamespace(user32=user32), create=True):
+                        x, y = adapter._bubble_point(context, ChatMessage('a', kind, None), bubble)
+                    self.assertTrue(64 <= x / scale <= 280)
+                    self.assertTrue(36 <= y / scale <= 180)
+
+    def test_unknown_window_scale_stops_before_capture(self):
+        """无法读取缩放时禁止退回固定像素并点击。"""
+        adapter = self.adapter(None)
+        adapter._activate = Mock()
+        context = ChatContext(SimpleNamespace(handle=1), 'A')
+        user32 = SimpleNamespace(GetDpiForWindow=Mock(return_value=0))
+        with patch('ctypes.windll', SimpleNamespace(user32=user32), create=True):
+            with self.assertRaisesRegex(ChatAutomationError, '缩放'):
+                adapter._bubble_point(context, ChatMessage('a', 'image', None), None)
 
     def test_original_button_accepts_size_suffix_but_not_unrelated_text(self):
         """原图按钮可以包含文件大小，但普通说明或正文不是下载入口。"""

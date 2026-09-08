@@ -499,13 +499,19 @@ class WechatChatAdapter:
         """在已识别附件正文内定位可见内容，避开整行中心的空白和头像。"""
         if message.kind not in {'image', 'forward', 'file'}:
             raise ChatAutomationError('只允许定位附件气泡')
+        self._activate(context)
+        dpi = ctypes.windll.user32.GetDpiForWindow(context.window.handle)
+        if dpi <= 0:
+            raise ChatAutomationError('无法读取微信窗口缩放，未点击附件')
+        # UIA 矩形使用物理像素；头像和昵称的排除距离必须随窗口 DPI 同步放大。
+        side, header, inset = (round(value * dpi / 96) for value in (64, 36, 8))
         listing = self._list(context)
         viewport = rect_to_tuple(listing.BoundingRectangle)
         row = rect_to_tuple(bubble.BoundingRectangle)
         # 倒序扫描时最早一条可能刚露出底边；先让正文进入视口再定位。
         for _ in range(20):
-            visible_height = min(row[3] - 8, viewport[3]) - max(row[1] + 36, viewport[1])
-            if visible_height >= 64 or row[1] >= viewport[1]:
+            visible_height = min(row[3] - inset, viewport[3]) - max(row[1] + header, viewport[1])
+            if visible_height >= side or row[1] >= viewport[1]:
                 break
             self._wheel(context, older=True)
             self._pause(0.3)
@@ -513,8 +519,8 @@ class WechatChatAdapter:
             listing = self._list(context)
             viewport = rect_to_tuple(listing.BoundingRectangle)
             row = rect_to_tuple(bubble.BoundingRectangle)
-        top, bottom = max(row[1] + 36, viewport[1]), min(row[3] - 8, viewport[3])
-        left, right = max(row[0] + 64, viewport[0]), min(row[2] - 64, viewport[2])
+        top, bottom = max(row[1] + header, viewport[1]), min(row[3] - inset, viewport[3])
+        left, right = max(row[0] + side, viewport[0]), min(row[2] - side, viewport[2])
         if right - left < 24 or bottom - top < 24:
             raise ChatAutomationError('附件可见内容不足，请调整起始位置后重试')
         # 仅在已核验消息的正文区域采样；不持久化图像，不调用外部识别服务。
@@ -532,8 +538,9 @@ class WechatChatAdapter:
             if score < 450:
                 raise ChatAutomationError('未能在附件消息内定位可见内容，未点击')
         fresh = self._fresh_target(context, message)
-        if rect_to_tuple(fresh.BoundingRectangle) != row:
-            raise ChatAutomationError('截图后消息位置已改变，未点击')
+        if (rect_to_tuple(fresh.BoundingRectangle) != row or
+                ctypes.windll.user32.GetDpiForWindow(context.window.handle) != dpi):
+            raise ChatAutomationError('截图后消息位置或窗口缩放已改变，未点击')
         self._activate(context)
         from types import SimpleNamespace
         self.guard.ensure_target_clickable(context.window, SimpleNamespace(
