@@ -402,14 +402,14 @@ class WechatChatAdapter:
         if self._message_layout(context, restored) != layout:
             raise ChatAutomationError('未能恢复原消息位置，停止以免漏扫')
         if page_identity(restored) != page_identity(original):
+            replacements = {new.control[0]: old.control[0] for old, new in zip(original.messages, restored.messages)}
+            # 一次性替换，避免控件标识交换时逐项更新把两个消息合并成同一个。
+            context.identities = {raw: replacements.get(canonical, canonical)
+                                  for raw, canonical in context.identities.items()}
+            context.identities.update(replacements)
             for old, new in zip(original.messages, restored.messages):
-                old_id, new_id = old.control[0], new.control[0]
-                for raw, canonical in list(context.identities.items()):
-                    if canonical == new_id:
-                        context.identities[raw] = old_id
-                context.identities[new_id] = old_id
                 if new.day:
-                    context.dates[old_id] = new.day
+                    context.dates[old.control[0]] = new.day
 
     def _restore_attachment_position(self, context: ChatContext) -> None:
         """底部附件处理完后撤回临时滚动，恢复扫描锚点；取消后不再滚动。"""
@@ -436,36 +436,51 @@ class WechatChatAdapter:
             raise ChatAutomationError("没有可确认的附件气泡")
         return target.control[1]
 
-    def scroll_older(self, context: ChatContext) -> None:
-        """在消息列表内小幅向上滚动，保留翻页重叠锚点。"""
+    def scroll_older(self, context: ChatContext, *, recover: bool = True) -> bool:
+        """小幅向上翻页；控件重建时退回核验整页再翻一次，返回是否恢复过。"""
         listing = self._list(context)
         self._activate(context)
         if self.cancelled():
-            return
+            return False
         pattern = listing.GetScrollPattern()
         if pattern is not None and pattern.VerticallyScrollable:
             pattern.Scroll(self.auto.ScrollAmount.NoAmount, self.auto.ScrollAmount.SmallDecrement)
             self._pause(0.6)
-            return
+            return False
         # 微信未提供 ScrollPattern 时，使用视口内小幅滚轮，不依赖消息方向键。
-        before = tuple((m.signature, m.control[0]) for m in self.read_page(context).messages)
+        original = self.read_page(context)
+        before = page_identity(original)
+        layout = self._message_layout(context, original)
         position = self._page_position(context)
         stationary = 0
-        for _ in range(200):
+        for step in range(1, 201):
             if self.cancelled():
-                return
+                return False
             self._wheel(context, older=True)
             self._pause(0.4)
-            after = tuple((m.signature, m.control[0]) for m in self.read_page(context).messages)
-            if after != before:
-                return
+            current = self.read_page(context)
+            if page_identity(current) != before:
+                try:
+                    older_prefix(original, current)
+                except ChatAutomationError:
+                    if not recover:
+                        raise
+                    # 加载历史可能重建整个可见列表。先撤回本次滚动，核验原页完整
+                    # 内容、顺序及几何位置，再重绑新控件；不能凭“都是图片”直接匹配。
+                    for _ in range(step):
+                        self._wheel(context, older=False)
+                        self._pause(0.3)
+                    self._verify_restored_page(context, original, layout, self.read_page(context))
+                    self.scroll_older(context, recover=False)
+                    return True
+                return False
             current_position = self._page_position(context)
             stationary = stationary + 1 if current_position == position else 0
             position = current_position
             if stationary >= 3:
                 if context.forwarded:
                     context.reached_start = True
-                    return
+                    return False
                 break
         raise ChatAutomationError("消息列表没有向前移动，未确认已读完历史")
 

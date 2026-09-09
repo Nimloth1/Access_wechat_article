@@ -263,6 +263,7 @@ class WechatChatAdapterTests(unittest.TestCase):
         adapter._pause = lambda seconds: None
         adapter._wheel = Mock()
         adapter._page_position = Mock(side_effect=[(100,), (80,)])
+        adapter._message_layout = Mock(return_value=('layout',))
         first = ChatMessage('one', 'text', None, ((1,), None))
         earlier = ChatMessage('zero', 'text', None, ((2,), None))
         adapter.read_page = Mock(side_effect=[ChatPage((first,)), ChatPage((first,)), ChatPage((earlier, first))])
@@ -336,6 +337,7 @@ class WechatChatAdapterTests(unittest.TestCase):
             adapter._pause = lambda seconds: None
             adapter._wheel = Mock()
             adapter._page_position = lambda context: (100,)
+            adapter._message_layout = Mock(return_value=('layout',))
             adapter.read_page = lambda context: ChatPage((ChatMessage('one', 'text', None, ((1,), None)),))
             context = ChatContext(None, 'A', forwarded)
             if forwarded:
@@ -344,6 +346,49 @@ class WechatChatAdapterTests(unittest.TestCase):
             else:
                 with self.assertRaises(ChatAutomationError):
                     adapter.scroll_older(context)
+
+    def test_scroll_rebuild_restores_whole_page_then_retries_once(self):
+        """整页控件重建先退回核验；原位不符或第二次仍重建均停止，不无限重试。"""
+        from dataclasses import replace
+        def page(ids):
+            """用同名图片模拟不能直接按正文区分的控件。"""
+            return ChatPage(tuple(ChatMessage('图片', 'image', None, ((i,), None)) for i in ids))
+        for failure in ('', 'layout', 'again'):
+            with self.subTest(failure=failure):
+                adapter = self.adapter(Node(kind='ListControl'))
+                adapter._activate = Mock()
+                adapter._pause = Mock()
+                adapter._wheel = Mock()
+                adapter.cancelled = lambda: False
+                adapter._page_position = Mock(return_value=())
+                adapter._message_layout = Mock(side_effect=[('original',),
+                    ('different' if failure == 'layout' else 'original',), ('original',)])
+                snapshots = iter([page((1, 2)), page((9, 11, 12)), page((11, 12)),
+                                  page((11, 12)), page((9, 21, 22) if failure == 'again' else (9, 11, 12))])
+                def read(context):
+                    """与真实读取一样应用已核验的控件别名。"""
+                    return ChatPage(tuple(replace(m, control=(context.identities.get(m.control[0], m.control[0]), None))
+                                          for m in next(snapshots).messages))
+                adapter.read_page = read
+                context = ChatContext(None, 'A')
+                if failure:
+                    with self.assertRaises(ChatAutomationError):
+                        adapter.scroll_older(context)
+                else:
+                    self.assertTrue(adapter.scroll_older(context))
+                    self.assertEqual(context.identities, {(11,): (1,), (12,): (2,)})
+                self.assertEqual([call.kwargs['older'] for call in adapter._wheel.call_args_list],
+                                 [True, False] if failure == 'layout' else [True, False, True])
+
+    def test_rebinding_swapped_ids_does_not_merge_messages(self):
+        """微信重用并交换控件标识时同时更新映射，不能把两条消息合并。"""
+        adapter = self.adapter(None)
+        adapter._message_layout = Mock(return_value=('layout',))
+        original = ChatPage((ChatMessage('a', 'image', None, ((1,), None)), ChatMessage('b', 'image', None, ((2,), None))))
+        restored = ChatPage((ChatMessage('a', 'image', None, ((2,), None)), ChatMessage('b', 'image', None, ((1,), None))))
+        context = ChatContext(None, 'A', identities={(1,): (1,), (2,): (2,)})
+        adapter._verify_restored_page(context, original, ('layout',), restored)
+        self.assertEqual(context.identities, {(1,): (2,), (2,): (1,)})
 
     def test_program_file_never_uses_single_click_download_fallback(self):
         """未下载程序没有明确下载入口时也不点击，避免微信下载后自动运行。"""

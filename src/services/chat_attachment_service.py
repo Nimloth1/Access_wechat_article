@@ -70,7 +70,7 @@ class ChatAdapter(Protocol):
     def open_chat(self, name: str | None) -> Any: ...
     def chat_name(self, context: Any) -> str: ...
     def read_page(self, context: Any) -> ChatPage: ...
-    def scroll_older(self, context: Any) -> None: ...
+    def scroll_older(self, context: Any) -> bool: ...
     def download(self, context: Any, message: ChatMessage, timeout: float) -> str: ...
     def open_forward(self, context: Any, message: ChatMessage) -> Any: ...
     def close_forward(self, child: Any, parent: Any) -> None: ...
@@ -88,17 +88,19 @@ def page_identity(page: ChatPage) -> tuple:
 
 
 def older_prefix(previous: ChatPage, current: ChatPage) -> int:
-    """返回新页前部新增消息数；无重叠或重复锚点不猜测。"""
+    """定位旧页最早消息在新页中的唯一位置，核验整个共同范围后返回新增数。"""
     old = page_identity(previous)
     new = page_identity(current)
     if not old or not new:
         raise ChatAutomationError("消息列表变空，无法确认翻页位置")
     if old == new:
         raise ChatAutomationError("滚动后消息未变化，未确认已到历史起点")
-    matches = [n for n in range(1, min(len(old), len(new)) + 1) if new[-n:] == old[:n]]
+    # 消息高度或视口变化时，重叠段后面还可能露出较新消息，不能强制重叠贴住新页底部。
+    matches = [start for start in range(len(new))
+               if new[start:start + len(old)] == old[:min(len(old), len(new) - start)]]
     if len(matches) != 1:
         raise ChatAutomationError("翻页重叠消息缺失或有歧义，已停止以免漏计或重复下载")
-    return len(new) - matches[0]
+    return matches[0]
 
 
 class ChatAttachmentService:
@@ -153,7 +155,13 @@ class ChatAttachmentService:
                 return "empty"
             if previous is not None and page.at_start and page_identity(page) == page_identity(previous):
                 return "history_start"
-            count = len(page.messages) if previous is None else older_prefix(previous, page)
+            try:
+                count = len(page.messages) if previous is None else older_prefix(previous, page)
+            except ChatAutomationError:
+                # 仅保存摘要与控件标识，不保存正文；下次失败能区分布局变化与身份丢失。
+                self._event('pagination_error', chat=chat, path=path,
+                            previous=page_identity(previous), current=page_identity(page))
+                raise
             for message in reversed(page.messages[:count]):
                 if self.adapter.cancelled():
                     return "cancelled"
@@ -230,5 +238,6 @@ class ChatAttachmentService:
             # 为点击刚露出的气泡而小幅滚动时，先处理因此新出现的消息，不能再叠加翻页。
             if page_identity(self.adapter.read_page(context)) != page_identity(page):
                 continue
-            self.adapter.scroll_older(context)
+            if self.adapter.scroll_older(context):
+                self._event('pagination_recovered', chat=chat, path=path)
         return "cancelled"

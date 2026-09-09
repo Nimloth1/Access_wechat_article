@@ -7,10 +7,11 @@
 # version: 1.5 @20260908: 滚动前重新读取布局并有界恢复遮挡，完善错误摘要;
 # version: 1.6 @20260908: 文件接收期间轮询状态，取消单击后的右键核验;
 # version: 1.7 @20260909: 修复起始页底部附件仅露出昵称时失败，处理后恢复扫描位置;
+# version: 1.8 @20260909: 控件重建后返回原页核验并恢复翻页，支持重叠段后露出较新消息;
 """独立运行聊天附件任务；不启动公众号代理服务。"""
 from __future__ import annotations
 
-__version__ = 'v1.7'
+__version__ = 'v1.8'
 __platform__ = 'nt'
 __pc__ = ['PW', 'AW', 'BW', 'UU', 'PM']
 __py__ = 'py3.13+'
@@ -69,6 +70,10 @@ def event_message(event: dict) -> str:
         return prefix + '任务停止：' + event['detail']
     if kind == 'scan_progress':
         return prefix + f"已扫描 {event['scanned']} 条" + ('内部消息' if event.get('path') else '消息')
+    if kind == 'pagination_error':
+        return prefix + '消息衔接未通过核验，已记录前后页面标识'
+    if kind == 'pagination_recovered':
+        return prefix + '微信重建了消息列表，已返回原页核验并恢复翻页'
     if kind == 'finished':
         counts = event['counts']
         return (f"任务结束：扫描外层 {counts.get('messages', 0)} 条、转发内部 {counts.get('forward_messages', 0)} 条；"

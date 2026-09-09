@@ -114,6 +114,40 @@ class ChatAttachmentServiceTests(unittest.TestCase):
         with self.assertRaises(ChatAutomationError):
             older_prefix(ChatPage((msg('b'),)), ChatPage((msg('a'),)))
 
+    def test_overlap_may_be_inside_expanded_viewport(self):
+        """视口扩展后重叠段不必在新页末尾；只处理旧页最早锚点之前的消息。"""
+        self.assertEqual(older_prefix(ChatPage(tuple(map(msg, 'bc'))), ChatPage(tuple(map(msg, 'abcd')))), 1)
+        self.assertEqual(older_prefix(ChatPage(tuple(map(msg, 'bc'))), ChatPage(tuple(map(msg, 'bcd')))), 0)
+
+    def test_expanded_page_never_reprocesses_newer_messages(self):
+        """布局变化露出较新消息不扩大起始边界，连续翻页也不重复计数。"""
+        adapter = FakeAdapter({'当前': [ChatPage(tuple(map(msg, 'de'))),
+            ChatPage(tuple(map(msg, 'cdef'))), ChatPage(tuple(map(msg, 'abcd')), True)]})
+        result, _ = self.run_task(adapter)
+        self.assertEqual([key for _, key in adapter.downloaded], list('edcba'))
+        self.assertEqual(result['messages'], 5)
+        self.assertNotIn('errors', result)
+
+    def test_overlap_rejects_deleted_or_reordered_middle(self):
+        """找到单个相同锚点仍不够，共同范围中间缺失或重排必须拒绝。"""
+        for content in ('xac', 'xacb', 'xbc'):
+            with self.subTest(content=content), self.assertRaises(ChatAutomationError):
+                older_prefix(ChatPage(tuple(map(msg, 'abc'))), ChatPage(tuple(map(msg, content))))
+
+    def test_long_scan_with_repeated_images_and_varying_viewport(self):
+        """连续两百条同名图片，页面宽松/收缩交替时仍按实例各处理一次。"""
+        messages = tuple(ChatMessage('图片', 'image', TODAY, ((index,), None)) for index in range(200))
+        pages = [ChatPage(messages[195:])]
+        for start in range(194, -1, -1):
+            pages.append(ChatPage(messages[start:min(200, start + (3, 8, 5)[start % 3])], start == 0))
+        adapter = FakeAdapter({'当前': pages})
+        ids = []
+        adapter.download = lambda context, message, timeout: ids.append(message.control[0][0]) or 'unconfirmed'
+        result, _ = self.run_task(adapter, max_messages=200)
+        self.assertEqual(ids, list(reversed(range(200))))
+        self.assertEqual(result['messages'], 200)
+        self.assertNotIn('errors', result)
+
     def test_runtime_ids_distinguish_identical_messages_across_pages(self):
         """重复内容可通过稳定实例标识衔接，但替换后的实例不能沿用。"""
         first = ChatMessage('same', 'image', TODAY, ((1,), None))
