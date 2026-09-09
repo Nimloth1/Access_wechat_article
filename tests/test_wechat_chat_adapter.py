@@ -410,6 +410,129 @@ class WechatChatAdapterTests(unittest.TestCase):
             with self.assertRaisesRegex(ChatAutomationError, '缩放'):
                 adapter._bubble_point(context, ChatMessage('a', 'image', None), None)
 
+    def test_clipped_attachment_reveals_body_in_correct_direction(self):
+        """顶部仅露底边、底部仅露昵称时先滚动正文，覆盖三种附件与三档缩放。"""
+        for dpi in (96, 144, 192):
+            for older in (True, False):
+                for kind in ('image', 'file', 'forward'):
+                    with self.subTest(dpi=dpi, older=older, kind=kind):
+                        scale = dpi / 96
+                        initial_top = -182 if older else 490
+                        bubble = Node(rect=(0, round(initial_top * scale), round(600 * scale), round((initial_top + 200) * scale)))
+                        listing = Node(kind='ListControl', rect=(0, 0, round(600 * scale), round(500 * scale)))
+                        adapter = self.adapter(listing)
+                        adapter._activate = Mock()
+                        adapter._pause = Mock()
+                        adapter.cancelled = lambda: False
+                        adapter._fresh_target = lambda *args: bubble
+                        adapter._check_point = Mock()
+                        message = ChatMessage('a', kind, None, ((1,), bubble))
+                        original = ChatPage((message,))
+                        adapter.read_page = Mock(return_value=original)
+                        adapter._message_layout = Mock(return_value=('original',))
+                        context = ChatContext(SimpleNamespace(handle=1), 'A')
+
+                        def wheel(*args, **kwargs):
+                            """一次小滚动露出正文；返回时模拟原始位置。"""
+                            offset = round((120 if kwargs['older'] else -120) * scale)
+                            l, t, r, b = bubble.BoundingRectangle
+                            bubble.BoundingRectangle = (l, t + offset, r, b + offset)
+
+                        adapter._wheel = Mock(side_effect=wheel)
+
+                        def capture(**crop):
+                            """只在气泡正文提供色差，右侧留空作为背景。"""
+                            bitmap = MagicMock()
+                            bitmap.Width, bitmap.Height = crop['width'], crop['height']
+                            bitmap.__enter__.return_value = bitmap
+                            bitmap.GetPixelColor.side_effect = lambda x, y: 0xBBBBBB if x < bitmap.Width // 2 else 0xFFFFFF
+                            return bitmap
+
+                        listing.ToBitmap = capture
+                        user32 = SimpleNamespace(GetDpiForWindow=Mock(return_value=dpi))
+                        with patch('ctypes.windll', SimpleNamespace(user32=user32), create=True):
+                            x, y = adapter._bubble_point(context, message, bubble)
+                        self.assertGreaterEqual(x, round(64 * scale))
+                        self.assertGreaterEqual(y, round(36 * scale))
+                        adapter._wheel.assert_called_once_with(context, older=older)
+                        if older:
+                            self.assertIsNone(context.attachment_position)
+                        else:
+                            self.assertEqual(context.attachment_position, (original, ('original',), 1))
+                            adapter._restore_attachment_position(context)
+                            self.assertIsNone(context.attachment_position)
+                            self.assertEqual(bubble.BoundingRectangle[1], round(initial_top * scale))
+
+    def test_attachment_restore_rebinds_only_matching_page_and_respects_cancel(self):
+        """恢复页几何不同即停止；整页相同可绑定新控件，取消时不滚动。"""
+        original = ChatPage((ChatMessage('a', 'image', None, ((1,), None)),))
+        restored = ChatPage((ChatMessage('a', 'image', None, ((2,), None)),))
+        for changed, cancelled in ((False, False), (True, False), (False, True)):
+            with self.subTest(changed=changed, cancelled=cancelled):
+                adapter = self.adapter(None)
+                adapter.cancelled = lambda: cancelled
+                adapter._wheel = Mock()
+                adapter._pause = Mock()
+                adapter.read_page = Mock(return_value=restored)
+                adapter._message_layout = Mock(return_value=('changed' if changed else 'original',))
+                context = ChatContext(None, 'A', attachment_position=(original, ('original',), 1))
+                if changed:
+                    with self.assertRaisesRegex(ChatAutomationError, '恢复原消息位置'):
+                        adapter._restore_attachment_position(context)
+                    self.assertFalse(context.identities)
+                else:
+                    adapter._restore_attachment_position(context)
+                    if cancelled:
+                        adapter._wheel.assert_not_called()
+                    else:
+                        self.assertEqual(context.identities[(2,)], (1,))
+                        self.assertIsNone(context.attachment_position)
+
+    def test_clipped_attachment_stops_when_scroll_does_not_move(self):
+        """微信没有移动时不盲点昵称，也不无限滚动。"""
+        bubble = Node(rect=(0, 490, 600, 690))
+        adapter = self.adapter(Node(rect=(0, 0, 600, 500)))
+        adapter._activate = Mock()
+        adapter._pause = Mock()
+        adapter.cancelled = lambda: False
+        adapter._fresh_target = lambda *args: bubble
+        adapter._wheel = Mock()
+        adapter.read_page = Mock(return_value=ChatPage(()))
+        adapter._message_layout = Mock(return_value=())
+        adapter._check_point = Mock()
+        context = ChatContext(SimpleNamespace(handle=1), 'A')
+        user32 = SimpleNamespace(GetDpiForWindow=Mock(return_value=96))
+        with patch('ctypes.windll', SimpleNamespace(user32=user32), create=True):
+            with self.assertRaisesRegex(ChatAutomationError, '自动滚动后'):
+                adapter._bubble_point(context, ChatMessage('a', 'image', None), bubble)
+        adapter._wheel.assert_called_once()
+        adapter._check_point.assert_not_called()
+
+    def test_file_result_restores_temporary_scroll(self):
+        """文件成功或失败退出都恢复临时滚动，与图片/转发关闭行为一致。"""
+        for failure in (False, True):
+            adapter = self.adapter(None)
+            adapter._restore_attachment_position = Mock()
+            adapter._download_file = Mock(return_value='unconfirmed', side_effect=ChatAutomationError('失败') if failure else None)
+            if failure:
+                with self.assertRaises(ChatAutomationError):
+                    adapter.download('parent', ChatMessage('a', 'file', None), 1)
+            else:
+                self.assertEqual(adapter.download('parent', ChatMessage('a', 'file', None), 1), 'unconfirmed')
+            adapter._restore_attachment_position.assert_called_once_with('parent')
+
+    def test_child_close_restores_parent_scan_position(self):
+        """本次图片/转发窗口确认关闭后才恢复父窗口，防止滚轮落在子窗口。"""
+        adapter = self.adapter(None)
+        pattern = SimpleNamespace(Close=Mock())
+        window = SimpleNamespace(handle=2, control=SimpleNamespace(GetWindowPattern=lambda: pattern))
+        adapter._window = Mock(return_value=window)
+        adapter._nodes = Mock()
+        adapter._restore_attachment_position = Mock(side_effect=lambda parent: pattern.Close.assert_called_once())
+        with patch('src.modules.window.wechat_chat_adapter.enumerate_desktop_windows', return_value=[]):
+            adapter.close_forward(ChatContext(window, 'A', True), 'parent')
+        adapter._restore_attachment_position.assert_called_once_with('parent')
+
     def test_original_button_accepts_size_suffix_but_not_unrelated_text(self):
         """原图按钮可以包含文件大小，但普通说明或正文不是下载入口。"""
         button = Node('查看原图（1.2 MB）', kind='ButtonControl')

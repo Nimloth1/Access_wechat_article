@@ -95,6 +95,7 @@ class ChatContext:
     expanded_dates: set[tuple] = field(default_factory=set)
     identities: dict[tuple, tuple] = field(default_factory=dict)
     resolve_dates: bool = False
+    attachment_position: tuple[ChatPage, tuple, int] | None = None
 
 
 class WechatChatAdapter:
@@ -393,18 +394,33 @@ class WechatChatAdapter:
                     self._wheel(context, older=False)
                     self._pause(0.2)
                 restored = self.read_page(context)
-                if page_identity(restored) != page_identity(original):
-                    # 滚出视口的控件可能被重建；完整有序内容和逐行位置均恢复才重新绑定。
-                    if self._message_layout(context, restored) != original_layout:
-                        raise ChatAutomationError('补全日期后未能恢复原消息位置，停止以免漏扫')
-                    for old, new in zip(original.messages, restored.messages):
-                        old_id, new_id = old.control[0], new.control[0]
-                        for raw, canonical in list(context.identities.items()):
-                            if canonical == new_id:
-                                context.identities[raw] = old_id
-                        context.identities[new_id] = old_id
-                        if new.day:
-                            context.dates[old_id] = new.day
+                self._verify_restored_page(context, original, original_layout, restored)
+
+    def _verify_restored_page(self, context: ChatContext, original: ChatPage,
+                              layout: tuple, restored: ChatPage) -> None:
+        """核验返回的整页位置；控件重建时仅按完整有序内容和矩形重新绑定。"""
+        if self._message_layout(context, restored) != layout:
+            raise ChatAutomationError('未能恢复原消息位置，停止以免漏扫')
+        if page_identity(restored) != page_identity(original):
+            for old, new in zip(original.messages, restored.messages):
+                old_id, new_id = old.control[0], new.control[0]
+                for raw, canonical in list(context.identities.items()):
+                    if canonical == new_id:
+                        context.identities[raw] = old_id
+                context.identities[new_id] = old_id
+                if new.day:
+                    context.dates[old_id] = new.day
+
+    def _restore_attachment_position(self, context: ChatContext) -> None:
+        """底部附件处理完后撤回临时滚动，恢复扫描锚点；取消后不再滚动。"""
+        if context.attachment_position is None or self.cancelled():
+            return
+        original, layout, steps = context.attachment_position
+        for _ in range(steps):
+            self._wheel(context, older=True)
+            self._pause(0.3)
+        self._verify_restored_page(context, original, layout, self.read_page(context))
+        context.attachment_position = None
 
     def _message_layout(self, context: ChatContext, page: ChatPage) -> tuple:
         """读取各消息有序内容与矩形，用于日期探查后的整页返回核验。"""
@@ -527,21 +543,37 @@ class WechatChatAdapter:
         listing = self._list(context)
         viewport = rect_to_tuple(listing.BoundingRectangle)
         row = rect_to_tuple(bubble.BoundingRectangle)
-        # 倒序扫描时最早一条可能刚露出底边；先让正文进入视口再定位。
+        # 顶部只露底边和底部只露昵称都可能出现；按裁切方向露出正文。
+        # 向下滚动会暂时隐藏较早消息，必须保存整页并在附件关闭后恢复。
         for _ in range(20):
             visible_height = min(row[3] - inset, viewport[3]) - max(row[1] + header, viewport[1])
-            if visible_height >= side or row[1] >= viewport[1]:
+            if visible_height >= side or (visible_height >= 24 and row[1] >= viewport[1]):
                 break
-            self._wheel(context, older=True)
+            if self.cancelled():
+                raise ChatAutomationError('已取消')
+            older = row[1] < viewport[1]
+            if not older and row[3] <= viewport[3]:
+                break
+            if not older:
+                if context.attachment_position is None:
+                    original = self.read_page(context)
+                    context.attachment_position = (original, self._message_layout(context, original), 0)
+            previous_row = row
+            self._wheel(context, older=older)
+            if not older:
+                original, layout, steps = context.attachment_position
+                context.attachment_position = (original, layout, steps + 1)
             self._pause(0.3)
             bubble = self._fresh_target(context, message)
             listing = self._list(context)
             viewport = rect_to_tuple(listing.BoundingRectangle)
             row = rect_to_tuple(bubble.BoundingRectangle)
+            if row == previous_row:
+                break
         top, bottom = max(row[1] + header, viewport[1]), min(row[3] - inset, viewport[3])
         left, right = max(row[0] + side, viewport[0]), min(row[2] - side, viewport[2])
         if right - left < 24 or bottom - top < 24:
-            raise ChatAutomationError('附件可见内容不足，请调整起始位置后重试')
+            raise ChatAutomationError(f'自动滚动后附件正文仍不足：消息矩形 {row}，列表矩形 {viewport}，DPI {dpi}')
         # 仅在已核验消息的正文区域采样；不持久化图像，不调用外部识别服务。
         with listing.ToBitmap(x=left - viewport[0], y=top - viewport[1],
                               width=right - left, height=bottom - top) as bitmap:
@@ -612,6 +644,7 @@ class WechatChatAdapter:
         while time.monotonic() < deadline:
             if not any(w.handle == window.handle for w in enumerate_desktop_windows()):
                 self._nodes(parent)
+                self._restore_attachment_position(parent)
                 return
             time.sleep(0.1)
         raise ChatAutomationError("附件窗口尚未关闭，停止后续操作")
@@ -624,9 +657,12 @@ class WechatChatAdapter:
                                  n.Name.strip(), re.IGNORECASE) for label in names))) and not n.IsOffscreen]
 
     def download(self, context: ChatContext, message: ChatMessage, timeout: float) -> str:
-        """图片寻找原图按钮，文件下载后核验菜单；微信可能自动打开文档。"""
+        """图片寻找原图按钮，文件等待下载状态；完成后恢复临时调整的位置。"""
         if message.kind == "file":
-            return self._download_file(context, message, timeout)
+            try:
+                return self._download_file(context, message, timeout)
+            finally:
+                self._restore_attachment_position(context)
         child = self._child_window(context, message, PREVIEW_CLASS)
         try:
             deadline = time.monotonic() + timeout
