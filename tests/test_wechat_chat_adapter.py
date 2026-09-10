@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import MagicMock, Mock, patch
 
-from src.modules.window.wechat_chat_adapter import AttachmentNotClickableError, ChatContext, ORIGINAL_NAMES, WechatChatAdapter
+from src.modules.window.wechat_chat_adapter import AttachmentNotClickableError, ChatContext, FORWARD_CLASS, ORIGINAL_NAMES, PREVIEW_CLASS, WechatChatAdapter
 from src.modules.window.home_window_activation import HomeWindowNotClickableError
 from src.services.chat_attachment_service import ChatAutomationError, ChatMessage, ChatPage
 
@@ -662,6 +662,52 @@ class WechatChatAdapterTests(unittest.TestCase):
         adapter._restore_attachment_position = Mock(side_effect=lambda parent: pattern.Close.assert_called_once())
         with patch('src.modules.window.wechat_chat_adapter.enumerate_desktop_windows', return_value=[]):
             adapter.close_forward(ChatContext(window, 'A', True), 'parent')
+        adapter._restore_attachment_position.assert_called_once_with('parent')
+
+    def test_child_window_recognizes_reuse_without_accepting_unrelated_windows(self):
+        """复现同句柄转发被误拒；类型、进程、标题、前台和祖先限制仍有效。"""
+        for case in ('new', 'hidden', 'reused', 'wrong_title', 'wrong_pid', 'wrong_type',
+                     'background', 'ancestor', 'old_preview', 'not_activated', 'cancelled'):
+            with self.subTest(case=case):
+                expected = PREVIEW_CLASS if case == 'old_preview' else FORWARD_CLASS
+                control = Node(cls='other' if case == 'wrong_type' else expected)
+                control.ProcessId = 99 if case == 'wrong_pid' else 10
+                window = SimpleNamespace(handle=2, title='其他聊天记录' if case == 'wrong_title' else 'Leada的聊天记录',
+                                         visible=True, is_minimized=False, process_name='Weixin.exe', control=control)
+                before = [] if case == 'new' else [SimpleNamespace(handle=2, visible=case != 'hidden')]
+                adapter = self.adapter(None)
+                adapter._fresh_target = Mock(return_value=Node('聊天记录Leada的聊天记录Leada: [图片]'))
+                adapter._activate = Mock()
+                adapter._open_bubble = Mock()
+                adapter._pause = Mock()
+                adapter.cancelled = lambda: case == 'cancelled'
+                context = ChatContext(SimpleNamespace(handle=1, control=SimpleNamespace(ProcessId=10)), 'A',
+                                      ancestors=(2,) if case == 'ancestor' else ())
+                foreground = Mock(side_effect=[3 if case == 'not_activated' else 1, 3 if case == 'background' else 2])
+                with patch('ctypes.windll', SimpleNamespace(user32=SimpleNamespace(GetForegroundWindow=foreground)), create=True), patch(
+                        'src.modules.window.wechat_chat_adapter.enumerate_desktop_windows', side_effect=[before, [window]]), patch(
+                        'src.modules.window.wechat_chat_adapter.attach_uia_control', side_effect=lambda w: w), patch(
+                        'src.modules.window.wechat_chat_adapter.time.monotonic', side_effect=[0, 0, 6]):
+                    if case in {'new', 'hidden', 'reused'}:
+                        child = adapter._child_window(context, ChatMessage('forward', 'forward', None), expected)
+                        self.assertEqual(child.window.handle, 2)
+                        self.assertEqual(child.owned, case != 'reused')
+                        self.assertEqual(child.ancestors, (1,))
+                    else:
+                        with self.assertRaises(ChatAutomationError):
+                            adapter._child_window(context, ChatMessage('forward', 'forward', None), expected)
+                self.assertEqual(adapter._open_bubble.call_count, 0 if case in {'not_activated', 'cancelled'} else 1)
+
+    def test_borrowed_forward_returns_to_parent_without_closing_user_window(self):
+        """复用的用户窗口不关闭，仍恢复父层焦点与扫描位置。"""
+        adapter = self.adapter(None)
+        adapter._window = Mock(side_effect=AssertionError('不应关闭用户窗口'))
+        adapter._nodes = Mock()
+        adapter._activate = Mock()
+        adapter._restore_attachment_position = Mock()
+        adapter.close_forward(ChatContext(None, 'A', True, owned=False), 'parent')
+        adapter._nodes.assert_called_once_with('parent')
+        adapter._activate.assert_called_once_with('parent')
         adapter._restore_attachment_position.assert_called_once_with('parent')
 
     def test_original_button_accepts_size_suffix_but_not_unrelated_text(self):

@@ -100,6 +100,8 @@ class ChatContext:
     identities: dict[tuple, tuple] = field(default_factory=dict)
     resolve_dates: bool = False
     attachment_position: tuple[ChatPage, tuple, int] | None = None
+    owned: bool = True
+    ancestors: tuple[int, ...] = ()
 
 
 class WechatChatAdapter:
@@ -533,27 +535,44 @@ class WechatChatAdapter:
         return False
 
     def _child_window(self, context: ChatContext, message: ChatMessage, class_name: str) -> ChatContext:
-        """只接管本次点击新产生、同微信进程的指定类型窗口。"""
-        before = {w.handle for w in enumerate_desktop_windows()}
+        """识别新出现或点击后复用的附件窗口，保留用户原已打开的转发窗口。"""
+        before = {w.handle: w for w in enumerate_desktop_windows()}
         bubble = self._fresh_target(context, message)
+        label = bubble.Name
         if self.cancelled():
             raise ChatAutomationError('已取消')
         self._activate(context)
+        if ctypes.windll.user32.GetForegroundWindow() != context.window.handle:
+            raise ChatAutomationError('未能激活附件所在窗口，未点击')
         self._open_bubble(context, message, bubble)
         deadline = time.monotonic() + 5
+        ancestors = context.ancestors + (context.window.handle,)
         while time.monotonic() < deadline and not self.cancelled():
             matches = []
             parent_pid = context.window.control.ProcessId
+            foreground = ctypes.windll.user32.GetForegroundWindow()
             for w in enumerate_desktop_windows():
-                if w.handle in before or not w.visible or w.process_name.lower() not in {"weixin.exe", "wechat.exe"}:
+                if w.handle in ancestors or not w.visible or w.is_minimized or w.process_name.lower() not in {"weixin.exe", "wechat.exe"}:
                     continue
+                previous = before.get(w.handle)
+                # 旧窗口必须由这次点击带到前台。已可见的转发还须与卡片标题相符；
+                # 不接管内容身份未确认的旧图片预览，也不进入任意已打开的同名窗口。
+                if previous is not None:
+                    if foreground != w.handle:
+                        continue
+                    if previous.visible and not (class_name == FORWARD_CLASS and
+                            w.title.strip() and w.title.strip() in label):
+                        continue
                 candidate = attach_uia_control(w)
                 if candidate.control.ProcessId == parent_pid and any(n.ClassName == class_name for n in walk(candidate.control)):
                     matches.append(candidate)
             if matches:
-                return ChatContext(unique(matches, "附件子窗口"), context.name, True)
+                window = unique(matches, "附件子窗口")
+                previous = before.get(window.handle)
+                return ChatContext(window, context.name, True,
+                                   owned=previous is None or not previous.visible, ancestors=ancestors)
             self._pause(0.2)
-        raise ChatAutomationError("未确认新附件窗口，停止任务；请手动检查当前微信界面")
+        raise ChatAutomationError("未确认附件窗口：未出现匹配的新窗口或可核验的复用窗口，停止任务")
 
     def _bubble_point(self, context: ChatContext, message: ChatMessage, bubble: Any) -> tuple[int, int]:
         """遮挡时重新激活、读取与采样一次；不重复已经发送的附件点击。"""
@@ -678,6 +697,11 @@ class WechatChatAdapter:
 
     def close_forward(self, child: ChatContext, parent: ChatContext) -> None:
         """关闭已确认的子窗口并核验返回位置，不发送全局 Escape。"""
+        if not child.owned:
+            self._nodes(parent)
+            self._activate(parent)
+            self._restore_attachment_position(parent)
+            return
         window = self._window(child.window)
         pattern = window.control.GetWindowPattern()
         if pattern is None:
