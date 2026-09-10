@@ -16,6 +16,11 @@ GA_ROOT = 2
 class HomeWindowNotClickableError(RuntimeError):
     """主页未处于可点击层级，或目标坐标当前不属于该主页。"""
 
+    def __init__(self, message: str, *, owner_handle: int = 0) -> None:
+        """保留实际遮挡句柄，便于区分前台窗口和点击点所属窗口。"""
+        super().__init__(message)
+        self.owner_handle = owner_handle
+
 
 class _Point(ctypes.Structure):
     _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
@@ -96,7 +101,8 @@ class WindowsHomeWindowGuard:
             return
         raise HomeWindowNotClickableError(
             "文章坐标不在微信主页可点击层级："
-            f"({target.click_x}, {target.click_y}) 当前属于窗口 {owner_handle}"
+            f"({target.click_x}, {target.click_y}) 当前属于窗口 {owner_handle}",
+            owner_handle=owner_handle,
         )
 
     def _resolve_user32(self) -> Any:

@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import MagicMock, Mock, patch
 
-from src.modules.window.wechat_chat_adapter import ChatContext, ORIGINAL_NAMES, WechatChatAdapter
+from src.modules.window.wechat_chat_adapter import AttachmentNotClickableError, ChatContext, ORIGINAL_NAMES, WechatChatAdapter
 from src.modules.window.home_window_activation import HomeWindowNotClickableError
 from src.services.chat_attachment_service import ChatAutomationError, ChatMessage, ChatPage
 
@@ -328,6 +328,19 @@ class WechatChatAdapterTests(unittest.TestCase):
                 adapter._check_point(ChatContext(SimpleNamespace(handle=1), 'A'), 10, 20)
         self.assertNotIn('文章坐标', str(error.exception))
 
+    def test_obstruction_reports_blocker_even_when_wechat_is_foreground(self):
+        """前台是微信不能解释遮挡，必须另记点击点真正所属的 PDF 窗口。"""
+        adapter = self.adapter(None)
+        adapter.guard = SimpleNamespace(ensure_target_clickable=Mock(side_effect=
+            HomeWindowNotClickableError('坐标被遮挡', owner_handle=3)))
+        user32 = SimpleNamespace(GetForegroundWindow=Mock(return_value=1), GetAncestor=Mock(return_value=2))
+        windows = [SimpleNamespace(handle=1, process_name='Weixin.exe', class_name='Qt'),
+                   SimpleNamespace(handle=2, process_name='msedge.exe', class_name='Chrome', rect=(0, 0, 1000, 1000))]
+        with patch('ctypes.windll', SimpleNamespace(user32=user32), create=True), patch(
+                'src.modules.window.wechat_chat_adapter.enumerate_desktop_windows', return_value=windows):
+            with self.assertRaisesRegex(AttachmentNotClickableError, '遮挡窗口：msedge.exe'):
+                adapter._check_point(ChatContext(SimpleNamespace(handle=1), 'A'), 10, 20)
+
     def test_forward_stationary_scroll_marks_start_but_outer_does_not(self):
         """有限转发的稳定边缘可确认起点，外层懒加载不能据此报告全部完成。"""
         for forwarded in (True, False):
@@ -449,11 +462,80 @@ class WechatChatAdapterTests(unittest.TestCase):
         """无法读取缩放时禁止退回固定像素并点击。"""
         adapter = self.adapter(None)
         adapter._activate = Mock()
+        adapter.cancelled = lambda: False
         context = ChatContext(SimpleNamespace(handle=1), 'A')
         user32 = SimpleNamespace(GetDpiForWindow=Mock(return_value=0))
         with patch('ctypes.windll', SimpleNamespace(user32=user32), create=True):
             with self.assertRaisesRegex(ChatAutomationError, '缩放'):
                 adapter._bubble_point(context, ChatMessage('a', 'image', None), None)
+
+    def test_attachment_obstruction_recaptures_moved_bubble_before_single_click(self):
+        """PDF 在采样时抢前台，恢复后重读已移动的消息，只发送一次新坐标点击。"""
+        for kind in ('image', 'forward'):
+            with self.subTest(kind=kind):
+                old, fresh = Mock(), Mock()
+                adapter = self.adapter(None)
+                adapter.cancelled = lambda: False
+                adapter._pause = Mock()
+                adapter._activate = Mock()
+                adapter._fresh_target = Mock(return_value=fresh)
+                adapter._locate_bubble_point = Mock(side_effect=[AttachmentNotClickableError('PDF 遮挡'), (120, 60)])
+                message = ChatMessage('a', kind, None)
+                adapter._open_bubble('context', message, old)
+                self.assertEqual(adapter._locate_bubble_point.call_args_list[1].args, ('context', message, fresh))
+                old.DoubleClick.assert_not_called()
+                fresh.DoubleClick.assert_called_once_with(x=120, y=60, simulateMove=False, waitTime=0.2)
+
+    def test_attachment_recovery_is_bounded_and_does_not_retry_identity_errors(self):
+        """持续遮挡最多定位两次；消息身份改变不进入恢复，也不点击。"""
+        for error, attempts in ((AttachmentNotClickableError('遮挡'), 2), (ChatAutomationError('消息身份改变'), 1)):
+            with self.subTest(error=type(error).__name__):
+                bubble = Mock()
+                adapter = self.adapter(None)
+                adapter.cancelled = lambda: False
+                adapter._pause = Mock()
+                adapter._activate = Mock()
+                adapter._fresh_target = Mock(return_value=bubble)
+                adapter._locate_bubble_point = Mock(side_effect=error)
+                with self.assertRaises(ChatAutomationError):
+                    adapter._open_bubble('context', ChatMessage('a', 'image', None), bubble)
+                self.assertEqual(adapter._locate_bubble_point.call_count, attempts)
+                bubble.DoubleClick.assert_not_called()
+
+    def test_cancel_during_attachment_recovery_sends_no_more_input(self):
+        """恢复等待中按停止，不再激活、重新读取或点击。"""
+        adapter = self.adapter(None)
+        stopped = [False]
+        adapter.cancelled = lambda: stopped[0]
+        adapter._pause = lambda seconds: stopped.__setitem__(0, True)
+        adapter._activate = Mock()
+        adapter._fresh_target = Mock()
+        adapter._locate_bubble_point = Mock(side_effect=AttachmentNotClickableError('遮挡'))
+        with self.assertRaisesRegex(ChatAutomationError, '已取消'):
+            adapter._bubble_point('context', ChatMessage('a', 'image', None), Mock())
+        adapter._activate.assert_not_called()
+        adapter._fresh_target.assert_not_called()
+
+    def test_file_result_restores_chat_after_viewer_open_only_when_needed(self):
+        """接收完成或超时后恢复对话；跳过文件和取消时不抢前台。"""
+        for status in ('confirmed', 'unconfirmed', 'skipped_file', 'available', 'cancelled'):
+            with self.subTest(status=status):
+                adapter = self.adapter(None)
+                adapter.cancelled = lambda: status == 'cancelled'
+                adapter._download_file = Mock(return_value=status)
+                adapter._nodes = Mock()
+                adapter._activate = Mock()
+                adapter._fresh_target = Mock()
+                adapter._restore_attachment_position = Mock()
+                message = ChatMessage('a', 'file', None)
+                self.assertEqual(adapter.download('context', message, 1), status)
+                if status in ('confirmed', 'unconfirmed'):
+                    adapter._nodes.assert_called_once_with('context')
+                    adapter._activate.assert_called_once_with('context')
+                    adapter._fresh_target.assert_called_once_with('context', message)
+                else:
+                    adapter._activate.assert_not_called()
+                adapter._restore_attachment_position.assert_called_once_with('context')
 
     def test_clipped_attachment_reveals_body_in_correct_direction(self):
         """顶部仅露底边、底部仅露昵称时先滚动正文，覆盖三种附件与三档缩放。"""
@@ -557,6 +639,10 @@ class WechatChatAdapterTests(unittest.TestCase):
         """文件成功或失败退出都恢复临时滚动，与图片/转发关闭行为一致。"""
         for failure in (False, True):
             adapter = self.adapter(None)
+            adapter.cancelled = lambda: False
+            adapter._nodes = Mock()
+            adapter._activate = Mock()
+            adapter._fresh_target = Mock()
             adapter._restore_attachment_position = Mock()
             adapter._download_file = Mock(return_value='unconfirmed', side_effect=ChatAutomationError('失败') if failure else None)
             if failure:

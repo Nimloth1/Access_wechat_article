@@ -28,6 +28,10 @@ ORIGINAL_NAMES = {"查看原图", "查看原圖", "View Original", "下载原图
 AVAILABLE_NAMES = {"打开", "Open", "打开文件夹", "Open Folder", "另存为", "Save As"}
 
 
+class AttachmentNotClickableError(ChatAutomationError):
+    """输入尚未发送时的临时遮挡，允许重新读取附件后有限重试。"""
+
+
 def walk(control: Any, limit: int = 2500) -> list[Any]:
     """有界遍历控件；超限明确报错，不返回可能漏消息的半棵树。"""
     result, pending = [], [control]
@@ -228,10 +232,16 @@ class WechatChatAdapter:
                 home_window_handle=context.window.handle, click_x=x, click_y=y))
         except HomeWindowNotClickableError as exc:
             foreground = ctypes.windll.user32.GetForegroundWindow()
-            windows = [w for w in enumerate_desktop_windows() if w.handle == foreground]
+            desktop_windows = enumerate_desktop_windows()
+            windows = [w for w in desktop_windows if w.handle == foreground]
             detail = f'{windows[0].process_name} / {windows[0].class_name}' if windows else '不可识别'
-            raise ChatAutomationError(
+            owner = exc.owner_handle
+            root = ctypes.windll.user32.GetAncestor(owner, 2) if owner else 0
+            blockers = [w for w in desktop_windows if w.handle in {owner, root}]
+            blocker = f'{blockers[0].process_name} / {blockers[0].class_name} / {blockers[0].rect}' if blockers else f'句柄 {owner}'
+            raise AttachmentNotClickableError(
                 f'附件操作位置被遮挡或窗口已变化，已停止；前台应用：{detail}；'
+                f'遮挡窗口：{blocker}；'
                 f'目标窗口 {context.window.handle}；{str(exc).replace("文章坐标", "操作坐标").replace("微信主页", "目标微信窗口")}') from exc
 
     def open_chat(self, name: str | None) -> ChatContext:
@@ -546,6 +556,22 @@ class WechatChatAdapter:
         raise ChatAutomationError("未确认新附件窗口，停止任务；请手动检查当前微信界面")
 
     def _bubble_point(self, context: ChatContext, message: ChatMessage, bubble: Any) -> tuple[int, int]:
+        """遮挡时重新激活、读取与采样一次；不重复已经发送的附件点击。"""
+        for attempt in range(2):
+            if self.cancelled():
+                raise ChatAutomationError('已取消')
+            try:
+                return self._locate_bubble_point(context, message, bubble)
+            except AttachmentNotClickableError:
+                if attempt or self.cancelled():
+                    raise
+                self._pause(0.3)
+                if self.cancelled():
+                    raise ChatAutomationError('已取消')
+                self._activate(context)
+                bubble = self._fresh_target(context, message)
+
+    def _locate_bubble_point(self, context: ChatContext, message: ChatMessage, bubble: Any) -> tuple[int, int]:
         """在已识别附件正文内定位可见内容，避开整行中心的空白和头像。"""
         if message.kind not in {'image', 'forward', 'file'}:
             raise ChatAutomationError('只允许定位附件气泡')
@@ -605,9 +631,10 @@ class WechatChatAdapter:
                 raise ChatAutomationError('未能在附件消息内定位可见内容，未点击')
         fresh = self._fresh_target(context, message)
         if (rect_to_tuple(fresh.BoundingRectangle) != row or
+                rect_to_tuple(self._list(context).BoundingRectangle) != viewport or
                 ctypes.windll.user32.GetDpiForWindow(context.window.handle) != dpi):
             raise ChatAutomationError('截图后消息位置或窗口缩放已改变，未点击')
-        self._activate(context)
+        # 截图后不能再激活窗口并沿用旧像素：若 PDF 此时抢到前台，交给外层重采样。
         self._check_point(context, left + x, top + y)
         if self.cancelled():
             raise ChatAutomationError('已取消')
@@ -618,6 +645,7 @@ class WechatChatAdapter:
         if message.kind not in {'image', 'forward'}:
             raise ChatAutomationError('不允许双击文件')
         x, y = self._bubble_point(context, message, bubble)
+        bubble = self._fresh_target(context, message)
         bubble.DoubleClick(x=x, y=y, simulateMove=False, waitTime=0.2)
 
     def open_forward(self, context: ChatContext, message: ChatMessage) -> ChatContext:
@@ -675,7 +703,13 @@ class WechatChatAdapter:
         """图片寻找原图按钮，文件等待下载状态；完成后恢复临时调整的位置。"""
         if message.kind == "file":
             try:
-                return self._download_file(context, message, timeout)
+                status = self._download_file(context, message, timeout)
+                if status not in {'skipped_file', 'available', 'cancelled'} and not self.cancelled():
+                    # 单击接收可能异步打开 PDF 等关联查看器；返回扫描前恢复原对话。
+                    self._nodes(context)
+                    self._activate(context)
+                    self._fresh_target(context, message)
+                return status
             finally:
                 self._restore_attachment_position(context)
         child = self._child_window(context, message, PREVIEW_CLASS)
@@ -758,6 +792,7 @@ class WechatChatAdapter:
                             '.pdf', '.docx', '.xlsx', '.pptx', '.txt', '.csv', '.zip', '.rar', '.7z'}:
                         bubble = self._fresh_target(context, message)
                         x, y = self._bubble_point(context, message, bubble)
+                        bubble = self._fresh_target(context, message)
                         try:
                             bubble.Click(x=x, y=y, simulateMove=False, waitTime=0.2)
                             return self._wait_file(context, message, lines[1], max(1, deadline - time.monotonic()))
@@ -803,6 +838,7 @@ class WechatChatAdapter:
         if self.cancelled():
             return []
         x, y = self._bubble_point(context, message, bubble)
+        bubble = self._fresh_target(context, message)
         bubble.RightClick(x=x, y=y, simulateMove=False, waitTime=0.1)
         self._pause(0.15)
         return [n for n in self._nodes(context) if n.ControlTypeName == 'MenuItemControl'
