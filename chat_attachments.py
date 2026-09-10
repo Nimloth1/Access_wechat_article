@@ -9,10 +9,11 @@
 # version: 1.7 @20260909: 修复起始页底部附件仅露出昵称时失败，处理后恢复扫描位置;
 # version: 1.8 @20260909: 控件重建后返回原页核验并恢复翻页，支持重叠段后露出较新消息;
 # version: 1.9 @20260911: 文件接收后恢复对话，附件点击前遮挡时重新定位并有界重试;
+# version: 1.10 @20260911: 默认直接采集，窗口显示版本号，开始按钮明确当前模式;
 """独立运行聊天附件任务；不启动公众号代理服务。"""
 from __future__ import annotations
 
-__version__ = 'v1.9'
+__version__ = 'v1.10'
 __platform__ = 'nt'
 __pc__ = ['PW', 'AW', 'BW', 'UU', 'PM']
 __py__ = 'py3.13+'
@@ -202,7 +203,7 @@ def show_gui() -> None:
     except ImportError as exc:
         raise RuntimeError('当前 Python 没有 tkinter，可使用 --run 命令行模式') from exc
     root = tk.Tk()
-    root.title('微信聊天附件下载 · 试验版')
+    root.title(f'微信聊天附件下载 · {__version__}')
     root.geometry('800x760')
     frame = ttk.Frame(root, padding=16)
     frame.pack(fill='both', expand=True)
@@ -240,7 +241,8 @@ def show_gui() -> None:
     ttk.Label(frame, text='连续图片：起始图片 + N 次上一张；不按日期筛选，不处理文件和合并转发。').pack(anchor='w')
     choices = ttk.Frame(frame)
     choices.pack(fill='x', pady=8)
-    images, files, forwards, dry = [tk.BooleanVar(value=True) for _ in range(4)]
+    images, files, forwards = [tk.BooleanVar(value=True) for _ in range(3)]
+    dry = tk.BooleanVar(value=False)
     compatibility = tk.BooleanVar(value=True)
     media_choices = []
     for text, var in [('图片', images), ('仅未下载文件', files), ('展开合并转发', forwards), ('仅扫描候选（不下载）', dry)]:
@@ -343,8 +345,14 @@ def show_gui() -> None:
 
     diagnose_button = ttk.Button(controls, text='检查微信', command=lambda: start(True))
     diagnose_button.pack(side='left', padx=(0, 8))
-    run_button = ttk.Button(controls, text='开始', command=start)
+    run_button = ttk.Button(controls, text='开始采集', command=start)
     run_button.pack(side='left', padx=8)
+
+    def update_mode(*_) -> None:
+        """开始按钮直接显示实际操作，避免把仅扫描误认为下载或续跑。"""
+        run_button.configure(text='仅扫描（不下载）' if dry.get() else '开始采集')
+
+    dry.trace_add('write', update_mode)
     ttk.Button(controls, text='停止', command=stop.set).pack(side='left', padx=8)
     ttk.Button(controls, text='打开处理记录', command=lambda: (LOG_DIR.mkdir(parents=True, exist_ok=True), os.startfile(LOG_DIR))).pack(side='right')
     root.protocol('WM_DELETE_WINDOW', close)
