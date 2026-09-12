@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from dataclasses import replace
 from unittest.mock import patch
 
 from src.modules.window import wechat_browser_tabs as browser_tabs
@@ -30,6 +31,63 @@ def make_window(
 
 
 class WechatBrowserWindowEnumerationTests(unittest.TestCase):
+    def test_native_tab_close_sends_keyboard_and_confirms_return(self) -> None:
+        """普通 TabItem 不能不执行关闭就返回成功。"""
+        selected = BrowserTabInfo('native-article', 853206, '文章甲', (100, 100, 1200, 900), True)
+        adapter = browser_tabs.UiaWechatBrowserTabAdapter(enumerate_windows=lambda: [make_window()])
+        adapter.active_tab = lambda: selected
+        with (
+            patch.object(browser_tabs, '_invoke_direct_close_button', return_value=False),
+            patch.object(browser_tabs, '_activate_tab_control'),
+            patch.object(browser_tabs, '_send_ctrl_w_to_control', return_value=True) as close,
+            patch.object(adapter, '_wait_until_document_title_changes', return_value=True) as confirm,
+        ):
+            adapter.close_tab(selected, home_window_handle=853206)
+        close.assert_called_once()
+        confirm.assert_called_once()
+
+    def test_native_tab_close_failure_is_not_reported_as_success(self) -> None:
+        """快捷键无效时必须上报关闭失败。"""
+        selected = BrowserTabInfo('native-article', 853206, '文章甲', (100, 100, 1200, 900), True)
+        adapter = browser_tabs.UiaWechatBrowserTabAdapter(enumerate_windows=lambda: [make_window()])
+        adapter.active_tab = lambda: selected
+        with (
+            patch.object(browser_tabs, '_invoke_direct_close_button', return_value=False),
+            patch.object(browser_tabs, '_activate_tab_control'),
+            patch.object(browser_tabs, '_send_ctrl_w_to_control', return_value=True),
+            patch.object(adapter, '_wait_until_document_title_changes', return_value=False),
+            self.assertRaisesRegex(RuntimeError, '仍处于活动状态'),
+        ):
+            adapter.close_tab(selected, home_window_handle=853206)
+
+    def test_native_return_requires_original_tab_to_disappear(self) -> None:
+        """新主页标签 ID 可不同，但切到主页却保留原文章不能算关闭。"""
+        selected = BrowserTabInfo('native-article', 853206, '文章甲', (100, 100, 1200, 900), True)
+        home = replace(selected, tab_id='native-home', title='第四维的梦想')
+        for remains in (False, True):
+            with self.subTest(remains=remains):
+                ticks = iter([0, .01, .02, .03, 1])
+                adapter = browser_tabs.UiaWechatBrowserTabAdapter(
+                    monotonic=lambda: next(ticks), sleep=lambda _: None,
+                    document_return_timeout_seconds=.1,
+                )
+                adapter.active_tab = lambda: home
+                adapter.list_tabs = lambda: [home, replace(selected, is_active=False)] if remains else [home]
+                self.assertEqual(adapter._wait_until_document_title_changes(selected), not remains)
+
+    def test_changed_page_does_not_receive_a_second_close(self) -> None:
+        """关闭按钮已切页时，不能用快捷键误关主页。"""
+        selected = BrowserTabInfo('native-article', 853206, '文章甲', (100, 100, 1200, 900), True)
+        adapter = browser_tabs.UiaWechatBrowserTabAdapter(enumerate_windows=lambda: [make_window()])
+        adapter.active_tab = lambda: replace(selected, tab_id='home', title='第四维的梦想')
+        with (
+            patch.object(browser_tabs, '_invoke_direct_close_button', return_value=True),
+            patch.object(adapter, '_wait_until_document_title_changes', side_effect=[False, True]),
+            patch.object(browser_tabs, '_send_ctrl_w_to_control') as close,
+        ):
+            adapter.close_tab(selected, home_window_handle=853206)
+        close.assert_not_called()
+
     def test_win32_candidates_are_filtered_before_uia_attachment(self) -> None:
         """只对可操作的微信 Chromium 窗口挂接 UIA。"""
         candidate = make_window()

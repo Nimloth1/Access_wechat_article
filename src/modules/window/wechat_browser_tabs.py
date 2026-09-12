@@ -360,25 +360,29 @@ class UiaWechatBrowserTabAdapter:
 
         if not selected.is_active and not selected.tab_id.startswith("window:"):
             raise RuntimeError("拒绝关闭非活动文章标签，避免 Ctrl+W 关闭错误标签")
+        if selected.tab_id.startswith("window:"):
+            raise RuntimeError("未读取到文章标签或网页文档，无法安全确认关闭")
 
         # 仅点击已匹配文章标题的标签行内关闭按钮；窗口级快捷键只作兜底，
         # 不使用顶层关闭按钮、中键点击或 WM_CLOSE，避免关闭主页窗口。
-        close_button_dispatched = (
-            selected.tab_id.startswith("document:")
-            and _invoke_direct_close_button(selected.control)
-        )
-        if selected.tab_id.startswith("document:"):
-            if close_button_dispatched and self._wait_until_document_title_changes(
-                selected,
-                timeout_seconds=min(1.0, self._document_return_timeout_seconds),
-            ):
+        close_button_dispatched = _invoke_direct_close_button(selected.control)
+        if close_button_dispatched and self._wait_until_document_title_changes(
+            selected,
+            timeout_seconds=min(1.0, self._document_return_timeout_seconds),
+        ):
+            return
+        # 点击关闭后可能已切页但 UIA 仍未稳定，不能盲目再关当前主页。
+        current = self.active_tab()
+        if (current is None or current.owner_handle != selected.owner_handle
+                or normalize_article_title(current.title) != normalize_article_title(selected.title)):
+            if self._wait_until_document_title_changes(selected):
                 return
-            _activate_tab_control(selected.control)
-            if not _send_ctrl_w_to_control(selected.control):
-                self._document_keyboard_closer(selected.owner_handle)
-            if not self._wait_until_document_title_changes(selected):
-                raise RuntimeError("关闭按钮和 Ctrl+W 均已尝试，但文章标签仍处于活动状态")
-        return
+            raise RuntimeError("文章关闭后的页面状态尚未确认，已停止继续发送关闭快捷键")
+        _activate_tab_control(current.control)
+        if not _send_ctrl_w_to_control(current.control):
+            self._document_keyboard_closer(selected.owner_handle)
+        if not self._wait_until_document_title_changes(selected):
+            raise RuntimeError("关闭按钮和 Ctrl+W 均已尝试，但文章标签仍处于活动状态")
 
     def _require_close_owner_window(self, owner_handle: int) -> Any:
         owner = next(
@@ -414,11 +418,12 @@ class UiaWechatBrowserTabAdapter:
         previous_title = ""
         while True:
             current = self.active_tab()
-            if current is not None and current.tab_id != selected.tab_id:
+            if current is not None and current.owner_handle != selected.owner_handle:
                 current = None
             if current is None:
                 current = next(
-                    (item for item in self.list_tabs() if item.tab_id == selected.tab_id),
+                    (item for item in self.list_tabs()
+                     if item.owner_handle == selected.owner_handle and item.is_active),
                     None,
                 )
             current_title = normalize_article_title(current.title) if current is not None else ""
@@ -429,6 +434,13 @@ class UiaWechatBrowserTabAdapter:
                 and _article_title_match_key(current_title) not in _TEMPORARY_TAB_TITLE_KEYS
                 and current_title.lower() not in {"微信", "wechat", "weixin"}
             )
+            if readable_return and not selected.tab_id.startswith("document:"):
+                # 普通标签切换不等于关闭；原文章仍在标签栏就不能继续采集。
+                readable_return = not any(
+                    item.owner_handle == selected.owner_handle
+                    and normalize_article_title(item.title) == expected
+                    for item in self.list_tabs()
+                )
             if readable_return:
                 stable_change_count = stable_change_count + 1 if current_title == previous_title else 1
                 if stable_change_count >= 3:
