@@ -35,6 +35,9 @@ GA_ROOT = 2
 
 # 微信文章页加载过程中可能短暂暴露这些标题，不能把它们当作最终文章标题。
 _TEMPORARY_TAB_TITLE_KEYS = {
+    "微信",
+    "wechat",
+    "weixin",
     "aboutblank",
     "微信公众平台",
     "加载中",
@@ -315,6 +318,13 @@ class UiaWechatBrowserTabAdapter:
             document_tab = _document_page_tab(window.handle, window.control)
             if document_tab is not None:
                 return document_tab
+            # 后台消息点击可能已开文章，却尚未向 UIA 暴露正文。激活后重新读取，
+            # 不把此时短暂出现的“微信”外壳当作文章标签。
+            _activate_tab_control(window.control)
+            selected_tab = self._selected_tab_from_control(window.handle, window.control)
+            document_tab = selected_tab or _document_page_tab(window.handle, window.control)
+            if document_tab is not None:
+                return document_tab
             if window.title.strip():
                 return BrowserTabInfo(
                     tab_id=f"window:{window.handle}",
@@ -590,6 +600,9 @@ def _is_opened_article_tab(
     item: BrowserTabInfo,
     baseline: Mapping[str, str],
 ) -> bool:
+    # 顶层窗口外壳会在页面切换时出现，不能拿它充当刚打开的文章。
+    if item.tab_id.startswith("window:"):
+        return False
     title = normalize_article_title(item.title)
     title_key = _article_title_match_key(title)
     if not title_key or title_key in _TEMPORARY_TAB_TITLE_KEYS:
@@ -640,8 +653,10 @@ def _document_page_tab(owner_handle: int, root: Any) -> BrowserTabInfo | None:
     if root is None:
         return None
     queue: deque[tuple[Any, int]] = deque([(root, 0)])
-    while queue:
+    visited = 0
+    while queue and visited < 4096:
         control, depth = queue.popleft()
+        visited += 1
         control_type = str(_safe_get(control, "ControlTypeName", "") or "").lower()
         if control_type == "documentcontrol":
             title = normalize_article_title(str(_safe_get(control, "Name", "") or ""))
@@ -656,7 +671,8 @@ def _document_page_tab(owner_handle: int, root: Any) -> BrowserTabInfo | None:
                     is_active=True,
                     control=tab_control,
                 )
-        if depth >= 14:
+        # 多标签窗口会增加 Chromium 包装层，主页深度不能作为文章页上限。
+        if depth >= 32:
             continue
         try:
             children = control.GetChildren()

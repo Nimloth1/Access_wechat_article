@@ -31,6 +31,38 @@ def make_window(
 
 
 class WechatBrowserWindowEnumerationTests(unittest.TestCase):
+    def test_window_shell_is_never_an_opened_article(self) -> None:
+        """主页 document ID 消失后出现 window ID，不能误认作新文章。"""
+        for title in ('微信', 'WeChat', '文章标题'):
+            with self.subTest(title=title):
+                tab = BrowserTabInfo('window:853206', 853206, title, (0, 0, 100, 100), True)
+                self.assertFalse(browser_tabs._is_opened_article_tab(tab, {'document:853206': '公众号主页'}))
+
+    def test_deep_document_in_multi_tab_window_is_readable(self) -> None:
+        """多标签包装层超过原先 14 层时仍应读到文章文档。"""
+        from test_uia_window_test_reader import Control
+        document = Control('DocumentControl', '别只盯着英伟达，2 万亿美元背后真正的暴利环节才刚刚开始')
+        root = document
+        for _ in range(20):
+            root = Control(children=[root])
+        tab = browser_tabs._document_page_tab(853206, root)
+        self.assertIsNotNone(tab)
+        self.assertEqual(tab.title, browser_tabs.normalize_article_title(document.Name))
+        self.assertEqual(tab.tab_id, 'document:853206')
+
+    def test_activation_recovers_document_before_returning_shell(self) -> None:
+        """后台打开后先激活重读 UIA，再将实际文章交给关闭流程。"""
+        window = make_window(control=object())
+        document = BrowserTabInfo('document:853206', 853206, '文章甲', window.rect, True)
+        adapter = browser_tabs.UiaWechatBrowserTabAdapter(enumerate_windows=lambda: [window])
+        with (
+            patch.object(adapter, '_selected_tab_from_control', return_value=None),
+            patch.object(browser_tabs, '_document_page_tab', side_effect=[None, document]),
+            patch.object(browser_tabs, '_activate_tab_control') as activate,
+        ):
+            self.assertEqual(adapter.active_tab(), document)
+        activate.assert_called_once_with(window.control)
+
     def test_native_tab_close_sends_keyboard_and_confirms_return(self) -> None:
         """普通 TabItem 不能不执行关闭就返回成功。"""
         selected = BrowserTabInfo('native-article', 853206, '文章甲', (100, 100, 1200, 900), True)
