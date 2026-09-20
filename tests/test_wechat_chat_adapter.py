@@ -86,9 +86,11 @@ class WechatChatAdapterTests(unittest.TestCase):
             original = ChatPage((ChatMessage('a', 'image', None, ((1,), None)),))
             dated = ChatPage((ChatMessage('a', 'image', date(2026, 9, 5), ((1,), None)),))
             restored = ChatPage((ChatMessage('a', 'image', None, ((2,), None)),))
-            adapter.read_page = Mock(side_effect=[original, dated, restored])
+            adapter.read_page = Mock(side_effect=[original, dated] + [restored] * (1 if same_layout else 241))
             adapter._expand_dates = Mock()
-            adapter._message_layout = Mock(side_effect=[('original',), ('original' if same_layout else 'changed',)])
+            adapter._message_layout = Mock(side_effect=[('original',)] +
+                                            [('original' if same_layout else 'changed',)] *
+                                            (1 if same_layout else 241))
             adapter._page_position = Mock(return_value=('position',))
             adapter._wheel = Mock()
             adapter._pause = Mock()
@@ -100,7 +102,9 @@ class WechatChatAdapterTests(unittest.TestCase):
                 with self.assertRaises(ChatAutomationError):
                     adapter.resolve_day(context, original.messages[0])
                 self.assertFalse(context.identities)
-            self.assertEqual([c.kwargs['older'] for c in adapter._wheel.call_args_list], [True, False])
+            directions = [c.kwargs['older'] for c in adapter._wheel.call_args_list]
+            self.assertEqual(directions[:2], [True, False])
+            self.assertEqual(len(directions), 2 if same_layout else 482)
 
     def test_date_probe_never_accepts_lost_page_overlap(self):
         """向前找日期时跳过消息必须报错，不能把远处日期赋给目标。"""
@@ -144,6 +148,26 @@ class WechatChatAdapterTests(unittest.TestCase):
         adapter.read_page = lambda context: ChatPage((replacement,))
         with self.assertRaises(ChatAutomationError):
             adapter._fresh_target(None, original)
+
+    def test_reused_runtime_identity_does_not_merge_current_messages(self):
+        """旧别名撞到当前真实 ID 时退回当前 ID，避免同名附件出现双匹配。"""
+        first = Node('图片', cls='mmui::ChatImageItemView', identity=1)
+        second = Node('图片', cls='mmui::ChatImageItemView', identity=2)
+        listing = Node(kind='ListControl', children=(first, second), rect=(0, 0, 400, 500))
+        context = ChatContext(None, 'A', identities={(1,): (2,)})
+        page = self.adapter(listing).read_page(context)
+        self.assertEqual([message.control[0] for message in page.messages], [(1,), (2,)])
+        self.assertNotIn((1,), context.identities)
+
+    def test_duplicate_alias_targets_fall_back_to_current_runtime_ids(self):
+        """两个当前控件不能共享同一个历史别名。"""
+        rows = (Node('图片', cls='mmui::ChatImageItemView', identity=1),
+                Node('图片', cls='mmui::ChatImageItemView', identity=2))
+        listing = Node(kind='ListControl', children=rows, rect=(0, 0, 400, 500))
+        context = ChatContext(None, 'A', identities={(1,): (9,), (2,): (9,)})
+        page = self.adapter(listing).read_page(context)
+        self.assertEqual([message.control[0] for message in page.messages], [(1,), (2,)])
+        self.assertFalse(context.identities)
 
     def test_file_without_explicit_download_control_is_not_opened(self):
         """文件名不是下载按钮，不可双击文件作为下载的兜底。"""
@@ -361,7 +385,7 @@ class WechatChatAdapterTests(unittest.TestCase):
                     adapter.scroll_older(context)
 
     def test_scroll_rebuild_restores_whole_page_then_retries_once(self):
-        """整页控件重建先退回核验；原位不符或第二次仍重建均停止，不无限重试。"""
+        """整页重建先退回核验；原位不符停止，连续重建则安全换新基线。"""
         from dataclasses import replace
         def page(ids):
             """用同名图片模拟不能直接按正文区分的控件。"""
@@ -384,12 +408,13 @@ class WechatChatAdapterTests(unittest.TestCase):
                                           for m in next(snapshots).messages))
                 adapter.read_page = read
                 context = ChatContext(None, 'A')
-                if failure:
+                if failure == 'layout':
                     with self.assertRaises(ChatAutomationError):
                         adapter.scroll_older(context)
                 else:
                     self.assertTrue(adapter.scroll_older(context))
-                    self.assertEqual(context.identities, {(11,): (1,), (12,): (2,)})
+                    self.assertEqual(context.identities,
+                                     {} if failure == 'again' else {(11,): (1,), (12,): (2,)})
                 self.assertEqual([call.kwargs['older'] for call in adapter._wheel.call_args_list],
                                  [True, False] if failure == 'layout' else [True, False, True])
 
@@ -501,6 +526,23 @@ class WechatChatAdapterTests(unittest.TestCase):
                     adapter._open_bubble('context', ChatMessage('a', 'image', None), bubble)
                 self.assertEqual(adapter._locate_bubble_point.call_count, attempts)
                 bubble.DoubleClick.assert_not_called()
+
+    def test_wechat_tooltip_recovery_moves_cursor_and_retries_three_times(self):
+        """微信自身提示框随鼠标移开后可消失，其他遮挡仍只重试一次。"""
+        adapter = self.adapter(None)
+        adapter.cancelled = lambda: False
+        adapter._pause = Mock()
+        adapter._activate = Mock()
+        adapter._fresh_target = Mock(return_value=Mock())
+        adapter._locate_bubble_point = Mock(side_effect=[
+            AttachmentNotClickableError('遮挡窗口：Weixin.exe / Qt51514QWindowToolTipSaveBits'),
+            (12, 34),
+        ])
+        context = SimpleNamespace(window=SimpleNamespace(rect=(100, 200, 900, 800)))
+        user32 = SimpleNamespace(SetCursorPos=Mock())
+        with patch('ctypes.windll', SimpleNamespace(user32=user32), create=True):
+            self.assertEqual(adapter._bubble_point(context, ChatMessage('a', 'image', None), Mock()), (12, 34))
+        user32.SetCursorPos.assert_called_once_with(500, 220)
 
     def test_cancel_during_attachment_recovery_sends_no_more_input(self):
         """恢复等待中按停止，不再激活、重新读取或点击。"""

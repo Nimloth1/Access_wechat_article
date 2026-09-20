@@ -29,6 +29,8 @@ class AttachmentOptions:
     image_route: str = 'messages'
     previous_clicks: int = 100
     image_interval: float = 1.0
+    start_latest: bool = False
+    verify_files: bool = False
 
     def __post_init__(self) -> None:
         """校验边界，0 条仅在给定日期时表示不限数量。"""
@@ -72,7 +74,9 @@ class ChatAdapter(Protocol):
     def chat_name(self, context: Any) -> str: ...
     def read_page(self, context: Any) -> ChatPage: ...
     def scroll_older(self, context: Any) -> bool: ...
-    def download(self, context: Any, message: ChatMessage, timeout: float) -> str: ...
+    def download(self, context: Any, message: ChatMessage, timeout: float,
+                 verify_files: bool = False) -> str: ...
+    def scroll_latest(self, context: Any) -> None: ...
     def open_forward(self, context: Any, message: ChatMessage) -> Any: ...
     def close_forward(self, child: Any, parent: Any) -> None: ...
     def cancelled(self) -> bool: ...
@@ -99,9 +103,19 @@ def older_prefix(previous: ChatPage, current: ChatPage) -> int:
     # 消息高度或视口变化时，重叠段后面还可能露出较新消息，不能强制重叠贴住新页底部。
     matches = [start for start in range(len(new))
                if new[start:start + len(old)] == old[:min(len(old), len(new) - start)]]
-    if len(matches) != 1:
-        raise ChatAutomationError("翻页重叠消息缺失或有歧义，已停止以免漏计或重复下载")
-    return matches[0]
+    if len(matches) == 1:
+        return matches[0]
+    # Qt 虚拟列表会在相邻页复用/更换 runtime id。仅当去掉实例 ID 后，
+    # 至少两条消息组成的完整重叠序列仍有唯一位置时，才允许按该位置衔接。
+    old_signatures = tuple(signature for signature, _ in old)
+    new_signatures = tuple(signature for signature, _ in new)
+    signature_matches = [start for start in range(len(new_signatures))
+                         if min(len(old_signatures), len(new_signatures) - start) >= 2 and
+                         len(set(new_signatures[start:])) >= 2 and
+                         new_signatures[start:] == old_signatures[:len(new_signatures) - start]]
+    if len(signature_matches) == 1:
+        return signature_matches[0]
+    raise ChatAutomationError("翻页重叠消息缺失或有歧义，已停止以免漏计或重复下载")
 
 
 class ChatAttachmentService:
@@ -125,6 +139,8 @@ class ChatAttachmentService:
                 break
             try:
                 context = self.adapter.open_chat(requested)
+                if options.start_latest:
+                    self.adapter.scroll_latest(context)
                 if options.since:
                     self.adapter.prepare_dates(context)
                 name = self.adapter.chat_name(context)
@@ -222,7 +238,12 @@ class ChatAttachmentService:
                         finally:
                             self.adapter.close_forward(child, context)
                 elif (message.kind == "image" and options.images) or (message.kind == "file" and options.files):
-                    status = "candidate" if options.dry_run else self.adapter.download(context, message, options.download_timeout)
+                    if options.dry_run:
+                        status = 'candidate'
+                    elif options.verify_files:
+                        status = self.adapter.download(context, message, options.download_timeout, True)
+                    else:
+                        status = self.adapter.download(context, message, options.download_timeout)
                     if status not in {"candidate", "confirmed", "available", "unconfirmed", "expired", "failed", "cancelled", "skipped_file"}:
                         raise ChatAutomationError(f"未知附件状态：{status}")
                     self.counts[status] += 1
@@ -241,4 +262,7 @@ class ChatAttachmentService:
                 continue
             if self.adapter.scroll_older(context):
                 self._event('pagination_recovered', chat=chat, path=path)
+                # 控件整页重建时适配器已核验确有小步位移；新页从头处理，允许
+                # 少量重复检查，避免用同名图片猜测重叠而漏掉附件。
+                previous = None
         return "cancelled"

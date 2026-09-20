@@ -1,6 +1,8 @@
 # encoding: UTF-8
 # version: 2.1 @20260920: 按搜索分类匹配本地对话，排除网络搜索与聊天记录;
 # version: 2.2 @20260920: 搜索弹层保留主窗口焦点，激活后重取搜索框;
+# version: 2.3 @20260920: 拒绝复用运行时 ID 引起的跨页消息映射冲突;
+# version: 2.4 @20260920: 日期探查按日期标签精确找回原页，单图预览失败继续扫描;
 """微信聊天 UIA 适配器；控件不可见、身份不明确时停止，不用盲点兜底。"""
 from __future__ import annotations
 
@@ -202,13 +204,20 @@ class WechatChatAdapter:
 
     def _nodes(self, context: ChatContext) -> list[Any]:
         """刷新窗口和标题，外层对话切换后立即中断。"""
-        context.window = self._window(context.window)
-        nodes = walk(context.window.control)
-        if not context.forwarded:
-            title = unique([n for n in nodes if n.AutomationId.endswith("current_chat_name_label")], "当前对话标题")
-            if title.Name.strip() != context.name:
-                raise ChatAutomationError("当前对话已改变，停止任务")
-        return nodes
+        deadline = time.monotonic() + 5
+        while True:
+            context.window = self._window(context.window)
+            nodes = walk(context.window.control)
+            if context.forwarded:
+                return nodes
+            titles = [n for n in nodes if n.AutomationId.endswith("current_chat_name_label")]
+            if len(titles) == 1:
+                if titles[0].Name.strip() != context.name:
+                    raise ChatAutomationError("当前对话已改变，停止任务")
+                return nodes
+            if len(titles) > 1 or time.monotonic() >= deadline or self.cancelled():
+                unique(titles, "当前对话标题")
+            self._pause(0.2)
 
     def _list(self, context: ChatContext) -> Any:
         """找到当前层级唯一的消息列表。"""
@@ -321,6 +330,12 @@ class WechatChatAdapter:
             self._expand_dates(context, listing)
         viewport = rect_to_tuple(listing.BoundingRectangle)
         messages = []
+        rows = [row for row in listing.GetChildren() if row.ControlTypeName == "ListItemControl"]
+        raw_ids = {tuple(row.GetRuntimeId()) for row in rows}
+        alias_counts: dict[tuple, int] = {}
+        for raw_identity in raw_ids:
+            canonical = context.identities.get(raw_identity, raw_identity)
+            alias_counts[canonical] = alias_counts.get(canonical, 0) + 1
         inherited = None
         for row in listing.GetChildren():
             nodes = walk(row)
@@ -343,6 +358,11 @@ class WechatChatAdapter:
             # 不解析消息正文里的日期，防止把正文当作聊天时间。
             raw_identity = tuple(row.GetRuntimeId())
             identity = context.identities.get(raw_identity, raw_identity)
+            # Qt 会在滚动后复用 runtime id。旧别名若撞到当前真实 id，或多个
+            # 当前控件映射到同一旧 id，就不能继续沿用，否则会误点同名附件。
+            if (identity != raw_identity and identity in raw_ids) or alias_counts[identity] > 1:
+                identity = raw_identity
+                context.identities.pop(raw_identity, None)
             day = inherited or context.dates.get(identity)
             if day is not None:
                 context.dates[identity] = day
@@ -488,13 +508,12 @@ class WechatChatAdapter:
                 for _ in range(steps):
                     self._wheel(context, older=False)
                     self._pause(0.2)
-                restored = self.read_page(context)
-                self._verify_restored_page(context, original, original_layout, restored)
+                self._restore_page_layout(context, original, original_layout)
 
     def _verify_restored_page(self, context: ChatContext, original: ChatPage,
-                              layout: tuple, restored: ChatPage) -> None:
+                              layout: tuple, restored: ChatPage, *, layout_verified: bool = False) -> None:
         """核验返回的整页位置；控件重建时仅按完整有序内容和矩形重新绑定。"""
-        if self._message_layout(context, restored) != layout:
+        if not layout_verified and self._message_layout(context, restored) != layout:
             raise ChatAutomationError('未能恢复原消息位置，停止以免漏扫')
         if page_identity(restored) != page_identity(original):
             replacements = {new.control[0]: old.control[0] for old, new in zip(original.messages, restored.messages)}
@@ -505,6 +524,29 @@ class WechatChatAdapter:
             for old, new in zip(original.messages, restored.messages):
                 if new.day:
                     context.dates[old.control[0]] = new.day
+
+    def _restore_page_layout(self, context: ChatContext, original: ChatPage,
+                             layout: tuple, *, search_steps: int = 120) -> None:
+        """固定步数未回到原页时双向有界查找；只接受完整布局精确命中。"""
+        restored = self.read_page(context)
+        if self._message_layout(context, restored) == layout:
+            self._verify_restored_page(context, original, layout, restored, layout_verified=True)
+            return
+        for older in (True, False):
+            moved = 0
+            for _ in range(search_steps):
+                self._wheel(context, older=older)
+                moved += 1
+                self._pause(0.2)
+                restored = self.read_page(context)
+                if self._message_layout(context, restored) == layout:
+                    self._verify_restored_page(context, original, layout, restored, layout_verified=True)
+                    return
+            # 回到本轮搜索起点，再从相反方向查找。
+            for _ in range(moved):
+                self._wheel(context, older=not older)
+                self._pause(0.2)
+        raise ChatAutomationError('未能精确找回日期探查前的原消息位置，停止以免漏扫')
 
     def _restore_attachment_position(self, context: ChatContext) -> None:
         """底部附件处理完后撤回临时滚动，恢复扫描锚点；取消后不再滚动。"""
@@ -518,9 +560,13 @@ class WechatChatAdapter:
         context.attachment_position = None
 
     def _message_layout(self, context: ChatContext, page: ChatPage) -> tuple:
-        """读取各消息有序内容与矩形，用于日期探查后的整页返回核验。"""
+        """读取消息及日期标签布局，用于日期探查后的原页精确核验。"""
         rectangles = {context.identities.get(key, key): bounds for key, bounds in self._page_position(context)}
-        return tuple((m.signature, rectangles[m.control[0]]) for m in page.messages)
+        messages = tuple((m.signature, rectangles[m.control[0]]) for m in page.messages)
+        labels = tuple((row.Name.strip(), rect_to_tuple(row.BoundingRectangle))
+                       for row in self._list(context).GetChildren()
+                       if row.ClassName == 'mmui::ChatItemView' and not row.IsOffscreen)
+        return messages, labels
 
     def _fresh_target(self, context: ChatContext, message: ChatMessage) -> Any:
         """返回操作前重新定位的气泡；布局重建不凭旧坐标继续。"""
@@ -559,7 +605,11 @@ class WechatChatAdapter:
                     older_prefix(original, current)
                 except ChatAutomationError:
                     if not recover:
-                        raise
+                        # 某些图片密集页面每次越过虚拟列表边界都会重建全部控件，
+                        # 无法保留 runtime id。滚轮为小步且页面确已变化时，允许
+                        # 调用端把当前可见页作为新基线；宁可重复检查，不跨页猜配。
+                        context.identities.clear()
+                        return True
                     # 加载历史可能重建整个可见列表。先撤回本次滚动，核验原页完整
                     # 内容、顺序及几何位置，再重绑新控件；不能凭“都是图片”直接匹配。
                     for _ in range(step):
@@ -578,6 +628,20 @@ class WechatChatAdapter:
                     return False
                 break
         raise ChatAutomationError("消息列表没有向前移动，未确认已读完历史")
+
+    def scroll_latest(self, context: ChatContext) -> None:
+        """有界滚动到最新消息；连续三次位置不变才确认底部。"""
+        position = self._page_position(context)
+        stationary = 0
+        for _ in range(100):
+            self._wheel(context, older=False, steps=10)
+            self._pause(0.3)
+            current = self._page_position(context)
+            stationary = stationary + 1 if current == position else 0
+            position = current
+            if stationary >= 3:
+                return
+        raise ChatAutomationError('未确认已滚动到最新消息，停止任务')
 
     def _page_position(self, context: ChatContext) -> tuple:
         """包含行几何位置，区分长消息内部滚动和真正停止移动。"""
@@ -659,15 +723,19 @@ class WechatChatAdapter:
 
     def _bubble_point(self, context: ChatContext, message: ChatMessage, bubble: Any) -> tuple[int, int]:
         """遮挡时重新激活、读取与采样一次；不重复已经发送的附件点击。"""
-        for attempt in range(2):
+        for attempt in range(4):
             if self.cancelled():
                 raise ChatAutomationError('已取消')
             try:
                 return self._locate_bubble_point(context, message, bubble)
-            except AttachmentNotClickableError:
-                if attempt or self.cancelled():
+            except AttachmentNotClickableError as exc:
+                tooltip = 'Weixin.exe / Qt51514QWindowToolTipSaveBits' in str(exc)
+                if (attempt >= (3 if tooltip else 1)) or self.cancelled():
                     raise
-                self._pause(0.3)
+                if tooltip:
+                    rect = context.window.rect
+                    ctypes.windll.user32.SetCursorPos((rect[0] + rect[2]) // 2, rect[1] + 20)
+                self._pause(0.6 if tooltip else 0.3)
                 if self.cancelled():
                     raise ChatAutomationError('已取消')
                 self._activate(context)
@@ -806,11 +874,12 @@ class WechatChatAdapter:
                     re.fullmatch(re.escape(label) + r'\s*[（(]\s*\d+(?:\.\d+)?\s*(?:[KMG]?B|字节)\s*[）)]',
                                  n.Name.strip(), re.IGNORECASE) for label in names))) and not n.IsOffscreen]
 
-    def download(self, context: ChatContext, message: ChatMessage, timeout: float) -> str:
+    def download(self, context: ChatContext, message: ChatMessage, timeout: float,
+                 verify_files: bool = False) -> str:
         """图片寻找原图按钮，文件等待下载状态；完成后恢复临时调整的位置。"""
         if message.kind == "file":
             try:
-                status = self._download_file(context, message, timeout)
+                status = self._download_file(context, message, timeout, verify_files)
                 if status not in {'skipped_file', 'available', 'cancelled'} and not self.cancelled():
                     # 单击接收可能异步打开 PDF 等关联查看器；返回扫描前恢复原对话。
                     self._nodes(context)
@@ -819,7 +888,16 @@ class WechatChatAdapter:
                 return status
             finally:
                 self._restore_attachment_position(context)
-        child = self._child_window(context, message, PREVIEW_CLASS)
+        try:
+            child = self._child_window(context, message, PREVIEW_CLASS)
+        except ChatAutomationError as exc:
+            if not str(exc).startswith('未确认附件窗口：'):
+                raise
+            # 图片已完成一次经过坐标核验的双击；预览未出现通常表示缓存失效或
+            # 当前气泡不支持预览。确认仍在原对话后记录失败并继续，不拖垮整周任务。
+            self._nodes(context)
+            self._restore_attachment_position(context)
+            return 'failed'
         try:
             deadline = time.monotonic() + timeout
             opened_at = time.monotonic()
@@ -870,7 +948,8 @@ class WechatChatAdapter:
         finally:
             self.close_forward(child, context)
 
-    def _download_file(self, context: ChatContext, message: ChatMessage, timeout: float) -> str:
+    def _download_file(self, context: ChatContext, message: ChatMessage, timeout: float,
+                       verify_existing: bool = False) -> str:
         """使用下载按钮或未下载文档的单击入口；已可用文件不再打开。"""
         deadline = time.monotonic() + timeout
         clicked = False
@@ -890,7 +969,7 @@ class WechatChatAdapter:
             if not clicked:
                 missing = any(re.search(r'(?:^|\s)未下载(?:\s|$)', n.Name) for n in nodes)
                 if not missing and not buttons:
-                    return 'skipped_file'
+                    return self._file_menu_download(context, message, timeout) if verify_existing else 'skipped_file'
                 if not buttons:
                     lines = self._fresh_target(context, message).Name.splitlines()
                     # 本机微信未下载文档没有下载菜单，单击会下载后交给关联查看器。

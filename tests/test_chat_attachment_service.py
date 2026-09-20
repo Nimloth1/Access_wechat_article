@@ -119,6 +119,16 @@ class ChatAttachmentServiceTests(unittest.TestCase):
         self.assertEqual(older_prefix(ChatPage(tuple(map(msg, 'bc'))), ChatPage(tuple(map(msg, 'abcd')))), 1)
         self.assertEqual(older_prefix(ChatPage(tuple(map(msg, 'bc'))), ChatPage(tuple(map(msg, 'bcd')))), 0)
 
+    def test_unique_signature_overlap_recovers_runtime_id_reuse(self):
+        """实例 ID 被复用时，只接受至少两种签名构成的唯一完整重叠。"""
+        def item(signature, identity):
+            return ChatMessage(signature, 'image', None, ((identity,), None))
+        previous = ChatPage(tuple(item(signature, identity) for signature, identity in
+                                  zip('ABCDXX', range(1, 7))))
+        current = ChatPage(tuple(item(signature, identity) for signature, identity in
+                                 zip('XABCDX', (5, 1, 2, 3, 4, 9))))
+        self.assertEqual(older_prefix(previous, current), 1)
+
     def test_expanded_page_never_reprocesses_newer_messages(self):
         """布局变化露出较新消息不扩大起始边界，连续翻页也不重复计数。"""
         adapter = FakeAdapter({'当前': [ChatPage(tuple(map(msg, 'de'))),

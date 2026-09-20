@@ -11,10 +11,11 @@
 # version: 1.9 @20260911: 文件接收后恢复对话，附件点击前遮挡时重新定位并有界重试;
 # version: 1.10 @20260911: 默认直接采集，窗口显示版本号，开始按钮明确当前模式;
 # version: 1.11 @20260911: 识别点击后复用的转发窗口，处理后保留用户已有窗口;
+# version: 1.12 @20260920: 增加自动滚到最新消息及既有文件可用性核验;
 """独立运行聊天附件任务；不启动公众号代理服务。"""
 from __future__ import annotations
 
-__version__ = 'v1.11'
+__version__ = 'v1.12'
 __platform__ = 'nt'
 __pc__ = ['PW', 'AW', 'BW', 'UU', 'PM']
 __py__ = 'py3.13+'
@@ -102,6 +103,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument('--max-depth', type=int, default=3)
     parser.add_argument('--max-forward-messages', type=int, default=1000)
     parser.add_argument('--download-timeout', type=float, default=30)
+    parser.add_argument('--start-latest', action='store_true', help='进入对话后先自动滚到最新消息')
+    parser.add_argument('--verify-files', action='store_true', help='无未下载标记时也用菜单核验文件可用性')
     parser.add_argument('--image-route', choices=['messages', 'viewer'], default='messages', help='逐条消息或连续图片路线')
     parser.add_argument('--previous-clicks', type=int, default=100, help='连续图片路线最多点击上一张次数，起始图片另计')
     parser.add_argument('--image-interval', type=float, default=1, help='每张图片停留秒数，默认 1')
@@ -112,7 +115,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if args.config:
         task_flags = {'--chat', '--since', '--max-messages', '--no-images', '--no-files',
                       '--no-forwards', '--max-depth', '--max-forward-messages', '--download-timeout', '--dry-run', '--compatibility',
-                      '--image-route', '--previous-clicks', '--image-interval'}
+                      '--image-route', '--previous-clicks', '--image-interval', '--start-latest', '--verify-files'}
         if any(arg.split('=', 1)[0] in task_flags for arg in argv):
             parser.error('--config 不能与单独的任务参数混用，请修改 JSON 配置')
     return args
@@ -125,7 +128,7 @@ def options_from_dict(values: dict) -> AttachmentOptions:
     if unknown:
         raise ValueError('未知配置项：' + ', '.join(sorted(unknown)))
     values = dict(values)
-    for key in ('images', 'files', 'forwards', 'dry_run', 'compatibility'):
+    for key in ('images', 'files', 'forwards', 'dry_run', 'compatibility', 'start_latest', 'verify_files'):
         if key in values and type(values[key]) is not bool:
             raise ValueError(f'{key} 必须为 true 或 false')
     for key in ('max_messages', 'max_depth', 'max_forward_messages', 'previous_clicks'):
@@ -391,6 +394,7 @@ def main() -> int:
                 'max_depth': args.max_depth, 'max_forward_messages': args.max_forward_messages,
                 'image_route': args.image_route, 'previous_clicks': args.previous_clicks, 'image_interval': args.image_interval,
                 'download_timeout': args.download_timeout, 'dry_run': args.dry_run, 'compatibility': args.compatibility}
+            values.update(start_latest=args.start_latest, verify_files=args.verify_files)
         result = execute(options_from_dict(values), Event())
         return 2 if result.get('errors') or result.get('cancelled') else 0
     except (RuntimeError, ValueError, OSError, TypeError) as exc:
