@@ -1,5 +1,6 @@
 # encoding: UTF-8
 # version: 2.1 @20260920: 按搜索分类匹配本地对话，排除网络搜索与聊天记录;
+# version: 2.2 @20260920: 搜索弹层保留主窗口焦点，激活后重取搜索框;
 """微信聊天 UIA 适配器；控件不可见、身份不明确时停止，不用盲点兜底。"""
 from __future__ import annotations
 
@@ -218,7 +219,8 @@ class WechatChatAdapter:
         return unique([n for n in nodes if n.ControlTypeName == "ListControl" and
                        n.Name in MESSAGE_LIST_NAMES], "消息列表")
 
-    def _click(self, context: ChatContext, control: Any, *, cleanup: bool = False) -> None:
+    def _click(self, context: ChatContext, control: Any, *, cleanup: bool = False,
+               keep_parent_active: bool = False) -> None:
         """核验窗口归属后点击；任务取消时仅允许关闭本任务的接收窗口。"""
         if self.cancelled() and not cleanup:
             raise ChatAutomationError("已取消")
@@ -239,7 +241,9 @@ class WechatChatAdapter:
             target_context = ChatContext(self._window(window), context.name, True)
             if target_context.window.control.ProcessId != context.window.control.ProcessId:
                 raise ChatAutomationError('控件窗口进程改变')
-        self._activate(target_context)
+        # 搜索弹层不接受激活：激活它会令主窗口失焦并销毁搜索结果。
+        # 仍按上面核验过的弹层句柄检查点击坐标，不放宽窗口归属。
+        self._activate(context if keep_parent_active else target_context)
         rect = rect_to_tuple(control.BoundingRectangle)
         x, y = (rect[0] + rect[2]) // 2, (rect[1] + rect[3]) // 2
         self._check_point(target_context, x, y)
@@ -275,11 +279,15 @@ class WechatChatAdapter:
         context = ChatContext(self.main, title.Name.strip())
         if name is None or name == context.name:
             return context
+        self._activate(context)
+        nodes = self._nodes(context)
         search = unique([n for n in nodes if n.ControlTypeName == "EditControl" and
                          n.ClassName == "mmui::XValidatorTextEdit" and n.Name in {"搜索", "Search", "搜尋"}], "对话搜索框")
-        self._activate(context)
         search.SetFocus()
         self._pause(0.2)
+        if not self._focus_within(search):
+            self._click(context, search)
+            self._pause(0.2)
         if not self._focus_within(search):
             raise ChatAutomationError('未确认焦点在对话搜索框，未输入搜索内容')
         pattern = search.GetValuePattern()
@@ -290,7 +298,7 @@ class WechatChatAdapter:
         nodes = self._nodes(context)
         results = unique([n for n in nodes if n.AutomationId == "search_list"], "对话搜索结果")
         matches = local_chat_matches(results.GetChildren(), name)
-        self._click(context, unique(matches, f"对话“{name}”"))
+        self._click(context, unique(matches, f"对话“{name}”"), keep_parent_active=True)
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline and not self.cancelled():
             context.window = self._window(context.window)

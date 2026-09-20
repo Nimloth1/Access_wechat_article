@@ -764,7 +764,7 @@ class WechatChatAdapterTests(unittest.TestCase):
         adapter = self.adapter(None)
         adapter.main = SimpleNamespace(control=root)
         adapter.diagnose = lambda: {'ready': True}
-        adapter._nodes = lambda context: [results]
+        adapter._nodes = lambda context: [old, search, results]
         adapter._activate = Mock()
         adapter._focus_within = lambda control: True
         adapter._click = Mock()
@@ -778,7 +778,52 @@ class WechatChatAdapterTests(unittest.TestCase):
         self.assertEqual(context.name, '180k拼团')
         self.assertEqual(adapter._window.call_count, 2)
         value.SetValue.assert_called_once_with('180k拼团')
-        adapter._click.assert_called_once_with(context, result)
+        adapter._click.assert_called_once_with(context, result, keep_parent_active=True)
+        for recovered in (True, False):
+            with self.subTest(focus_recovered=recovered):
+                adapter._click.reset_mock()
+                value.SetValue.reset_mock()
+                adapter._focus_within = Mock(side_effect=[False, recovered])
+                adapter._window = Mock(return_value=SimpleNamespace(control=Node(children=(target,))))
+                if recovered:
+                    adapter.open_chat('180k拼团')
+                    value.SetValue.assert_called_once_with('180k拼团')
+                    self.assertEqual(adapter._click.call_count, 2)
+                else:
+                    with self.assertRaisesRegex(ChatAutomationError, '焦点'):
+                        adapter.open_chat('180k拼团')
+                    value.SetValue.assert_not_called()
+                    self.assertEqual(adapter._click.call_count, 1)
+                self.assertIs(adapter._click.call_args_list[0].args[1], search)
+
+    def test_search_popup_keeps_parent_active_but_checks_popup_owner(self):
+        """搜索弹层不抢焦点；点击仍核验弹层所属进程和坐标。"""
+        adapter = self.adapter(None)
+        parent = ChatContext(SimpleNamespace(handle=10, control=SimpleNamespace(ProcessId=1)), '群')
+        popup = SimpleNamespace(handle=20, control=SimpleNamespace(ProcessId=1))
+        control = Node()
+        control.GetTopLevelControl = lambda: SimpleNamespace(NativeWindowHandle=20)
+        control.Click = Mock()
+        adapter.cancelled = lambda: False
+        adapter._nodes = Mock()
+        adapter._window = lambda window: window
+        adapter._activate = Mock()
+        adapter._check_point = Mock()
+        user32 = SimpleNamespace(GetWindow=Mock(return_value=10))
+        with patch('ctypes.windll', SimpleNamespace(user32=user32), create=True), patch(
+                'src.modules.window.wechat_chat_adapter.enumerate_desktop_windows', return_value=[popup]):
+            adapter._click(parent, control, keep_parent_active=True)
+        adapter._activate.assert_called_once_with(parent)
+        self.assertEqual(adapter._check_point.call_args.args[0].window.handle, 20)
+        control.Click.assert_called_once_with(simulateMove=False)
+        control.Click.reset_mock()
+        adapter._activate.reset_mock()
+        user32.GetWindow.return_value = 0
+        with patch('ctypes.windll', SimpleNamespace(user32=user32), create=True):
+            with self.assertRaisesRegex(ChatAutomationError, '不属于'):
+                adapter._click(parent, control, keep_parent_active=True)
+        adapter._activate.assert_not_called()
+        control.Click.assert_not_called()
 
     def test_local_search_categories(self):
         """排除网络和记录，保留本地重名歧义及公众号入口，不猜无分类结果。"""
