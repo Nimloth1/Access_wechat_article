@@ -322,10 +322,11 @@ class WechatChatAdapter:
                 context.dates[identity] = day
             # 整条消息文本作为重叠锚点；下载状态按钮不进入锚点。
             content = row.Name or "\n".join(n.Name for n in nodes if n.ClassName.startswith("mmui::Chat"))
+            visible_text = content
             if kind == "file":
                 content = "\n".join(content.splitlines()[:2])
             signature = hashlib.sha256((row.ClassName + "\n" + content).encode("utf-8")).hexdigest()
-            messages.append(ChatMessage(signature, kind, day, (identity, bubble)))
+            messages.append(ChatMessage(signature, kind, day, (identity, bubble), visible_text))
         at_start = context.reached_start
         pattern = listing.GetScrollPattern()
         if pattern is not None:
@@ -338,6 +339,62 @@ class WechatChatAdapter:
     def prepare_dates(self, context: ChatContext) -> None:
         """按日期运行时启用时间行展开；按条数运行不产生日期探查动作。"""
         context.resolve_dates = True
+
+    def page_snapshot(self, context: ChatContext) -> dict:
+        """返回可见文本和实例标识；标识仅用于当前窗口，不是微信永久消息 ID。"""
+        page = self.read_page(context)
+        items = []
+        for message in page.messages:
+            identity = (context.window.handle, context.name, message.control[0], message.signature)
+            message_id = hashlib.sha256(repr(identity).encode('utf-8')).hexdigest()
+            items.append(dict(id=message_id, signature=message.signature, kind=message.kind,
+                              text=message.text, date=message.day.isoformat() if message.day else None))
+        # 包含几何位置，长消息内部滚动同样会使旧页面凭据失效。
+        token = hashlib.sha256(repr(([item['id'] for item in items], self._page_position(context))).encode('utf-8')).hexdigest()
+        return dict(chat=context.name, page_token=token, visible_messages=items, at_start=page.at_start)
+
+    def click_visible_message(self, context: ChatContext, message_id: str, page_token: str) -> dict:
+        """重读页面和气泡后单击；拒绝过期标识、文件执行和非气泡控件。"""
+        snapshot = self.page_snapshot(context)
+        if snapshot['page_token'] != page_token:
+            raise ChatAutomationError('页面已变化，请重新读取后再点击')
+        index = next((i for i, item in enumerate(snapshot['visible_messages']) if item['id'] == message_id), None)
+        if index is None:
+            raise ChatAutomationError('消息不在当前可见页')
+        message = self.read_page(context).messages[index]
+        if message.kind == 'file':
+            raise ChatAutomationError('V2 不单击文件消息，避免启动关联程序')
+        rows = [row for row in self._list(context).GetChildren()
+                if context.identities.get(tuple(row.GetRuntimeId()), tuple(row.GetRuntimeId())) == message.control[0]]
+        row = unique(rows, '消息实例')
+        bubbles = [n for n in walk(row) if n.ClassName in {'mmui::ChatBubbleItemView', 'mmui::ChatBubbleReferItemView'}
+                   and not n.IsOffscreen]
+        bubble = unique(bubbles, '消息气泡')
+        bounds = rect_to_tuple(bubble.BoundingRectangle)
+        viewport = rect_to_tuple(self._list(context).BoundingRectangle)
+        x, y = (bounds[0] + bounds[2]) // 2, (bounds[1] + bounds[3]) // 2
+        if not (viewport[0] < x < viewport[2] and viewport[1] < y < viewport[3]):
+            raise ChatAutomationError('消息气泡中心不在可见视口内，请先滚动后重新读取')
+        if self.page_snapshot(context)['page_token'] != page_token:
+            raise ChatAutomationError('点击前页面已变化')
+        self._click(context, bubble)
+        return dict(clicked=True, message_id=message_id, chat=context.name)
+
+    def open_account(self, name: str) -> None:
+        """精确搜索本地公众号会话，通过明确的历史消息入口打开主页。"""
+        context = self.open_chat(name)
+        labels = {'查看历史消息', '历史消息', '全部消息', 'View History', 'All Messages'}
+        entries = [n for n in self._nodes(context) if n.ControlTypeName in {'ButtonControl', 'HyperlinkControl'}
+                   and n.Name.strip() in labels and not n.IsOffscreen]
+        if not entries:
+            title = unique([n for n in self._nodes(context)
+                            if n.AutomationId.endswith('current_chat_name_label') and n.Name.strip() == name], '公众号标题')
+            self._click(context, title)
+            self._pause(0.5)
+            entries = [n for n in self._nodes(context) if n.ControlTypeName in {'ButtonControl', 'HyperlinkControl'}
+                       and n.Name.strip() in labels and not n.IsOffscreen]
+        self._click(context, unique(entries, '公众号历史消息入口'))
+        self._pause(1)
 
     def _expand_dates(self, context: ChatContext, listing: Any = None) -> None:
         """单击可见的缩略时间行，读取微信展开的日期；同一行只尝试一次。"""

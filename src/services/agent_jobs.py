@@ -141,8 +141,11 @@ def navigate_chat(adapter, request, stop):
             older_prefix(page, current)
             page = current
             scrolls += 1
-    return {'chat': adapter.chat_name(context), 'date': request['date'],
+    result = {'chat': adapter.chat_name(context), 'date': request['date'],
             'found': found, 'reason': reason, 'scrolls': scrolls,
             'visible_messages': [{'signature': m.signature, 'kind': m.kind,
                                   'date': m.day.isoformat() if m.day else None}
                                  for m in page.messages] if page else []}
+    if request.get('include_content'):
+        result.update(adapter.page_snapshot(context))
+    return result

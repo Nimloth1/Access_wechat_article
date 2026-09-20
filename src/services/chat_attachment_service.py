@@ -56,6 +56,7 @@ class ChatMessage:
     kind: str
     day: date | None
     control: Any = field(default=None, compare=False, repr=False)
+    text: str = field(default='', compare=False)
 
 
 @dataclass(frozen=True)
