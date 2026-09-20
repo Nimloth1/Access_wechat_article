@@ -1,4 +1,5 @@
 # encoding: UTF-8
+# version: 2.1 @20260920: 按搜索分类匹配本地对话，排除网络搜索与聊天记录;
 """微信聊天 UIA 适配器；控件不可见、身份不明确时停止，不用盲点兜底。"""
 from __future__ import annotations
 
@@ -42,6 +43,24 @@ def walk(control: Any, limit: int = 2500) -> list[Any]:
             raise ChatAutomationError("控件数量超出诊断上限，停止扫描")
         pending.extend(reversed(node.GetChildren()))
     return result
+
+
+def local_chat_matches(rows: list[Any], name: str) -> list[Any]:
+    """只返回本地对话分类中的精确名称匹配，未知分类不作为入口。"""
+    allowed = {'群聊', '联系人', '公众号', 'Group Chats', 'Contacts', 'Official Accounts'}
+    headers = allowed | {'搜索网络结果', '聊天记录', '更多搜索结果',
+                         'Search Web', 'Chat History', 'More Search Results'}
+    section = None
+    matches = []
+    for row in rows:
+        label = row.Name.strip()
+        if label in headers:
+            section = label
+            continue
+        if section in allowed and row.ControlTypeName == 'ListItemControl' and any(
+                node.Name.strip() == name for node in walk(row)):
+            matches.append(row)
+    return matches
 
 
 def unique(nodes: list[Any], label: str) -> Any:
@@ -270,8 +289,7 @@ class WechatChatAdapter:
         self._pause(1)
         nodes = self._nodes(context)
         results = unique([n for n in nodes if n.AutomationId == "search_list"], "对话搜索结果")
-        matches = [row for row in results.GetChildren() if row.ControlTypeName == "ListItemControl" and
-                   any(n.Name.strip() == name for n in walk(row))]
+        matches = local_chat_matches(results.GetChildren(), name)
         self._click(context, unique(matches, f"对话“{name}”"))
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline and not self.cancelled():

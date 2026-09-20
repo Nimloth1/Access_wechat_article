@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import MagicMock, Mock, patch
 
-from src.modules.window.wechat_chat_adapter import AttachmentNotClickableError, ChatContext, FORWARD_CLASS, ORIGINAL_NAMES, PREVIEW_CLASS, WechatChatAdapter
+from src.modules.window.wechat_chat_adapter import AttachmentNotClickableError, ChatContext, FORWARD_CLASS, ORIGINAL_NAMES, PREVIEW_CLASS, WechatChatAdapter, local_chat_matches
 from src.modules.window.home_window_activation import HomeWindowNotClickableError
 from src.services.chat_attachment_service import ChatAutomationError, ChatMessage, ChatPage
 
@@ -757,7 +757,8 @@ class WechatChatAdapterTests(unittest.TestCase):
         value = SimpleNamespace(SetValue=Mock())
         search.GetValuePattern = lambda: value
         result = Node('180k拼团')
-        results = Node(kind='ListControl', children=(result,))
+        results = Node(kind='ListControl', children=(Node('搜索网络结果'), Node('180k拼团'),
+                       Node('群聊'), result, Node('聊天记录'), Node('180k拼团')))
         results.AutomationId = 'search_list'
         root = Node(kind='WindowControl', children=(old, search))
         adapter = self.adapter(None)
@@ -777,6 +778,17 @@ class WechatChatAdapterTests(unittest.TestCase):
         self.assertEqual(context.name, '180k拼团')
         self.assertEqual(adapter._window.call_count, 2)
         value.SetValue.assert_called_once_with('180k拼团')
+        adapter._click.assert_called_once_with(context, result)
+
+    def test_local_search_categories(self):
+        """排除网络和记录，保留本地重名歧义及公众号入口，不猜无分类结果。"""
+        target = Node('目标')
+        self.assertEqual(local_chat_matches([target], '目标'), [])
+        self.assertEqual(local_chat_matches([Node('搜索网络结果'), target], '目标'), [])
+        self.assertEqual(local_chat_matches([Node('群聊'), target, Node('聊天记录'), Node('目标')], '目标'), [target])
+        self.assertEqual(len(local_chat_matches([Node('群聊'), target, Node('目标')], '目标')), 2)
+        self.assertEqual(local_chat_matches([Node('公众号'), target], '目标'), [target])
+        self.assertEqual(local_chat_matches([Node('群聊'), Node('目标其他')], '目标'), [])
 
 
 if __name__ == '__main__':
