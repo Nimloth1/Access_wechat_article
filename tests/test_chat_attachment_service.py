@@ -325,43 +325,26 @@ class ChatAttachmentServiceTests(unittest.TestCase):
         self.assertEqual(result['messages'], 2)
         self.assertEqual(adapter.opened, ['A', 'B'])
 
-    def test_completed_day_stops_next_incremental_scan(self):
-        """可靠完成的自然日会落盘，下次遇到该日即停止，不逐条重读。"""
+    def test_same_day_is_never_used_as_a_checkpoint_boundary(self):
+        """同一天可以分多批来消息，不能因旧批次完成就跳过当天较早或较晚消息。"""
         with tempfile.TemporaryDirectory() as directory:
             progress = ChatAttachmentProgress(Path(directory) / 'progress.json')
-            first = FakeAdapter({'群': [ChatPage((msg('old', day=date(2026, 9, 17)),
-                                                  msg('done', day=date(2026, 9, 18))), True)]})
-            first.status = 'available'
-            events = []
-            ChatAttachmentService(first, events.append, progress).run(
-                AttachmentOptions(chats=('群',), since=date(2026, 9, 18)))
-            self.assertTrue(progress.covers('群', date(2026, 9, 18), date(2026, 9, 18), 'completed'))
-
-            second = FakeAdapter({'群': [ChatPage((msg('done', day=date(2026, 9, 18)),
-                                                   msg('new', day=date(2026, 9, 19))), True)]})
-            second.status = 'available'
-            events = []
-            ChatAttachmentService(second, events.append, progress).run(
-                AttachmentOptions(chats=('群',), since=date(2026, 9, 18)))
-            self.assertEqual(second.downloaded, [('群', 'new')])
-            self.assertTrue(any(event['event'] == 'checkpoint_hit' for event in events))
-
-    def test_unconfirmed_day_is_never_checkpointed(self):
-        """只打开过但无法确认落盘的图片不能被误标为完整日期。"""
-        with tempfile.TemporaryDirectory() as directory:
-            progress = ChatAttachmentProgress(Path(directory) / 'progress.json')
-            adapter = FakeAdapter({'群': [ChatPage((msg('old', day=date(2026, 9, 17)),
-                                                    msg('image', day=date(2026, 9, 18))), True)]})
+            adapter = FakeAdapter({'群': [ChatPage((msg('batch-1', day=date(2026, 9, 18)),
+                                                    msg('batch-2', day=date(2026, 9, 18))), True)]})
+            adapter.status = 'available'
             ChatAttachmentService(adapter, lambda _event: None, progress).run(
                 AttachmentOptions(chats=('群',), since=date(2026, 9, 18)))
-            self.assertFalse(progress.covers('群', date(2026, 9, 18), date(2026, 9, 18), 'completed'))
-            self.assertTrue(progress.covers('群', date(2026, 9, 18), date(2026, 9, 18), 'attempted'))
+            self.assertEqual(adapter.downloaded, [('群', 'batch-2'), ('群', 'batch-1')])
 
+    def test_resume_opened_does_not_skip_unverified_messages(self):
+        """兼容旧参数时也不能把仅打开过的整天当成落盘证明。"""
+        with tempfile.TemporaryDirectory() as directory:
+            progress = ChatAttachmentProgress(Path(directory) / 'progress.json')
             retry = FakeAdapter({'群': [ChatPage((msg('image', day=date(2026, 9, 18)),
                                                   msg('new', day=date(2026, 9, 19))), True)]})
             ChatAttachmentService(retry, lambda _event: None, progress).run(
                 AttachmentOptions(chats=('群',), since=date(2026, 9, 18), resume_opened=True))
-            self.assertEqual(retry.downloaded, [('群', 'new')])
+            self.assertEqual(retry.downloaded, [('群', 'new'), ('群', 'image')])
 
 
 class ConfigurationAndRecognitionTests(unittest.TestCase):

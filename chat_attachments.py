@@ -12,11 +12,11 @@
 # version: 1.10 @20260911: 默认直接采集，窗口显示版本号，开始按钮明确当前模式;
 # version: 1.11 @20260911: 识别点击后复用的转发窗口，处理后保留用户已有窗口;
 # version: 1.12 @20260920: 增加自动滚到最新消息及既有文件可用性核验;
-# version: 1.13 @20260921: 增加群聊自然日完成检查点和每日增量续跑;
+# version: 1.14 @20260921: 改用稳定消息键和落盘证据，支持同日多批增量核验;
 """独立运行聊天附件任务；不启动公众号代理服务。"""
 from __future__ import annotations
 
-__version__ = 'v1.13'
+__version__ = 'v1.14'
 __platform__ = 'nt'
 __pc__ = ['PW', 'AW', 'BW', 'UU', 'PM']
 __py__ = 'py3.13+'
@@ -39,10 +39,12 @@ else:
 from src.modules.window.wechat_chat_adapter import WechatChatAdapter
 from src.services.chat_attachment_service import AttachmentOptions, ChatAttachmentService
 from src.services.chat_attachment_progress import ChatAttachmentProgress
+from src.services.wechat_attachment_inventory import load_inventory
 
 ROOT = Path(__file__).resolve().parent
 LOG_DIR = ROOT / 'data' / 'chat_attachments'
 PROGRESS_PATH = LOG_DIR / 'progress.json'
+DEFAULT_EXPORT_ROOT = Path('I:/wechat_self/exports/daily')
 
 
 def event_message(event: dict) -> str:
@@ -52,7 +54,6 @@ def event_message(event: dict) -> str:
                 'skipped_file': '无未下载标记，已跳过（未核验缓存）'}
     reasons = {'message_limit': '达到消息条数上限', 'forward_message_limit': '达到转发内部条数上限',
                'date_boundary': '已到截止日期之前', 'history_start': '已到记录起点', 'empty': '列表为空',
-               'checkpoint_boundary': '已遇到完整处理过的日期，增量扫描结束',
                'cancelled': '已停止', 'unknown_date': '日期不明确，跳过', 'depth_limit': '达到转发层数上限',
                'previous_limit': '达到上一张点击次数上限', 'previous_unavailable': '上一张按钮不可用，停止',
                'viewer_candidate': '已找到连续图片起点；仅扫描模式不打开预览'}
@@ -82,12 +83,6 @@ def event_message(event: dict) -> str:
         return prefix + '消息衔接未通过核验，已记录前后页面标识'
     if kind == 'pagination_recovered':
         return prefix + '微信重建了消息列表，已返回原页核验并恢复翻页'
-    if kind == 'checkpoint_hit':
-        level = '完整处理' if event.get('level') == 'completed' else '全部打开过'
-        return prefix + f"日期 {event['day']} 已{level}，跳过更早记录"
-    if kind == 'checkpoint_saved':
-        level = '完整处理' if event.get('level') == 'completed' else '全部打开过（未证明落盘）'
-        return prefix + f"已把 {event['start']} 至 {event['end']} 标记为{level}"
     if kind == 'finished':
         counts = event['counts']
         return (f"任务结束：扫描外层 {counts.get('messages', 0)} 条、转发内部 {counts.get('forward_messages', 0)} 条；"
@@ -115,8 +110,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument('--download-timeout', type=float, default=30)
     parser.add_argument('--start-latest', action='store_true', help='进入对话后先自动滚到最新消息')
     parser.add_argument('--verify-files', action='store_true', help='无未下载标记时也用菜单核验文件可用性')
-    parser.add_argument('--no-resume', action='store_true', help='忽略已完成自然日检查点，强制重新扫描')
-    parser.add_argument('--resume-opened', action='store_true', help='也跳过整日均已打开过但尚未确认落盘的图片')
+    parser.add_argument('--no-resume', action='store_true', help=argparse.SUPPRESS)
+    parser.add_argument('--resume-opened', action='store_true', help=argparse.SUPPRESS)
+    parser.add_argument('--inventory-only', action='store_true', help='只核验 wechat_self 清单和真实落盘状态，不操作微信')
+    parser.add_argument('--export-root', type=Path, default=DEFAULT_EXPORT_ROOT, help='wechat_self 日导出目录')
     parser.add_argument('--image-route', choices=['messages', 'viewer'], default='messages', help='逐条消息或连续图片路线')
     parser.add_argument('--previous-clicks', type=int, default=100, help='连续图片路线最多点击上一张次数，起始图片另计')
     parser.add_argument('--image-interval', type=float, default=1, help='每张图片停留秒数，默认 1')
@@ -131,6 +128,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         if any(arg.split('=', 1)[0] in task_flags for arg in argv):
             parser.error('--config 不能与单独的任务参数混用，请修改 JSON 配置')
     return args
+
+
+def reconcile_inventory(chat_names: list[str], since: date | None, export_root: Path,
+                        progress_path: Path = PROGRESS_PATH, notify=print) -> dict[str, dict[str, int]]:
+    """把日导出中的稳定消息和落盘证据写入消息级进度。"""
+    if not chat_names:
+        raise ValueError('清单核验必须用 --chat 指定群聊')
+    progress = ChatAttachmentProgress(progress_path)
+    result: dict[str, dict[str, int]] = {}
+    for chat_name in chat_names:
+        session_id, items = load_inventory(export_root, chat_name, since=since)
+        counts = progress.reconcile(session_id, chat_name, items)
+        counts['retry'] = len(progress.pending(session_id))
+        counts['missing_images'] = sum(item['kind'] == 'image' and item['state'] == 'missing' for item in items)
+        counts['missing_files'] = sum(item['kind'] == 'file' and item['state'] == 'missing' for item in items)
+        result[chat_name] = counts
+        notify(f"[{chat_name}] 清单 {len(items)} 项：原图/高清 {counts.get('original', 0)}，"
+               f"文件已落盘 {counts.get('confirmed', 0)}，缩略图 {counts.get('thumbnail', 0)}，"
+               f"缺图 {counts['missing_images']}，缺文件 {counts['missing_files']}；待处理/重试 {counts['retry']}。")
+    return result
 
 
 def options_from_dict(values: dict) -> AttachmentOptions:
@@ -392,6 +409,11 @@ def main() -> int:
                     result = adapter.diagnose()
             print(json.dumps(result, ensure_ascii=False, indent=2))
             return 0 if result['ready'] else 2
+        if args.inventory_only:
+            since = date.fromisoformat(args.since) if args.since else None
+            result = reconcile_inventory(args.chat or [], since, args.export_root)
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return 0
         if not args.run and not args.config:
             show_gui()
             return 0

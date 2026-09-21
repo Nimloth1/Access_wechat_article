@@ -1,93 +1,83 @@
 # encoding: UTF-8
-"""群聊附件任务的持久进度；只保存能够证明完整处理的自然日。"""
+"""群聊附件的消息级持久进度。"""
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import datetime
 import json
 from pathlib import Path
+from typing import Any, Iterable
+
+
+RETRY_STATES = {"pending", "thumbnail", "missing", "failed"}
 
 
 @dataclass
 class ChatAttachmentProgress:
-    """以群名和自然日保存保守检查点。"""
+    """以微信会话 ID 和稳定消息键保存附件状态。"""
 
     path: Path
 
     def __post_init__(self) -> None:
-        """读取已有状态；损坏文件明确报错，避免静默跳过消息。"""
-        self.data = {"version": 1, "chats": {}}
-        if self.path.exists():
-            loaded = json.loads(self.path.read_text(encoding="utf-8"))
-            if not isinstance(loaded, dict) or loaded.get("version") != 1 or not isinstance(loaded.get("chats"), dict):
-                raise ValueError(f"附件进度文件格式无效：{self.path}")
+        """读取 v2 状态；v1 日期区间不迁移，避免继续错误跳过半天消息。"""
+        self.data: dict[str, Any] = {"version": 2, "chats": {}}
+        if not self.path.exists():
+            return
+        loaded = json.loads(self.path.read_text(encoding="utf-8"))
+        if not isinstance(loaded, dict) or not isinstance(loaded.get("chats"), dict):
+            raise ValueError(f"附件进度文件格式无效：{self.path}")
+        if loaded.get("version") == 2:
             self.data = loaded
+        elif loaded.get("version") != 1:
+            raise ValueError(f"附件进度文件版本不受支持：{self.path}")
 
-    def completed(self, chat: str, day: date) -> bool:
-        """返回该群该自然日是否已被完整处理。"""
-        values = self.data["chats"].get(chat, {}).get("completed_dates", [])
-        return day.isoformat() in values
+    def reconcile(self, session_id: str, chat_name: str,
+                  items: Iterable[dict[str, Any]]) -> dict[str, int]:
+        """用当前落盘证据更新消息状态，并返回本轮状态计数。"""
+        chat = self.data["chats"].setdefault(session_id, {"name": chat_name, "items": {}})
+        chat["name"] = chat_name
+        records = chat.setdefault("items", {})
+        counts: dict[str, int] = {}
+        newest: tuple[int, int] | None = None
+        changed = False
+        now = datetime.now().isoformat(timespec="seconds")
+        for item in items:
+            key = str(item["key"])
+            state = str(item["state"])
+            cursor = (int(item["timestamp"]), int(item["local_id"]))
+            newest = max(newest or cursor, cursor)
+            previous = records.get(key, {})
+            value = {
+                "state": state,
+                "kind": item["kind"],
+                "timestamp": cursor[0],
+                "local_id": cursor[1],
+                "message_id": item.get("message_id"),
+                "evidence_path": item.get("evidence_path"),
+                "updated_at": previous.get("updated_at", now),
+            }
+            comparable = {name: value[name] for name in value if name != "updated_at"}
+            previous_comparable = {name: previous.get(name) for name in comparable}
+            if previous_comparable != comparable:
+                value["updated_at"] = now
+                records[key] = value
+                changed = True
+            counts[state] = counts.get(state, 0) + 1
+        cursor_value = {"timestamp": newest[0], "local_id": newest[1]} if newest else None
+        if chat.get("cursor") != cursor_value:
+            chat["cursor"] = cursor_value
+            changed = True
+        if changed:
+            chat["updated_at"] = now
+            self._save()
+        return counts
 
-    def attempted(self, chat: str, day: date) -> bool:
-        """返回该日所有候选是否至少已执行过打开或下载动作。"""
-        values = self.data["chats"].get(chat, {}).get("attempted_dates", [])
-        return day.isoformat() in values
-
-    def covers(self, chat: str, day: date, since: date | None, level: str) -> bool:
-        """仅当检查点连续覆盖到本次截止日时，才允许提前结束扫描。"""
-        if since is None:
-            return False
-        key = "completed_ranges" if level == "completed" else "attempted_ranges"
-        for item in self.data["chats"].get(chat, {}).get(key, []):
-            if item["start"] <= since.isoformat() <= day.isoformat() <= item["end"]:
-                return True
-        return False
-
-    def mark_range(self, chat: str, start: date, end: date, level: str) -> bool:
-        """保存一次完整遍历得到的连续日期范围。"""
-        if end >= date.today() or end < start:
-            return False
-        key = "completed_ranges" if level == "completed" else "attempted_ranges"
-        record = self.data["chats"].setdefault(chat, {})
-        ranges = record.setdefault(key, [])
-        value = {"start": start.isoformat(), "end": end.isoformat()}
-        if value in ranges:
-            return False
-        ranges.append(value)
-        ranges.sort(key=lambda item: (item["start"], item["end"]))
-        record["updated_at"] = datetime.now().isoformat(timespec="seconds")
-        self._save()
-        return True
-
-    def mark_completed(self, chat: str, day: date) -> bool:
-        """写入一个完整自然日，返回本次是否新增。"""
-        if day >= date.today():
-            return False
-        record = self.data["chats"].setdefault(chat, {"completed_dates": [], "attempted_dates": []})
-        values = set(record.get("completed_dates", []))
-        before = len(values)
-        values.add(day.isoformat())
-        record["completed_dates"] = sorted(values)
-        record["updated_at"] = datetime.now().isoformat(timespec="seconds")
-        if len(values) == before:
-            return False
-        self._save()
-        return True
-
-    def mark_attempted(self, chat: str, day: date) -> bool:
-        """记录整日已尝试；它不代表微信已给出文件落盘证明。"""
-        if day >= date.today():
-            return False
-        record = self.data["chats"].setdefault(chat, {"completed_dates": [], "attempted_dates": []})
-        values = set(record.get("attempted_dates", []))
-        before = len(values)
-        values.add(day.isoformat())
-        record["attempted_dates"] = sorted(values)
-        record["updated_at"] = datetime.now().isoformat(timespec="seconds")
-        if len(values) == before:
-            return False
-        self._save()
-        return True
+    def pending(self, session_id: str) -> list[dict[str, Any]]:
+        """返回需要首次处理或重试的附件，按时间从新到旧排列。"""
+        records = self.data["chats"].get(session_id, {}).get("items", {})
+        values = [dict(value, key=key) for key, value in records.items()
+                  if value.get("state") in RETRY_STATES]
+        return sorted(values, key=lambda value: (value["timestamp"], value["local_id"]), reverse=True)
 
     def _save(self) -> None:
         """使用同目录临时文件原子替换，避免中断留下半个 JSON。"""
