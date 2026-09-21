@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import date
+import hashlib
 import json
 from pathlib import Path
 from typing import Any, Iterable
@@ -31,6 +32,34 @@ def _variant(path: str, resource_md5: str) -> str | None:
             f"{resource_md5}_t": "thumb", f"{resource_md5}_t_W": "thumb_w"}.get(stem)
 
 
+def _content_md5(path: Path) -> str:
+    """分块计算文件 MD5，避免读取大型附件时占用过多内存。"""
+    digest = hashlib.md5()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _resolve_file_by_content(attachment: dict[str, Any], expected: Path) -> Path | None:
+    """用大小筛选、内容 MD5 终验微信生成的哈希文件名。"""
+    expected_md5 = str(attachment.get("md5") or "").lower()
+    expected_size = attachment.get("size")
+    if len(expected_md5) != 32 or not isinstance(expected_size, int):
+        return None
+    try:
+        candidates = expected.parent.iterdir()
+        for candidate in candidates:
+            if (not candidate.is_file() or candidate.suffix.lower() != expected.suffix.lower()
+                    or candidate.stat().st_size != expected_size):
+                continue
+            if _content_md5(candidate).lower() == expected_md5:
+                return candidate
+    except OSError:
+        return None
+    return None
+
+
 def attachment_state(attachment: dict[str, Any]) -> tuple[str, str | None]:
     """返回附件状态及证明路径；缩略图明确保持为待补原图。"""
     kind = attachment.get("kind")
@@ -50,6 +79,9 @@ def attachment_state(attachment: dict[str, Any]) -> tuple[str, str | None]:
                 suffix = candidate.stem.removeprefix(expected.stem)
                 if suffix.startswith("(") and suffix.endswith(")") and suffix[1:-1].isdigit() and candidate.is_file():
                     return "confirmed", str(candidate)
+            content_match = _resolve_file_by_content(attachment, expected)
+            if content_match:
+                return "confirmed", str(content_match)
         return "missing", None
     if kind != "image":
         return "pending", None

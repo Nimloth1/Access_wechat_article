@@ -1,5 +1,6 @@
 # encoding: UTF-8
 from datetime import date
+import hashlib
 import json
 from pathlib import Path
 import tempfile
@@ -31,6 +32,31 @@ class WechatAttachmentInventoryTests(unittest.TestCase):
             numbered.write_bytes(b'pdf')
             self.assertEqual(attachment_state({'kind': 'file', 'path': str(root / 'report.pdf')}),
                              ('confirmed', str(numbered)))
+
+    def test_hashed_file_name_is_confirmed_by_size_and_md5(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            hashed = root / '48df40ea528631dcca04f3e11d868d6a.pdf'
+            hashed.write_bytes(b'actual attachment')
+            attachment = {
+                'kind': 'file',
+                'path': str(root / 'name: invalid on Windows.pdf'),
+                'size': hashed.stat().st_size,
+                'md5': hashlib.md5(hashed.read_bytes()).hexdigest(),
+            }
+            self.assertEqual(attachment_state(attachment), ('confirmed', str(hashed)))
+
+    def test_same_size_without_matching_md5_remains_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'candidate.pdf').write_bytes(b'wrong')
+            attachment = {
+                'kind': 'file',
+                'path': str(root / 'missing.pdf'),
+                'size': 5,
+                'md5': hashlib.md5(b'right').hexdigest(),
+            }
+            self.assertEqual(attachment_state(attachment), ('missing', None))
 
     def test_inventory_uses_stable_message_keys_and_intraday_cursor(self):
         with tempfile.TemporaryDirectory() as directory:
