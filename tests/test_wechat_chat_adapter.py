@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import MagicMock, Mock, patch
 
-from src.modules.window.wechat_chat_adapter import AttachmentNotClickableError, ChatContext, FORWARD_CLASS, ORIGINAL_NAMES, PREVIEW_CLASS, WechatChatAdapter, local_chat_matches
+from src.modules.window.wechat_chat_adapter import AttachmentNotClickableError, ChatContext, FORWARD_CLASS, ORIGINAL_NAMES, PREVIEW_CLASS, WechatChatAdapter, is_chat_list_search, local_chat_matches
 from src.modules.window.home_window_activation import HomeWindowNotClickableError
 from src.services.chat_attachment_service import ChatAutomationError, ChatMessage, ChatPage
 
@@ -13,7 +13,7 @@ from src.services.chat_attachment_service import ChatAutomationError, ChatMessag
 class Node:
     """实现测试需要的最小 UIA 控件接口。"""
 
-    def __init__(self, name='', kind='ListItemControl', cls='', children=(), identity=1, rect=(0, 10, 300, 100)):
+    def __init__(self, name='', kind='ListItemControl', cls='', children=(), identity=1, rect=(0, 10, 300, 100), parent=None):
         """创建有边界、类型与运行时标识的控件。"""
         self.Name = name
         self.ControlTypeName = kind
@@ -24,6 +24,7 @@ class Node:
         self.children = children
         self.identity = identity
         self.pattern = None
+        self.parent = parent
 
     def GetChildren(self):
         """返回控件子节点。"""
@@ -32,6 +33,10 @@ class Node:
     def GetRuntimeId(self):
         """返回控件实例标识。"""
         return [self.identity]
+
+    def GetParentControl(self):
+        """返回模拟父控件。"""
+        return self.parent
 
     def GetScrollPattern(self):
         """返回模拟滚动属性。"""
@@ -822,7 +827,9 @@ class WechatChatAdapterTests(unittest.TestCase):
         old.AutomationId = 'current_chat_name_label'
         target = Node('180k拼团', kind='TextControl')
         target.AutomationId = 'current_chat_name_label'
-        search = Node('搜索', kind='EditControl', cls='mmui::XValidatorTextEdit')
+        master = Node(cls='mmui::ChatMasterView')
+        search_field = Node(cls='mmui::XSearchField', parent=master)
+        search = Node('搜索', kind='EditControl', cls='mmui::XValidatorTextEdit', parent=search_field)
         search.SetFocus = Mock()
         value = SimpleNamespace(SetValue=Mock())
         search.GetValuePattern = lambda: value
@@ -911,6 +918,18 @@ class WechatChatAdapterTests(unittest.TestCase):
         group = Node('目标')
         rows = [Node('最常使用'), recent, Node('群聊'), group]
         self.assertEqual(local_chat_matches(rows, '目标'), [group])
+
+    def test_chat_list_search_excludes_group_member_sidebar(self):
+        """群成员侧栏打开时，不把其搜索框当成会话搜索框。"""
+        master = Node(cls='mmui::ChatMasterView')
+        master_field = Node(cls='mmui::XSearchField', parent=master)
+        chat_search = Node('搜索', kind='EditControl', cls='mmui::XValidatorTextEdit', parent=master_field)
+        member_panel = Node(cls='mmui::ChatRoomMemberInfoView')
+        member_field = Node(cls='mmui::XSearchField', parent=member_panel)
+        member_search = Node('搜索', kind='EditControl', cls='mmui::XValidatorTextEdit', parent=member_field)
+
+        self.assertTrue(is_chat_list_search(chat_search))
+        self.assertFalse(is_chat_list_search(member_search))
 
 
 if __name__ == '__main__':

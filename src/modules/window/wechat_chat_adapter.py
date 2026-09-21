@@ -4,6 +4,7 @@
 # version: 2.3 @20260920: 拒绝复用运行时 ID 引起的跨页消息映射冲突;
 # version: 2.4 @20260920: 日期探查按日期标签精确找回原页，单图预览失败继续扫描;
 # version: 2.5 @20260921: 搜索结果重复时优先正式分类，不将“最常使用”副本当成重名会话;
+# version: 2.6 @20260921: 仅使用会话列表搜索框，排除群成员侧栏的同名搜索框;
 """微信聊天 UIA 适配器；控件不可见、身份不明确时停止，不用盲点兜底。"""
 from __future__ import annotations
 
@@ -75,6 +76,18 @@ def unique(nodes: list[Any], label: str) -> Any:
     if len(nodes) != 1:
         raise ChatAutomationError(f"{label}需要唯一匹配，实际找到 {len(nodes)} 个")
     return nodes[0]
+
+
+def is_chat_list_search(control: Any) -> bool:
+    """只接受左侧会话列表内的搜索框。"""
+    parent = control.GetParentControl()
+    for _ in range(8):
+        if parent is None:
+            return False
+        if parent.ClassName == 'mmui::ChatMasterView':
+            return True
+        parent = parent.GetParentControl()
+    return False
 
 
 def message_day(text: str, today: date, inherited: date | None = None) -> date | None:
@@ -300,7 +313,8 @@ class WechatChatAdapter:
         self._activate(context)
         nodes = self._nodes(context)
         search = unique([n for n in nodes if n.ControlTypeName == "EditControl" and
-                         n.ClassName == "mmui::XValidatorTextEdit" and n.Name in {"搜索", "Search", "搜尋"}], "对话搜索框")
+                         n.ClassName == "mmui::XValidatorTextEdit" and n.Name in {"搜索", "Search", "搜尋"} and
+                         is_chat_list_search(n)], "对话搜索框")
         search.SetFocus()
         self._pause(0.2)
         if not self._focus_within(search):
