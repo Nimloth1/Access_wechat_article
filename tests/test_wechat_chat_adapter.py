@@ -46,6 +46,32 @@ class WechatChatAdapterTests(unittest.TestCase):
         adapter._list = lambda context: listing
         return adapter
 
+    def test_local_chat_match_accepts_most_used_but_excludes_history_and_web(self):
+        """Fresh-login search may put a local chat under Most Used."""
+        local = Node('180k拼团', children=(Node('180k拼团', kind='TextControl'),))
+        history = Node('Jay Lee', children=(Node('180k拼团', kind='TextControl'),))
+        web = Node('180k拼团', children=(Node('180k拼团', kind='TextControl'),))
+        rows = [Node('最常使用'), local, Node('聊天记录'), history,
+                Node('搜索网络结果'), web]
+
+        self.assertEqual(local_chat_matches(rows, '180k拼团'), [local])
+
+    @patch('src.modules.window.wechat_chat_adapter.temporary_accessibility')
+    def test_compatibility_locates_shell_before_enabling_accessibility(self, temporary):
+        """A fresh process must enable accessibility before inspecting descendants."""
+        adapter = self.adapter(None)
+        adapter.main = None
+        adapter._locate_main = Mock(side_effect=lambda: setattr(
+            adapter, 'main', SimpleNamespace(control=SimpleNamespace(ProcessId=123))))
+        temporary.return_value.__enter__ = Mock(return_value=None)
+        temporary.return_value.__exit__ = Mock(return_value=False)
+
+        with adapter.compatibility(True):
+            self.assertEqual(adapter.main.control.ProcessId, 123)
+
+        adapter._locate_main.assert_called_once_with()
+        temporary.assert_called_once_with(123)
+
     def test_date_in_message_body_does_not_become_message_time(self):
         """普通正文含日期时不可触发截止条件。"""
         body = Node('2020-01-01', 'TextControl', 'mmui::ChatTextItemView')
@@ -281,6 +307,7 @@ class WechatChatAdapterTests(unittest.TestCase):
     def test_scroll_waits_through_long_message_and_returns_when_new_row_appears(self):
         """长消息滚动中身份未变化仍继续，出现新行后立即交给服务核验衔接。"""
         listing = Node(kind='ListControl')
+        listing.pattern = SimpleNamespace(VerticallyScrollable=True, Scroll=Mock())
         adapter = self.adapter(listing)
         adapter._activate = Mock()
         adapter.cancelled = lambda: False
@@ -293,6 +320,7 @@ class WechatChatAdapterTests(unittest.TestCase):
         adapter.read_page = Mock(side_effect=[ChatPage((first,)), ChatPage((first,)), ChatPage((earlier, first))])
         adapter.scroll_older(ChatContext(None, 'A'))
         self.assertEqual(adapter._wheel.call_count, 2)
+        listing.pattern.Scroll.assert_not_called()
 
     def test_wheel_rechecks_fresh_layout_after_transient_obstruction(self):
         """临时遮挡时尚未滚动；重新激活并读取新位置后只发送一次滚轮。"""

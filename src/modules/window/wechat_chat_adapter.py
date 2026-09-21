@@ -50,7 +50,8 @@ def walk(control: Any, limit: int = 2500) -> list[Any]:
 
 def local_chat_matches(rows: list[Any], name: str) -> list[Any]:
     """只返回本地对话分类中的精确名称匹配，未知分类不作为入口。"""
-    allowed = {'群聊', '联系人', '公众号', 'Group Chats', 'Contacts', 'Official Accounts'}
+    allowed = {'群聊', '联系人', '公众号', '最常使用',
+               'Group Chats', 'Contacts', 'Official Accounts', 'Most Used'}
     headers = allowed | {'搜索网络结果', '聊天记录', '更多搜索结果',
                          'Search Web', 'Chat History', 'More Search Results'}
     section = None
@@ -153,9 +154,18 @@ class WechatChatAdapter:
         if not enabled:
             yield
             return
-        self.diagnose()
+        self._locate_main()
         with temporary_accessibility(self.main.control.ProcessId):
             yield
+
+    def _locate_main(self) -> Any:
+        """Locate the WeChat shell without requiring readable UIA descendants."""
+        windows = [w for w in enumerate_desktop_windows()
+                   if w.process_name.lower() in {"weixin.exe", "wechat.exe"}
+                   and w.title in {"微信", "Weixin", "WeChat"} and w.visible and not w.is_minimized
+                   and w.rect[2] - w.rect[0] >= 400 and w.rect[3] - w.rect[1] >= 400]
+        self.main = attach_uia_control(unique(windows, "微信主窗口"))
+        return self.main
 
     def _pause(self, seconds: float) -> None:
         """短间隔等待以响应取消。"""
@@ -188,11 +198,7 @@ class WechatChatAdapter:
 
     def diagnose(self) -> dict:
         """仅检查控件可读性，不点击、切换对话或收集聊天正文。"""
-        windows = [w for w in enumerate_desktop_windows()
-                   if w.process_name.lower() in {"weixin.exe", "wechat.exe"}
-                   and w.title in {"微信", "Weixin", "WeChat"} and w.visible and not w.is_minimized
-                   and w.rect[2] - w.rect[0] >= 400 and w.rect[3] - w.rect[1] >= 400]
-        self.main = attach_uia_control(unique(windows, "微信主窗口"))
+        self._locate_main()
         nodes = walk(self.main.control)
         lists = [n for n in nodes if n.ControlTypeName == "ListControl" and n.Name in MESSAGE_LIST_NAMES]
         titles = [n for n in nodes if n.AutomationId.endswith("current_chat_name_label")]
@@ -583,12 +589,8 @@ class WechatChatAdapter:
         self._activate(context)
         if self.cancelled():
             return False
-        pattern = listing.GetScrollPattern()
-        if pattern is not None and pattern.VerticallyScrollable:
-            pattern.Scroll(self.auto.ScrollAmount.NoAmount, self.auto.ScrollAmount.SmallDecrement)
-            self._pause(0.6)
-            return False
-        # 微信未提供 ScrollPattern 时，使用视口内小幅滚轮，不依赖消息方向键。
+        # 微信的 ScrollPattern 会在图片密集页重排相同控件却不移动视口；统一使用
+        # 视口内小幅滚轮，并在每一步核验页面身份和几何位置。
         original = self.read_page(context)
         before = page_identity(original)
         layout = self._message_layout(context, original)
@@ -798,7 +800,11 @@ class WechatChatAdapter:
                     scores.append((score, x, y))
             score, x, y = max(scores, default=(0, 0, 0))
             if score < 450:
-                raise ChatAutomationError('未能在附件消息内定位可见内容，未点击')
+                if message.kind != 'image':
+                    raise ChatAutomationError('未能在附件消息内定位可见内容，未点击')
+                # 纯白截图、扫描件留白等图片可能没有足够色差；图片类型已由气泡控件
+                # 明确确认，且采样区域已排除头像、昵称和裁切边缘，此时点击正文中心。
+                x, y = bitmap.Width // 2, bitmap.Height // 2
         fresh = self._fresh_target(context, message)
         if (rect_to_tuple(fresh.BoundingRectangle) != row or
                 rect_to_tuple(self._list(context).BoundingRectangle) != viewport or
