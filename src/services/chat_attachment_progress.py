@@ -33,6 +33,32 @@ class ChatAttachmentProgress:
         values = self.data["chats"].get(chat, {}).get("attempted_dates", [])
         return day.isoformat() in values
 
+    def covers(self, chat: str, day: date, since: date | None, level: str) -> bool:
+        """仅当检查点连续覆盖到本次截止日时，才允许提前结束扫描。"""
+        if since is None:
+            return False
+        key = "completed_ranges" if level == "completed" else "attempted_ranges"
+        for item in self.data["chats"].get(chat, {}).get(key, []):
+            if item["start"] <= since.isoformat() <= day.isoformat() <= item["end"]:
+                return True
+        return False
+
+    def mark_range(self, chat: str, start: date, end: date, level: str) -> bool:
+        """保存一次完整遍历得到的连续日期范围。"""
+        if end >= date.today() or end < start:
+            return False
+        key = "completed_ranges" if level == "completed" else "attempted_ranges"
+        record = self.data["chats"].setdefault(chat, {})
+        ranges = record.setdefault(key, [])
+        value = {"start": start.isoformat(), "end": end.isoformat()}
+        if value in ranges:
+            return False
+        ranges.append(value)
+        ranges.sort(key=lambda item: (item["start"], item["end"]))
+        record["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        self._save()
+        return True
+
     def mark_completed(self, chat: str, day: date) -> bool:
         """写入一个完整自然日，返回本次是否新增。"""
         if day >= date.today():

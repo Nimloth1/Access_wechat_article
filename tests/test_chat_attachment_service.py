@@ -335,14 +335,14 @@ class ChatAttachmentServiceTests(unittest.TestCase):
             events = []
             ChatAttachmentService(first, events.append, progress).run(
                 AttachmentOptions(chats=('群',), since=date(2026, 9, 18)))
-            self.assertTrue(progress.completed('群', date(2026, 9, 18)))
+            self.assertTrue(progress.covers('群', date(2026, 9, 18), date(2026, 9, 18), 'completed'))
 
             second = FakeAdapter({'群': [ChatPage((msg('done', day=date(2026, 9, 18)),
                                                    msg('new', day=date(2026, 9, 19))), True)]})
             second.status = 'available'
             events = []
             ChatAttachmentService(second, events.append, progress).run(
-                AttachmentOptions(chats=('群',), since=date(2026, 9, 1)))
+                AttachmentOptions(chats=('群',), since=date(2026, 9, 18)))
             self.assertEqual(second.downloaded, [('群', 'new')])
             self.assertTrue(any(event['event'] == 'checkpoint_hit' for event in events))
 
@@ -354,13 +354,13 @@ class ChatAttachmentServiceTests(unittest.TestCase):
                                                     msg('image', day=date(2026, 9, 18))), True)]})
             ChatAttachmentService(adapter, lambda _event: None, progress).run(
                 AttachmentOptions(chats=('群',), since=date(2026, 9, 18)))
-            self.assertFalse(progress.completed('群', date(2026, 9, 18)))
-            self.assertTrue(progress.attempted('群', date(2026, 9, 18)))
+            self.assertFalse(progress.covers('群', date(2026, 9, 18), date(2026, 9, 18), 'completed'))
+            self.assertTrue(progress.covers('群', date(2026, 9, 18), date(2026, 9, 18), 'attempted'))
 
             retry = FakeAdapter({'群': [ChatPage((msg('image', day=date(2026, 9, 18)),
                                                   msg('new', day=date(2026, 9, 19))), True)]})
             ChatAttachmentService(retry, lambda _event: None, progress).run(
-                AttachmentOptions(chats=('群',), since=date(2026, 9, 1), resume_opened=True))
+                AttachmentOptions(chats=('群',), since=date(2026, 9, 18), resume_opened=True))
             self.assertEqual(retry.downloaded, [('群', 'new')])
 
 

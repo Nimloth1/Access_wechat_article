@@ -87,7 +87,7 @@ def event_message(event: dict) -> str:
         return prefix + f"日期 {event['day']} 已{level}，跳过更早记录"
     if kind == 'checkpoint_saved':
         level = '完整处理' if event.get('level') == 'completed' else '全部打开过（未证明落盘）'
-        return prefix + f"已把 {event['day']} 标记为{level}"
+        return prefix + f"已把 {event['start']} 至 {event['end']} 标记为{level}"
     if kind == 'finished':
         counts = event['counts']
         return (f"任务结束：扫描外层 {counts.get('messages', 0)} 条、转发内部 {counts.get('forward_messages', 0)} 条；"

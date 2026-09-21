@@ -136,6 +136,7 @@ class ChatAttachmentService:
         self._coverage_clean = True
         self._coverage_attempted_clean = True
         self._coverage_blocked = False
+        self._coverage_days: set[date] = set()
 
     def _event(self, event: str, **details: Any) -> None:
         """输出不包含聊天正文的结构化事件。"""
@@ -158,9 +159,11 @@ class ChatAttachmentService:
                 self._coverage_clean = True
                 self._coverage_attempted_clean = True
                 self._coverage_blocked = False
+                self._coverage_days = set()
                 self._event("chat_started", chat=name)
                 budget = [options.max_forward_messages]
                 reason = self._scan(context, options, name, (), budget)
+                self._finish_coverage_run(name, options, reason)
                 self._event("chat_stopped", chat=name, reason=reason)
             except ChatAutomationError as exc:
                 if self.adapter.cancelled():
@@ -220,19 +223,18 @@ class ChatAttachmentService:
                     if message.day is None:
                         self._event('date_resolved', chat=chat, path=item_path, day=day.isoformat())
                     if day < options.since:
-                        self._finish_coverage_day(chat)
                         return "date_boundary"
                     if self._coverage_day != day:
-                        self._finish_coverage_day(chat)
-                        strict = options.resume and self.progress and self.progress.completed(chat, day)
-                        opened = options.resume_opened and self.progress and self.progress.attempted(chat, day)
+                        strict = options.resume and self.progress and self.progress.covers(
+                            chat, day, options.since, "completed")
+                        opened = options.resume_opened and self.progress and self.progress.covers(
+                            chat, day, options.since, "attempted")
                         if strict or opened:
                             self._event("checkpoint_hit", chat=chat, path=item_path, day=day.isoformat(),
                                         level="completed" if strict else "attempted")
                             return "checkpoint_boundary"
                         self._coverage_day = day
-                        self._coverage_clean = True
-                        self._coverage_attempted_clean = True
+                    self._coverage_days.add(day)
                 if options.image_route == 'viewer':
                     if message.kind != 'image':
                         continue
@@ -293,8 +295,6 @@ class ChatAttachmentService:
             if count:
                 self._event("scan_progress", chat=chat, path=path, scanned=scanned)
             if page.at_start:
-                if not path:
-                    self._finish_coverage_day(chat)
                 return "history_start"
             if not path and options.max_messages and scanned >= options.max_messages:
                 return "message_limit"
@@ -311,13 +311,17 @@ class ChatAttachmentService:
                 previous = None
         return "cancelled"
 
-    def _finish_coverage_day(self, chat: str) -> None:
-        """仅在整日扫描完整且所有附件状态可靠时写入检查点。"""
-        if (self.progress and self._coverage_day and self._coverage_attempted_clean and
-                not self._coverage_blocked and self.progress.mark_attempted(chat, self._coverage_day)):
+    def _finish_coverage_run(self, chat: str, options: AttachmentOptions, reason: str) -> None:
+        """只有抵达明确边界的连续扫描，才能保存可用于提前停止的范围。"""
+        if not self.progress or not self._coverage_days or reason not in {"date_boundary", "history_start"}:
+            return
+        start = options.since if reason == "date_boundary" and options.since else min(self._coverage_days)
+        end = max(self._coverage_days)
+        if (self._coverage_attempted_clean and not self._coverage_blocked and
+                self.progress.mark_range(chat, start, end, "attempted")):
             self.counts["attempted_days"] += 1
-            self._event("checkpoint_saved", chat=chat, day=self._coverage_day.isoformat(), level="attempted")
-        if (self.progress and self._coverage_day and self._coverage_clean and not self._coverage_blocked and
-                self.progress.mark_completed(chat, self._coverage_day)):
+            self._event("checkpoint_saved", chat=chat, start=start.isoformat(), end=end.isoformat(), level="attempted")
+        if (self._coverage_clean and not self._coverage_blocked and
+                self.progress.mark_range(chat, start, end, "completed")):
             self.counts["completed_days"] += 1
-            self._event("checkpoint_saved", chat=chat, day=self._coverage_day.isoformat(), level="completed")
+            self._event("checkpoint_saved", chat=chat, start=start.isoformat(), end=end.isoformat(), level="completed")
