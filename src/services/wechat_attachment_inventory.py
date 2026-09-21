@@ -36,7 +36,21 @@ def attachment_state(attachment: dict[str, Any]) -> tuple[str, str | None]:
     kind = attachment.get("kind")
     if kind == "file":
         path = attachment.get("path")
-        return ("confirmed", path) if _exists(path) else ("missing", None)
+        if _exists(path):
+            return "confirmed", path
+        if isinstance(path, str) and path:
+            expected = Path(path)
+            try:
+                # 微信对重名下载使用 name(1).pdf/name(2).pdf；它们仍是同一消息的
+                # 可用落盘副本，不能因导出保留原始文件名而误报缺失。
+                numbered = sorted(expected.parent.glob(f"{expected.stem}(*){expected.suffix}"))
+            except OSError:
+                numbered = []
+            for candidate in numbered:
+                suffix = candidate.stem.removeprefix(expected.stem)
+                if suffix.startswith("(") and suffix.endswith(")") and suffix[1:-1].isdigit() and candidate.is_file():
+                    return "confirmed", str(candidate)
+        return "missing", None
     if kind != "image":
         return "pending", None
     resource_md5 = str(attachment.get("resource_md5") or "")

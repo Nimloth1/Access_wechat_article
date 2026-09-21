@@ -24,6 +24,14 @@ class WechatAttachmentInventoryTests(unittest.TestCase):
                 'kind': 'image', 'resource_md5': 'abc', 'dat_paths': [str(thumb), str(original)]
             }), ('original', str(original)))
 
+    def test_numbered_file_copy_is_confirmed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            numbered = root / 'report(1).pdf'
+            numbered.write_bytes(b'pdf')
+            self.assertEqual(attachment_state({'kind': 'file', 'path': str(root / 'report.pdf')}),
+                             ('confirmed', str(numbered)))
+
     def test_inventory_uses_stable_message_keys_and_intraday_cursor(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
