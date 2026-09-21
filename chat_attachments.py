@@ -12,10 +12,11 @@
 # version: 1.10 @20260911: 默认直接采集，窗口显示版本号，开始按钮明确当前模式;
 # version: 1.11 @20260911: 识别点击后复用的转发窗口，处理后保留用户已有窗口;
 # version: 1.12 @20260920: 增加自动滚到最新消息及既有文件可用性核验;
+# version: 1.13 @20260921: 增加群聊自然日完成检查点和每日增量续跑;
 """独立运行聊天附件任务；不启动公众号代理服务。"""
 from __future__ import annotations
 
-__version__ = 'v1.12'
+__version__ = 'v1.13'
 __platform__ = 'nt'
 __pc__ = ['PW', 'AW', 'BW', 'UU', 'PM']
 __py__ = 'py3.13+'
@@ -37,9 +38,11 @@ else:
 
 from src.modules.window.wechat_chat_adapter import WechatChatAdapter
 from src.services.chat_attachment_service import AttachmentOptions, ChatAttachmentService
+from src.services.chat_attachment_progress import ChatAttachmentProgress
 
 ROOT = Path(__file__).resolve().parent
 LOG_DIR = ROOT / 'data' / 'chat_attachments'
+PROGRESS_PATH = LOG_DIR / 'progress.json'
 
 
 def event_message(event: dict) -> str:
@@ -49,6 +52,7 @@ def event_message(event: dict) -> str:
                 'skipped_file': '无未下载标记，已跳过（未核验缓存）'}
     reasons = {'message_limit': '达到消息条数上限', 'forward_message_limit': '达到转发内部条数上限',
                'date_boundary': '已到截止日期之前', 'history_start': '已到记录起点', 'empty': '列表为空',
+               'checkpoint_boundary': '已遇到完整处理过的日期，增量扫描结束',
                'cancelled': '已停止', 'unknown_date': '日期不明确，跳过', 'depth_limit': '达到转发层数上限',
                'previous_limit': '达到上一张点击次数上限', 'previous_unavailable': '上一张按钮不可用，停止',
                'viewer_candidate': '已找到连续图片起点；仅扫描模式不打开预览'}
@@ -78,6 +82,12 @@ def event_message(event: dict) -> str:
         return prefix + '消息衔接未通过核验，已记录前后页面标识'
     if kind == 'pagination_recovered':
         return prefix + '微信重建了消息列表，已返回原页核验并恢复翻页'
+    if kind == 'checkpoint_hit':
+        level = '完整处理' if event.get('level') == 'completed' else '全部打开过'
+        return prefix + f"日期 {event['day']} 已{level}，跳过更早记录"
+    if kind == 'checkpoint_saved':
+        level = '完整处理' if event.get('level') == 'completed' else '全部打开过（未证明落盘）'
+        return prefix + f"已把 {event['day']} 标记为{level}"
     if kind == 'finished':
         counts = event['counts']
         return (f"任务结束：扫描外层 {counts.get('messages', 0)} 条、转发内部 {counts.get('forward_messages', 0)} 条；"
@@ -105,6 +115,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument('--download-timeout', type=float, default=30)
     parser.add_argument('--start-latest', action='store_true', help='进入对话后先自动滚到最新消息')
     parser.add_argument('--verify-files', action='store_true', help='无未下载标记时也用菜单核验文件可用性')
+    parser.add_argument('--no-resume', action='store_true', help='忽略已完成自然日检查点，强制重新扫描')
+    parser.add_argument('--resume-opened', action='store_true', help='也跳过整日均已打开过但尚未确认落盘的图片')
     parser.add_argument('--image-route', choices=['messages', 'viewer'], default='messages', help='逐条消息或连续图片路线')
     parser.add_argument('--previous-clicks', type=int, default=100, help='连续图片路线最多点击上一张次数，起始图片另计')
     parser.add_argument('--image-interval', type=float, default=1, help='每张图片停留秒数，默认 1')
@@ -115,7 +127,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if args.config:
         task_flags = {'--chat', '--since', '--max-messages', '--no-images', '--no-files',
                       '--no-forwards', '--max-depth', '--max-forward-messages', '--download-timeout', '--dry-run', '--compatibility',
-                      '--image-route', '--previous-clicks', '--image-interval', '--start-latest', '--verify-files'}
+                      '--image-route', '--previous-clicks', '--image-interval', '--start-latest', '--verify-files', '--no-resume', '--resume-opened'}
         if any(arg.split('=', 1)[0] in task_flags for arg in argv):
             parser.error('--config 不能与单独的任务参数混用，请修改 JSON 配置')
     return args
@@ -128,7 +140,7 @@ def options_from_dict(values: dict) -> AttachmentOptions:
     if unknown:
         raise ValueError('未知配置项：' + ', '.join(sorted(unknown)))
     values = dict(values)
-    for key in ('images', 'files', 'forwards', 'dry_run', 'compatibility', 'start_latest', 'verify_files'):
+    for key in ('images', 'files', 'forwards', 'dry_run', 'compatibility', 'start_latest', 'verify_files', 'resume', 'resume_opened'):
         if key in values and type(values[key]) is not bool:
             raise ValueError(f'{key} 必须为 true 或 false')
     for key in ('max_messages', 'max_depth', 'max_forward_messages', 'previous_clicks'):
@@ -193,7 +205,8 @@ def execute(options: AttachmentOptions, stop: Event, notify=print) -> dict:
             try:
                 adapter = WechatChatAdapter(stop)
                 with adapter.compatibility(options.compatibility):
-                    return ChatAttachmentService(adapter, emit).run(options)
+                    progress = None if options.dry_run else ChatAttachmentProgress(PROGRESS_PATH)
+                    return ChatAttachmentService(adapter, emit, progress).run(options)
             except Exception as exc:
                 emit({'event': 'fatal_error', 'detail': str(exc)})
                 raise
@@ -393,7 +406,8 @@ def main() -> int:
                 'images': not args.no_images, 'files': not args.no_files, 'forwards': not args.no_forwards,
                 'max_depth': args.max_depth, 'max_forward_messages': args.max_forward_messages,
                 'image_route': args.image_route, 'previous_clicks': args.previous_clicks, 'image_interval': args.image_interval,
-                'download_timeout': args.download_timeout, 'dry_run': args.dry_run, 'compatibility': args.compatibility}
+                'download_timeout': args.download_timeout, 'dry_run': args.dry_run, 'compatibility': args.compatibility,
+                'resume': not args.no_resume, 'resume_opened': args.resume_opened}
             values.update(start_latest=args.start_latest, verify_files=args.verify_files)
         result = execute(options_from_dict(values), Event())
         return 2 if result.get('errors') or result.get('cancelled') else 0

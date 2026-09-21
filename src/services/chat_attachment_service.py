@@ -8,6 +8,8 @@ from datetime import date, datetime
 import traceback
 from typing import Any, Callable, Protocol
 
+from src.services.chat_attachment_progress import ChatAttachmentProgress
+
 
 class ChatAutomationError(RuntimeError):
     """无法可靠继续时停止当前对话。"""
@@ -31,6 +33,8 @@ class AttachmentOptions:
     image_interval: float = 1.0
     start_latest: bool = False
     verify_files: bool = False
+    resume: bool = True
+    resume_opened: bool = False
 
     def __post_init__(self) -> None:
         """校验边界，0 条仅在给定日期时表示不限数量。"""
@@ -121,11 +125,17 @@ def older_prefix(previous: ChatPage, current: ChatPage) -> int:
 class ChatAttachmentService:
     """顺序扫描外层和嵌套转发；附件完成数独立于消息扫描数。"""
 
-    def __init__(self, adapter: ChatAdapter, emit: Callable[[dict], None]) -> None:
+    def __init__(self, adapter: ChatAdapter, emit: Callable[[dict], None],
+                 progress: ChatAttachmentProgress | None = None) -> None:
         """接收界面适配器和逐条持久化的事件回调。"""
         self.adapter = adapter
         self.emit = emit
         self.counts: Counter = Counter()
+        self.progress = progress
+        self._coverage_day: date | None = None
+        self._coverage_clean = True
+        self._coverage_attempted_clean = True
+        self._coverage_blocked = False
 
     def _event(self, event: str, **details: Any) -> None:
         """输出不包含聊天正文的结构化事件。"""
@@ -144,6 +154,10 @@ class ChatAttachmentService:
                 if options.since:
                     self.adapter.prepare_dates(context)
                 name = self.adapter.chat_name(context)
+                self._coverage_day = None
+                self._coverage_clean = True
+                self._coverage_attempted_clean = True
+                self._coverage_blocked = False
                 self._event("chat_started", chat=name)
                 budget = [options.max_forward_messages]
                 reason = self._scan(context, options, name, (), budget)
@@ -199,13 +213,26 @@ class ChatAttachmentService:
                     if self.adapter.cancelled():
                         return 'cancelled'
                     if day is None:
+                        self._coverage_blocked = True
                         self.counts["unknown_date"] += 1
                         self._event("skipped", chat=chat, path=item_path, reason="unknown_date")
                         continue
                     if message.day is None:
                         self._event('date_resolved', chat=chat, path=item_path, day=day.isoformat())
                     if day < options.since:
+                        self._finish_coverage_day(chat)
                         return "date_boundary"
+                    if self._coverage_day != day:
+                        self._finish_coverage_day(chat)
+                        strict = options.resume and self.progress and self.progress.completed(chat, day)
+                        opened = options.resume_opened and self.progress and self.progress.attempted(chat, day)
+                        if strict or opened:
+                            self._event("checkpoint_hit", chat=chat, path=item_path, day=day.isoformat(),
+                                        level="completed" if strict else "attempted")
+                            return "checkpoint_boundary"
+                        self._coverage_day = day
+                        self._coverage_clean = True
+                        self._coverage_attempted_clean = True
                 if options.image_route == 'viewer':
                     if message.kind != 'image':
                         continue
@@ -232,8 +259,19 @@ class ChatAttachmentService:
                     else:
                         child = self.adapter.open_forward(context, message)
                         try:
+                            unresolved_before = sum(self.counts[key] for key in
+                                                    ("unconfirmed", "failed", "cancelled", "expired", "skipped_file"))
+                            failed_before = sum(self.counts[key] for key in
+                                                ("failed", "cancelled", "expired", "skipped_file"))
                             self._event('forward_started', chat=chat, path=item_path)
                             reason = self._scan(child, options, chat, item_path, budget)
+                            unresolved_after = sum(self.counts[key] for key in
+                                                   ("unconfirmed", "failed", "cancelled", "expired", "skipped_file"))
+                            if unresolved_after > unresolved_before:
+                                self._coverage_clean = False
+                            if sum(self.counts[key] for key in
+                                   ("failed", "cancelled", "expired", "skipped_file")) > failed_before:
+                                self._coverage_attempted_clean = False
                             self._event("forward_stopped", chat=chat, path=item_path, reason=reason)
                         finally:
                             self.adapter.close_forward(child, context)
@@ -247,10 +285,16 @@ class ChatAttachmentService:
                     if status not in {"candidate", "confirmed", "available", "unconfirmed", "expired", "failed", "cancelled", "skipped_file"}:
                         raise ChatAutomationError(f"未知附件状态：{status}")
                     self.counts[status] += 1
+                    if not path and status not in {"confirmed", "available", "candidate"}:
+                        self._coverage_clean = False
+                    if not path and status in {"failed", "cancelled", "expired", "skipped_file"}:
+                        self._coverage_attempted_clean = False
                     self._event("attachment", chat=chat, path=item_path, kind=message.kind, status=status)
             if count:
                 self._event("scan_progress", chat=chat, path=path, scanned=scanned)
             if page.at_start:
+                if not path:
+                    self._finish_coverage_day(chat)
                 return "history_start"
             if not path and options.max_messages and scanned >= options.max_messages:
                 return "message_limit"
@@ -266,3 +310,14 @@ class ChatAttachmentService:
                 # 少量重复检查，避免用同名图片猜测重叠而漏掉附件。
                 previous = None
         return "cancelled"
+
+    def _finish_coverage_day(self, chat: str) -> None:
+        """仅在整日扫描完整且所有附件状态可靠时写入检查点。"""
+        if (self.progress and self._coverage_day and self._coverage_attempted_clean and
+                not self._coverage_blocked and self.progress.mark_attempted(chat, self._coverage_day)):
+            self.counts["attempted_days"] += 1
+            self._event("checkpoint_saved", chat=chat, day=self._coverage_day.isoformat(), level="attempted")
+        if (self.progress and self._coverage_day and self._coverage_clean and not self._coverage_blocked and
+                self.progress.mark_completed(chat, self._coverage_day)):
+            self.counts["completed_days"] += 1
+            self._event("checkpoint_saved", chat=chat, day=self._coverage_day.isoformat(), level="completed")
