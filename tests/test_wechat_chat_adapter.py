@@ -905,6 +905,13 @@ class WechatChatAdapterTests(unittest.TestCase):
         self.assertEqual(local_chat_matches([Node('公众号'), target], '目标'), [target])
         self.assertEqual(local_chat_matches([Node('群聊'), Node('目标其他')], '目标'), [])
 
+    def test_local_search_prefers_group_over_most_used_duplicate(self):
+        """同一会话出现在快捷分类和正式分类时，只返回正式分类。"""
+        recent = Node('目标')
+        group = Node('目标')
+        rows = [Node('最常使用'), recent, Node('群聊'), group]
+        self.assertEqual(local_chat_matches(rows, '目标'), [group])
+
 
 if __name__ == '__main__':
     unittest.main()

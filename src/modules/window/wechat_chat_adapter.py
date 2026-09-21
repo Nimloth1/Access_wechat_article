@@ -3,6 +3,7 @@
 # version: 2.2 @20260920: 搜索弹层保留主窗口焦点，激活后重取搜索框;
 # version: 2.3 @20260920: 拒绝复用运行时 ID 引起的跨页消息映射冲突;
 # version: 2.4 @20260920: 日期探查按日期标签精确找回原页，单图预览失败继续扫描;
+# version: 2.5 @20260921: 搜索结果重复时优先正式分类，不将“最常使用”副本当成重名会话;
 """微信聊天 UIA 适配器；控件不可见、身份不明确时停止，不用盲点兜底。"""
 from __future__ import annotations
 
@@ -50,12 +51,14 @@ def walk(control: Any, limit: int = 2500) -> list[Any]:
 
 def local_chat_matches(rows: list[Any], name: str) -> list[Any]:
     """只返回本地对话分类中的精确名称匹配，未知分类不作为入口。"""
-    allowed = {'群聊', '联系人', '公众号', '最常使用',
-               'Group Chats', 'Contacts', 'Official Accounts', 'Most Used'}
+    preferred = {'群聊', '联系人', '公众号', 'Group Chats', 'Contacts', 'Official Accounts'}
+    fallback = {'最常使用', 'Most Used'}
+    allowed = preferred | fallback
     headers = allowed | {'搜索网络结果', '聊天记录', '更多搜索结果',
                          'Search Web', 'Chat History', 'More Search Results'}
     section = None
     matches = []
+    fallback_matches = []
     for row in rows:
         label = row.Name.strip()
         if label in headers:
@@ -63,8 +66,8 @@ def local_chat_matches(rows: list[Any], name: str) -> list[Any]:
             continue
         if section in allowed and row.ControlTypeName == 'ListItemControl' and any(
                 node.Name.strip() == name for node in walk(row)):
-            matches.append(row)
-    return matches
+            (matches if section in preferred else fallback_matches).append(row)
+    return matches or fallback_matches
 
 
 def unique(nodes: list[Any], label: str) -> Any:
