@@ -8,6 +8,7 @@
 # version: 2.7 @20260923: 按消息签名缓存已补全日期，避免点图后控件重建重复回滚;
 # version: 2.8 @20260923: 连续页面无日期分隔条时沿用最近核验日期，减少大图逐张回滚;
 # version: 2.9 @20260923: 从公众号等非聊天页可通过左侧会话搜索切换到指定对话;
+# version: 3.0 @20260923: 排除微信日期弹窗，前台切换瞬断时有限重试;
 """微信聊天 UIA 适配器；控件不可见、身份不明确时停止，不用盲点兜底。"""
 from __future__ import annotations
 
@@ -183,7 +184,8 @@ class WechatChatAdapter:
         """Locate the WeChat shell without requiring readable UIA descendants."""
         windows = [w for w in enumerate_desktop_windows()
                    if w.process_name.lower() in {"weixin.exe", "wechat.exe"}
-                   and w.title in {"微信", "Weixin", "WeChat"} and w.visible and not w.is_minimized
+                   and w.title in {"微信", "Weixin", "WeChat"}
+                   and w.class_name == "Qt51514QWindowIcon" and w.visible and not w.is_minimized
                    and w.rect[2] - w.rect[0] >= 400 and w.rect[3] - w.rect[1] >= 400]
         self.main = attach_uia_control(unique(windows, "微信主窗口"))
         return self.main
@@ -213,9 +215,12 @@ class WechatChatAdapter:
         if not desktop:
             raise ChatAutomationError('桌面不可交互，请解锁 Windows 并保持登录会话连接后重试')
         user32.CloseDesktop(desktop)
-        self.guard.activate(context.window)
-        if not user32.GetForegroundWindow():
-            raise ChatAutomationError('未能获得可交互的前台窗口，停止操作')
+        for _ in range(5):
+            self.guard.activate(context.window)
+            if user32.GetForegroundWindow():
+                return
+            self._pause(0.2)
+        raise ChatAutomationError('未能获得可交互的前台窗口，停止操作')
 
     def diagnose(self) -> dict:
         """仅检查控件可读性，不点击、切换对话或收集聊天正文。"""

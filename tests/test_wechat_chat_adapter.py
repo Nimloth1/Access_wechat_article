@@ -77,6 +77,23 @@ class WechatChatAdapterTests(unittest.TestCase):
         adapter._locate_main.assert_called_once_with()
         temporary.assert_called_once_with(123)
 
+    @patch('src.modules.window.wechat_chat_adapter.attach_uia_control')
+    @patch('src.modules.window.wechat_chat_adapter.enumerate_desktop_windows')
+    def test_main_window_ignores_weixin_calendar_popup(self, windows, attach):
+        """日历弹窗标题同为 Weixin，不得当成第二个微信主窗口。"""
+        main = SimpleNamespace(process_name='Weixin.exe', title='微信',
+                               class_name='Qt51514QWindowIcon', visible=True,
+                               is_minimized=False, rect=(0, 0, 1200, 800))
+        popup = SimpleNamespace(process_name='Weixin.exe', title='Weixin',
+                                class_name='Qt51514QWindowToolSaveBits', visible=True,
+                                is_minimized=False, rect=(100, 100, 550, 650))
+        windows.return_value = [popup, main]
+        adapter = self.adapter(None)
+
+        adapter._locate_main()
+
+        attach.assert_called_once_with(main)
+
     def test_date_in_message_body_does_not_become_message_time(self):
         """普通正文含日期时不可触发截止条件。"""
         body = Node('2020-01-01', 'TextControl', 'mmui::ChatTextItemView')
