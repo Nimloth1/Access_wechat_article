@@ -124,6 +124,13 @@ class WechatChatAdapterTests(unittest.TestCase):
         self.assertIsNone(page.messages[0].day)
         self.assertEqual(page.messages[1].day, date(2026, 9, 4))
 
+        hidden_boundary = Node('2026年9月4日 23:59', cls='mmui::ChatItemView')
+        hidden_boundary.IsOffscreen = True
+        continuous = Node(kind='ListControl', children=(hidden_boundary, Node('continuous', identity=4)),
+                          rect=(0, 0, 400, 500))
+        self.assertEqual(self.adapter(continuous).read_page(context).messages[0].day,
+                         date(2026, 9, 5))
+
     def test_date_scan_clicks_short_time_once_and_reads_expanded_label(self):
         """按日期扫描展开时间标签一次，使用控件文字而非正文或 OCR。"""
         header = Node('10:00', cls='mmui::ChatItemView')

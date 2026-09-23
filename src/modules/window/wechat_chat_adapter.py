@@ -364,7 +364,12 @@ class WechatChatAdapter:
         for raw_identity in raw_ids:
             canonical = context.identities.get(raw_identity, raw_identity)
             alias_counts[canonical] = alias_counts.get(canonical, 0) + 1
-        has_date_boundary = any(row.ClassName == "mmui::ChatItemView" for row in children)
+        has_date_boundary = any(
+            row.ClassName == "mmui::ChatItemView" and not row.IsOffscreen
+            and rect_to_tuple(row.BoundingRectangle)[3] > viewport[1]
+            and rect_to_tuple(row.BoundingRectangle)[1] < viewport[3]
+            for row in children
+        )
         inherited = None if has_date_boundary else context.scan_day
         for row in children:
             nodes = walk(row)
