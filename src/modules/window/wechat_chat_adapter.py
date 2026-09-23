@@ -7,6 +7,7 @@
 # version: 2.6 @20260921: 仅使用会话列表搜索框，排除群成员侧栏的同名搜索框;
 # version: 2.7 @20260923: 按消息签名缓存已补全日期，避免点图后控件重建重复回滚;
 # version: 2.8 @20260923: 连续页面无日期分隔条时沿用最近核验日期，减少大图逐张回滚;
+# version: 2.9 @20260923: 从公众号等非聊天页可通过左侧会话搜索切换到指定对话;
 """微信聊天 UIA 适配器；控件不可见、身份不明确时停止，不用盲点兜底。"""
 from __future__ import annotations
 
@@ -307,12 +308,14 @@ class WechatChatAdapter:
     def open_chat(self, name: str | None) -> ChatContext:
         """选择当前对话或精确搜索指定对话；不向聊天输入框输入文字。"""
         diagnostic = self.diagnose()
-        if not diagnostic["ready"]:
+        if not diagnostic["ready"] and name is None:
             raise ChatAutomationError(diagnostic["detail"])
         nodes = walk(self.main.control)
         title = unique([n for n in nodes if n.AutomationId.endswith("current_chat_name_label")], "当前对话标题")
         context = ChatContext(self.main, title.Name.strip())
         if name is None or name == context.name:
+            if not diagnostic["ready"]:
+                raise ChatAutomationError(diagnostic["detail"])
             return context
         self._activate(context)
         nodes = self._nodes(context)

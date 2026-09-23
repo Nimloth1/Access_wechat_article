@@ -908,6 +908,47 @@ class WechatChatAdapterTests(unittest.TestCase):
                     self.assertEqual(adapter._click.call_count, 1)
                 self.assertIs(adapter._click.call_args_list[0].args[1], search)
 
+    def test_chat_navigation_can_leave_official_account_page(self):
+        """指定目标对话时，公众号页可使用左侧会话搜索框跳转。"""
+        account = Node('公众号', kind='TextControl')
+        account.AutomationId = 'current_chat_name_label'
+        target = Node('180k拼团', kind='TextControl')
+        target.AutomationId = 'current_chat_name_label'
+        master = Node(cls='mmui::ChatMasterView')
+        search_field = Node(cls='mmui::XSearchField', parent=master)
+        search = Node('搜索', kind='EditControl', cls='mmui::XValidatorTextEdit', parent=search_field)
+        search.SetFocus = Mock()
+        value = SimpleNamespace(SetValue=Mock())
+        search.GetValuePattern = lambda: value
+        result = Node('180k拼团')
+        results = Node(kind='ListControl', children=(Node('群聊'), result))
+        results.AutomationId = 'search_list'
+        root = Node(kind='WindowControl', children=(account, search))
+        adapter = self.adapter(None)
+        adapter.main = SimpleNamespace(control=root)
+        adapter.diagnose = lambda: {'ready': False, 'detail': '当前不是聊天页'}
+        adapter._nodes = lambda context: [account, search, results]
+        adapter._activate = Mock()
+        adapter._focus_within = lambda control: True
+        adapter._click = Mock()
+        adapter._pause = Mock()
+        adapter.cancelled = lambda: False
+        adapter._window = Mock(return_value=SimpleNamespace(control=Node(children=(target,))))
+
+        context = adapter.open_chat('180k拼团')
+
+        self.assertEqual(context.name, '180k拼团')
+        value.SetValue.assert_called_once_with('180k拼团')
+        adapter._click.assert_called_once_with(context, result, keep_parent_active=True)
+
+    def test_current_non_chat_page_still_stops_without_target_name(self):
+        """未指定目标时，公众号页不能被误当作可采集聊天页。"""
+        adapter = self.adapter(None)
+        adapter.diagnose = lambda: {'ready': False, 'detail': '当前不是聊天页'}
+
+        with self.assertRaisesRegex(ChatAutomationError, '当前不是聊天页'):
+            adapter.open_chat(None)
+
     def test_search_popup_keeps_parent_active_but_checks_popup_owner(self):
         """搜索弹层不抢焦点；点击仍核验弹层所属进程和坐标。"""
         adapter = self.adapter(None)
