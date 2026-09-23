@@ -374,6 +374,9 @@ class WechatChatAdapter:
         for row in children:
             nodes = walk(row)
             if row.ControlTypeName != "ListItemControl":
+                bounds = rect_to_tuple(row.BoundingRectangle)
+                if row.IsOffscreen or bounds[3] <= viewport[1] or bounds[1] >= viewport[3]:
+                    continue
                 # 只读取明确独立的时间标签，不在任意分组正文里寻找日期。
                 if row.ControlTypeName == "TextControl":
                     parsed = message_day(row.Name, self.today, inherited)
@@ -382,6 +385,9 @@ class WechatChatAdapter:
                 continue
             # 时间分隔条不是聊天消息，不能消耗用户指定的条数。
             if row.ClassName == "mmui::ChatItemView":
+                bounds = rect_to_tuple(row.BoundingRectangle)
+                if row.IsOffscreen or bounds[3] <= viewport[1] or bounds[1] >= viewport[3]:
+                    continue
                 # 时间行即使格式未知也不算聊天消息，并清除旧日期避免误归属。
                 inherited = message_day(row.Name, self.today, None if context.resolve_dates else inherited)
                 continue
