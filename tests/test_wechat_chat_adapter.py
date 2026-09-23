@@ -111,6 +111,19 @@ class WechatChatAdapterTests(unittest.TestCase):
         self.assertEqual(rebuilt.day, date(2026, 9, 5))
         self.assertEqual(context.dates[(2,)], date(2026, 9, 5))
 
+    def test_read_page_inherits_scan_day_only_without_date_boundary(self):
+        """相邻页面可沿用核验日期，但出现日期分隔条时必须停止沿用。"""
+        context = ChatContext(None, 'A', scan_day=date(2026, 9, 5))
+        plain = Node(kind='ListControl', children=(Node('older', identity=1),), rect=(0, 0, 400, 500))
+        self.assertEqual(self.adapter(plain).read_page(context).messages[0].day, date(2026, 9, 5))
+
+        boundary = Node('2026年9月4日 23:59', cls='mmui::ChatItemView')
+        crossed = Node(kind='ListControl', children=(Node('previous day', identity=2), boundary,
+                                                     Node('new day', identity=3)), rect=(0, 0, 400, 500))
+        page = self.adapter(crossed).read_page(context)
+        self.assertIsNone(page.messages[0].day)
+        self.assertEqual(page.messages[1].day, date(2026, 9, 4))
+
     def test_date_scan_clicks_short_time_once_and_reads_expanded_label(self):
         """按日期扫描展开时间标签一次，使用控件文字而非正文或 OCR。"""
         header = Node('10:00', cls='mmui::ChatItemView')

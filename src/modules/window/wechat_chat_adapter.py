@@ -6,6 +6,7 @@
 # version: 2.5 @20260921: 搜索结果重复时优先正式分类，不将“最常使用”副本当成重名会话;
 # version: 2.6 @20260921: 仅使用会话列表搜索框，排除群成员侧栏的同名搜索框;
 # version: 2.7 @20260923: 按消息签名缓存已补全日期，避免点图后控件重建重复回滚;
+# version: 2.8 @20260923: 连续页面无日期分隔条时沿用最近核验日期，减少大图逐张回滚;
 """微信聊天 UIA 适配器；控件不可见、身份不明确时停止，不用盲点兜底。"""
 from __future__ import annotations
 
@@ -137,6 +138,7 @@ class ChatContext:
     reached_start: bool = False
     dates: dict[tuple, date] = field(default_factory=dict)
     signature_dates: dict[str, date] = field(default_factory=dict)
+    scan_day: date | None = None
     expanded_dates: set[tuple] = field(default_factory=set)
     identities: dict[tuple, tuple] = field(default_factory=dict)
     resolve_dates: bool = False
@@ -354,15 +356,17 @@ class WechatChatAdapter:
         if context.resolve_dates:
             self._expand_dates(context, listing)
         viewport = rect_to_tuple(listing.BoundingRectangle)
+        children = listing.GetChildren()
         messages = []
-        rows = [row for row in listing.GetChildren() if row.ControlTypeName == "ListItemControl"]
+        rows = [row for row in children if row.ControlTypeName == "ListItemControl"]
         raw_ids = {tuple(row.GetRuntimeId()) for row in rows}
         alias_counts: dict[tuple, int] = {}
         for raw_identity in raw_ids:
             canonical = context.identities.get(raw_identity, raw_identity)
             alias_counts[canonical] = alias_counts.get(canonical, 0) + 1
-        inherited = None
-        for row in listing.GetChildren():
+        has_date_boundary = any(row.ClassName == "mmui::ChatItemView" for row in children)
+        inherited = None if has_date_boundary else context.scan_day
+        for row in children:
             nodes = walk(row)
             if row.ControlTypeName != "ListItemControl":
                 # 只读取明确独立的时间标签，不在任意分组正文里寻找日期。
@@ -493,8 +497,10 @@ class WechatChatAdapter:
         """补全日期；必要时向前寻找相邻时间行，再原路滚回并核验消息位置。"""
         target = message.control[0]
         if target in context.dates:
+            context.scan_day = context.dates[target]
             return context.dates[target]
         if message.signature in context.signature_dates:
+            context.scan_day = context.signature_dates[message.signature]
             return context.signature_dates[message.signature]
         self._expand_dates(context)
         original = self.read_page(context)
@@ -526,6 +532,7 @@ class WechatChatAdapter:
                     found = dates.pop()
                     context.dates.update({key: found for key in pending})
                     context.signature_dates.update({key: found for key in pending_signatures})
+                    context.scan_day = found
                     return found
                 unresolved = [m for m in current.messages if m.day is None]
                 pending.update(m.control[0] for m in unresolved)
