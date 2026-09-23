@@ -5,6 +5,7 @@
 # version: 2.4 @20260920: 日期探查按日期标签精确找回原页，单图预览失败继续扫描;
 # version: 2.5 @20260921: 搜索结果重复时优先正式分类，不将“最常使用”副本当成重名会话;
 # version: 2.6 @20260921: 仅使用会话列表搜索框，排除群成员侧栏的同名搜索框;
+# version: 2.7 @20260923: 按消息签名缓存已补全日期，避免点图后控件重建重复回滚;
 """微信聊天 UIA 适配器；控件不可见、身份不明确时停止，不用盲点兜底。"""
 from __future__ import annotations
 
@@ -135,6 +136,7 @@ class ChatContext:
     forwarded: bool = False
     reached_start: bool = False
     dates: dict[tuple, date] = field(default_factory=dict)
+    signature_dates: dict[str, date] = field(default_factory=dict)
     expanded_dates: set[tuple] = field(default_factory=set)
     identities: dict[tuple, tuple] = field(default_factory=dict)
     resolve_dates: bool = False
@@ -386,15 +388,16 @@ class WechatChatAdapter:
             if (identity != raw_identity and identity in raw_ids) or alias_counts[identity] > 1:
                 identity = raw_identity
                 context.identities.pop(raw_identity, None)
-            day = inherited or context.dates.get(identity)
-            if day is not None:
-                context.dates[identity] = day
             # 整条消息文本作为重叠锚点；下载状态按钮不进入锚点。
             content = row.Name or "\n".join(n.Name for n in nodes if n.ClassName.startswith("mmui::Chat"))
             visible_text = content
             if kind == "file":
                 content = "\n".join(content.splitlines()[:2])
             signature = hashlib.sha256((row.ClassName + "\n" + content).encode("utf-8")).hexdigest()
+            day = inherited or context.dates.get(identity) or context.signature_dates.get(signature)
+            if day is not None:
+                context.dates[identity] = day
+                context.signature_dates[signature] = day
             messages.append(ChatMessage(signature, kind, day, (identity, bubble), visible_text))
         at_start = context.reached_start
         pattern = listing.GetScrollPattern()
@@ -491,12 +494,16 @@ class WechatChatAdapter:
         target = message.control[0]
         if target in context.dates:
             return context.dates[target]
+        if message.signature in context.signature_dates:
+            return context.signature_dates[message.signature]
         self._expand_dates(context)
         original = self.read_page(context)
         if target in context.dates:
             return context.dates[target]
         # 只传播连续且尚无日期分隔的区间；每次滚动都核验相邻消息重叠。
-        pending = {m.control[0] for m in original.messages if m.day is None}
+        unresolved = [m for m in original.messages if m.day is None]
+        pending = {m.control[0] for m in unresolved}
+        pending_signatures = {m.signature for m in unresolved}
         original_layout = self._message_layout(context, original)
         previous = original
         steps, stationary = 0, 0
@@ -518,8 +525,11 @@ class WechatChatAdapter:
                 if dates:
                     found = dates.pop()
                     context.dates.update({key: found for key in pending})
+                    context.signature_dates.update({key: found for key in pending_signatures})
                     return found
-                pending.update(m.control[0] for m in current.messages if m.day is None)
+                unresolved = [m for m in current.messages if m.day is None]
+                pending.update(m.control[0] for m in unresolved)
+                pending_signatures.update(m.signature for m in unresolved)
                 current_position = self._page_position(context)
                 stationary = stationary + 1 if current_position == position else 0
                 if stationary >= 3:

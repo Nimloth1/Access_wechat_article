@@ -96,6 +96,21 @@ class WechatChatAdapterTests(unittest.TestCase):
         self.assertIsNone(page.messages[0].day)
         self.assertEqual(page.messages[1].day, date(2026, 9, 5))
 
+    def test_read_page_reuses_date_after_runtime_id_changes(self):
+        """点开附件导致控件重建时，稳定消息签名应避免再次探查日期。"""
+        first = Node('same image', identity=1)
+        listing = Node(kind='ListControl', children=(first,), rect=(0, 0, 400, 500))
+        adapter = self.adapter(listing)
+        context = ChatContext(None, 'A')
+        original = adapter.read_page(context).messages[0]
+        context.signature_dates[original.signature] = date(2026, 9, 5)
+
+        listing.children = (Node('same image', identity=2),)
+
+        rebuilt = adapter.read_page(context).messages[0]
+        self.assertEqual(rebuilt.day, date(2026, 9, 5))
+        self.assertEqual(context.dates[(2,)], date(2026, 9, 5))
+
     def test_date_scan_clicks_short_time_once_and_reads_expanded_label(self):
         """按日期扫描展开时间标签一次，使用控件文字而非正文或 OCR。"""
         header = Node('10:00', cls='mmui::ChatItemView')
