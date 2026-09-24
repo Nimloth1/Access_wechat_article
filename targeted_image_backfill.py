@@ -1,7 +1,8 @@
 # encoding: UTF-8
 # version: 1.0 @20260923: 按落盘缺口日期和微信消息 ID 定向补原图;
 # version: 1.1 @20260924: 适配聊天记录星期标签，支持按目标消息 ID 文件筛选;
-__version__ = 'v1.1'
+# version: 1.2 @20260924: 修复月份菜单定位，支持导出与界面会话名不同;
+__version__ = 'v1.2'
 __platform__ = 'nt'
 __pc__ = ['PW']
 __py__ = 'py3.11+'
@@ -32,6 +33,7 @@ def parse_args():
     """解析群名、日期范围和单次处理上限。"""
     parser = argparse.ArgumentParser(description='按落盘缺口定向补齐微信群原图')
     parser.add_argument('--chat', required=True, help='完整群名')
+    parser.add_argument('--export-chat', help='日导出中的会话名与微信界面显示不同时使用')
     parser.add_argument('--since', type=date.fromisoformat, default=date(2026, 1, 1))
     parser.add_argument('--max-items', type=int, default=0, help='本次最多核验的缺口数，0 表示不限')
     parser.add_argument('--retry-expired', action='store_true', help='重试微信已明确提示过期的图片')
@@ -217,7 +219,7 @@ def record_attempt(key, result):
         log.flush()
 
 
-def run_day(adapter, history, chat, session_id, day, targets, export_root, limit):
+def run_day(adapter, history, chat, session_id, day, targets, export_root, export_chat, limit):
     """只打开目标分钟的图片，用预览 ID 精确匹配待补消息。"""
     history = select_day(adapter, history, chat, session_id, day)
     target_minutes = {f'{datetime.fromtimestamp(item["timestamp"]).hour:02d}:'
@@ -267,9 +269,9 @@ def run_day(adapter, history, chat, session_id, day, targets, export_root, limit
                         adapter._click(context_for(preview, chat), unique(buttons, '查看原图按钮'))
                     for _ in range(10):
                         time.sleep(0.5)
-                        if current_state(export_root, chat, day, local_id, timestamp) == 'original':
+                        if current_state(export_root, export_chat, day, local_id, timestamp) == 'original':
                             break
-                state = current_state(export_root, chat, day, local_id, timestamp)
+                state = current_state(export_root, export_chat, day, local_id, timestamp)
                 record_attempt(targets[key]['key'], 'expired' if expired else state)
                 print(f'{day} {datetime.fromtimestamp(timestamp):%H:%M:%S} id={local_id}: '
                       f'{"微信已过期" if expired else state}', flush=True)
@@ -292,7 +294,8 @@ def main():
     args = parse_args()
     if args.max_items < 0:
         raise ValueError('--max-items 不能为负数')
-    session_id, items = load_inventory(args.export_root, args.chat, since=args.since)
+    export_chat = args.export_chat or args.chat
+    session_id, items = load_inventory(args.export_root, export_chat, since=args.since)
     if args.target_ids_file:
         target_ids = {line.strip() for line in args.target_ids_file.read_text(encoding='utf-8-sig').splitlines()
                       if line.strip()}
@@ -324,7 +327,8 @@ def main():
                     break
                 print(f'{day}: 缺口 {len(targets)} 张', flush=True)
                 handled += run_day(adapter, history, args.chat, session_id, day, targets,
-                                   args.export_root, args.max_items - handled if args.max_items else 0)
+                                   args.export_root, export_chat,
+                                   args.max_items - handled if args.max_items else 0)
                 if targets:
                     print(f'{day}: 尚未定位 {len(targets)} 张', flush=True)
             print(f'本次已核验 {handled} 张；重新运行会按当前落盘状态选缺口。', flush=True)
