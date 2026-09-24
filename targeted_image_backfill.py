@@ -141,10 +141,12 @@ def select_day(adapter, history, chat, session_id, day):
             (menu.control.WheelUp if rect[1] < viewport[1] else menu.control.WheelDown)(wheelTimes=1)
             time.sleep(0.1)
         else:
-            raise ChatAutomationError('目标月份未滚入菜单可见区域')
-        # 激活临时菜单窗口会使其关闭；直接校验当前可点击层级后点击。
-        adapter._check_point(menu_context, (rect[0] + rect[2]) // 2, (rect[1] + rect[3]) // 2)
-        option.Click(simulateMove=False)
+            # 菜单在部分会话中不响应滚轮，使用控件的语义调用并在下方核验月份。
+            option.GetInvokePattern().Invoke()
+        if rect[1] >= viewport[1] and rect[3] <= viewport[3]:
+            # 激活临时菜单窗口会使其关闭；直接校验当前可点击层级后点击。
+            adapter._check_point(menu_context, (rect[0] + rect[2]) // 2, (rect[1] + rect[3]) // 2)
+            option.Click(simulateMove=False)
         calendar = one_window('mmui::XPopover')
         context = context_for(calendar, chat)
         if not any(node.ControlTypeName == 'TextControl' and node.Name == f'{day.month}月'
