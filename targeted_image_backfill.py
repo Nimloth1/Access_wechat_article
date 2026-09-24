@@ -128,7 +128,7 @@ def select_day(adapter, history, chat, session_id, day):
                  attach_uia_control(window).control.ClassName == 'mmui::XMenu']
         menu = attach_uia_control(unique(menus, '月份菜单'))
         menu_context = context_for(menu, chat)
-        for _ in range(8):
+        for _ in range(20):
             option = unique([node for node in walk(menu.control) if node.ControlTypeName == 'MenuItemControl'
                              and node.Name == f'{day.month}月'], '目标月份')
             rect = rect_to_tuple(option.BoundingRectangle)
@@ -138,7 +138,7 @@ def select_day(adapter, history, chat, session_id, day):
                 break
             adapter._check_point(menu_context, (viewport[0] + viewport[2]) // 2,
                                  (viewport[1] + viewport[3]) // 2)
-            (menu.control.WheelUp if rect[1] < viewport[1] else menu.control.WheelDown)(wheelTimes=2)
+            (menu.control.WheelUp if rect[1] < viewport[1] else menu.control.WheelDown)(wheelTimes=1)
             time.sleep(0.1)
         else:
             raise ChatAutomationError('目标月份未滚入菜单可见区域')
