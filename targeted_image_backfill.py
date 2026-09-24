@@ -134,16 +134,17 @@ def select_day(adapter, history, chat, session_id, day):
             rect = rect_to_tuple(option.BoundingRectangle)
             bounds = rect_to_tuple(menu.control.BoundingRectangle)
             viewport = (bounds[0], bounds[1] + 30, bounds[2], bounds[3] - 30)
-            if rect[1] >= viewport[1] and rect[3] <= viewport[3]:
+            center_y = (rect[1] + rect[3]) // 2
+            if viewport[1] + 8 <= center_y <= viewport[3] - 8:
                 break
             adapter._check_point(menu_context, (viewport[0] + viewport[2]) // 2,
                                  (viewport[1] + viewport[3]) // 2)
-            (menu.control.WheelUp if rect[1] < viewport[1] else menu.control.WheelDown)(wheelTimes=1)
+            (menu.control.WheelUp if center_y < viewport[1] + 8 else menu.control.WheelDown)(wheelTimes=1)
             time.sleep(0.1)
         else:
             # 菜单在部分会话中不响应滚轮，使用控件的语义调用并在下方核验月份。
             option.GetInvokePattern().Invoke()
-        if rect[1] >= viewport[1] and rect[3] <= viewport[3]:
+        if viewport[1] + 8 <= center_y <= viewport[3] - 8:
             # 激活临时菜单窗口会使其关闭；直接校验当前可点击层级后点击。
             adapter._check_point(menu_context, (rect[0] + rect[2]) // 2, (rect[1] + rect[3]) // 2)
             option.Click(simulateMove=False)
