@@ -5,7 +5,13 @@ from datetime import date
 import json
 from unittest.mock import patch
 
-from targeted_image_backfill import calendar_day_point, expired_attempts, record_attempt
+from targeted_image_backfill import IMAGE_ROW, calendar_day_point, expired_attempts, record_attempt
+
+
+def test_image_row_time_accepts_wechat_weekday_label():
+    """日期筛选后微信用星期标签显示图片时间，仍能定位目标分钟。"""
+    assert IMAGE_ROW.fullmatch('图片 星期五 09:00').group(1) == '09:00'
+    assert IMAGE_ROW.fullmatch('图片 9月18日 09:00').group(1) == '09:00'
 
 
 def test_calendar_day_point_matches_observed_august_and_september_cells():

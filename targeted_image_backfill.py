@@ -1,6 +1,7 @@
 # encoding: UTF-8
 # version: 1.0 @20260923: 按落盘缺口日期和微信消息 ID 定向补原图;
-__version__ = 'v1.0'
+# version: 1.1 @20260924: 适配聊天记录星期标签，支持按目标消息 ID 文件筛选;
+__version__ = 'v1.1'
 __platform__ = 'nt'
 __pc__ = ['PW']
 __py__ = 'py3.11+'
@@ -23,6 +24,7 @@ from src.services.wechat_attachment_inventory import load_inventory
 
 
 PREVIEW_ID = re.compile(r'^PreviewWindow_(.+)_(\d+)_(\d+)_\d+_\d+$')
+IMAGE_ROW = re.compile(r'^图片 .+ (\d{2}:\d{2})$')
 ATTEMPT_LOG = LOG_DIR / 'targeted_image_attempts.jsonl'
 
 
@@ -33,6 +35,7 @@ def parse_args():
     parser.add_argument('--since', type=date.fromisoformat, default=date(2026, 1, 1))
     parser.add_argument('--max-items', type=int, default=0, help='本次最多核验的缺口数，0 表示不限')
     parser.add_argument('--retry-expired', action='store_true', help='重试微信已明确提示过期的图片')
+    parser.add_argument('--target-ids-file', type=Path, help='每行一个完整消息 ID，如 群ID:消息ID')
     parser.add_argument('--export-root', type=Path, default=DEFAULT_EXPORT_ROOT)
     return parser.parse_args()
 
@@ -219,7 +222,7 @@ def run_day(adapter, history, chat, session_id, day, targets, export_root, limit
         for row in rows:
             if not targets or (limit and handled >= limit):
                 break
-            match = re.fullmatch(rf'图片 {day.month}月{day.day}日 (\d{{2}}:\d{{2}})', row.Name)
+            match = IMAGE_ROW.fullmatch(row.Name)
             if not match or match.group(1) not in target_minutes:
                 continue
             marker = (row.Name, tuple(row.GetRuntimeId()), rect_to_tuple(row.BoundingRectangle))
@@ -270,6 +273,12 @@ def main():
     if args.max_items < 0:
         raise ValueError('--max-items 不能为负数')
     session_id, items = load_inventory(args.export_root, args.chat, since=args.since)
+    if args.target_ids_file:
+        target_ids = {line.strip() for line in args.target_ids_file.read_text(encoding='utf-8-sig').splitlines()
+                      if line.strip()}
+        if not target_ids:
+            raise ValueError('目标消息 ID 文件为空')
+        items = [item for item in items if f'{item["session_id"]}:{item["message_id"]}' in target_ids]
     pending = {(item['timestamp'], item['local_id']): item for item in items
                if item['kind'] == 'image' and item['state'] != 'original'}
     if not args.retry_expired:
