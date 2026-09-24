@@ -128,11 +128,28 @@ def select_day(adapter, history, chat, session_id, day):
                  attach_uia_control(window).control.ClassName == 'mmui::XMenu']
         menu = attach_uia_control(unique(menus, '月份菜单'))
         menu_context = context_for(menu, chat)
-        option = unique([node for node in walk(menu.control) if node.ControlTypeName == 'MenuItemControl'
-                         and node.Name == f'{day.month}月'], '目标月份')
-        adapter._click(menu_context, option)
+        for _ in range(8):
+            option = unique([node for node in walk(menu.control) if node.ControlTypeName == 'MenuItemControl'
+                             and node.Name == f'{day.month}月'], '目标月份')
+            rect = rect_to_tuple(option.BoundingRectangle)
+            bounds = rect_to_tuple(menu.control.BoundingRectangle)
+            viewport = (bounds[0], bounds[1] + 30, bounds[2], bounds[3] - 30)
+            if rect[1] >= viewport[1] and rect[3] <= viewport[3]:
+                break
+            adapter._check_point(menu_context, (viewport[0] + viewport[2]) // 2,
+                                 (viewport[1] + viewport[3]) // 2)
+            (menu.control.WheelUp if rect[1] < viewport[1] else menu.control.WheelDown)(wheelTimes=2)
+            time.sleep(0.1)
+        else:
+            raise ChatAutomationError('目标月份未滚入菜单可见区域')
+        # 激活临时菜单窗口会使其关闭；直接校验当前可点击层级后点击。
+        adapter._check_point(menu_context, (rect[0] + rect[2]) // 2, (rect[1] + rect[3]) // 2)
+        option.Click(simulateMove=False)
         calendar = one_window('mmui::XPopover')
         context = context_for(calendar, chat)
+        if not any(node.ControlTypeName == 'TextControl' and node.Name == f'{day.month}月'
+                   for node in walk(calendar.control)):
+            raise ChatAutomationError(f'月份菜单未切换到 {day.month}月')
     panel = unique([node for node in walk(calendar.control) if node.ClassName == 'mmui::DateNumPanel'],
                    '日历日期面板')
     x, y = calendar_day_point(day, rect_to_tuple(panel.BoundingRectangle))
