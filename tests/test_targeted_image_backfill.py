@@ -3,9 +3,16 @@
 
 from datetime import date
 import json
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
-from targeted_image_backfill import IMAGE_ROW, calendar_day_point, expired_attempts, record_attempt
+from targeted_image_backfill import (
+    IMAGE_ROW,
+    calendar_day_point,
+    close_history,
+    expired_attempts,
+    record_attempt,
+)
 
 
 def test_image_row_time_accepts_wechat_weekday_label():
@@ -29,3 +36,19 @@ def test_expired_attempts_only_skips_confirmed_expiry(tmp_path):
         assert expired_attempts() == {'chat:2:101'}
         entries = [json.loads(line) for line in journal.read_text(encoding='utf-8').splitlines()]
         assert [entry['result'] for entry in entries] == ['thumbnail', 'expired']
+
+
+def test_close_history_clicks_only_the_history_close_button():
+    """补图收尾关闭聊天记录窗口，不操作微信主窗口。"""
+    close_button = SimpleNamespace(ControlTypeName='ButtonControl', Name='关闭')
+    other_button = SimpleNamespace(ControlTypeName='ButtonControl', Name='最小化')
+    window = SimpleNamespace(control=object())
+    adapter = Mock()
+
+    with patch('targeted_image_backfill.one_window', return_value=window) as one_window_mock, \
+            patch('targeted_image_backfill.walk', return_value=[other_button, close_button]), \
+            patch('targeted_image_backfill.context_for', return_value='history-context'):
+        close_history(adapter, '测试群', 'chat-id')
+
+    one_window_mock.assert_called_once_with('mmui::SearchMsgUniqueChatWindow', session_id='chat-id')
+    adapter._click.assert_called_once_with('history-context', close_button)

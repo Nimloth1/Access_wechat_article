@@ -2,7 +2,8 @@
 # version: 1.0 @20260923: 按落盘缺口日期和微信消息 ID 定向补原图;
 # version: 1.1 @20260924: 适配聊天记录星期标签，支持按目标消息 ID 文件筛选;
 # version: 1.2 @20260924: 修复月份菜单定位，支持导出与界面会话名不同;
-__version__ = 'v1.2'
+# version: 1.3 @20260926: 任务结束或异常时关闭聊天记录窗口;
+__version__ = 'v1.3'
 __platform__ = 'nt'
 __pc__ = ['PW']
 __py__ = 'py3.11+'
@@ -74,6 +75,20 @@ def close_preview(adapter, chat, session_id):
     context = context_for(window, chat)
     button = unique([node for node in walk(window.control) if node.ControlTypeName == 'ButtonControl'
                      and node.Name == '关闭'], '图片预览关闭按钮')
+    adapter._click(context, button)
+
+
+def close_history(adapter, chat, session_id):
+    """关闭本次补图使用的聊天记录窗口。"""
+    try:
+        window = one_window('mmui::SearchMsgUniqueChatWindow', session_id=session_id)
+    except ChatAutomationError as exc:
+        if '实际找到 0 个' in str(exc):
+            return
+        raise
+    context = context_for(window, chat)
+    button = unique([node for node in walk(window.control) if node.ControlTypeName == 'ButtonControl'
+                     and node.Name == '关闭'], '聊天记录关闭按钮')
     adapter._click(context, button)
 
 
@@ -320,18 +335,24 @@ def main():
         with adapter.compatibility(True):
             close_preview(adapter, args.chat, session_id)
             main_chat = adapter.open_chat(args.chat)
-            history = history_window(adapter, main_chat, args.chat, session_id)
-            handled = 0
-            for day, targets in sorted(by_day.items()):
-                if args.max_items and handled >= args.max_items:
-                    break
-                print(f'{day}: 缺口 {len(targets)} 张', flush=True)
-                handled += run_day(adapter, history, args.chat, session_id, day, targets,
-                                   args.export_root, export_chat,
-                                   args.max_items - handled if args.max_items else 0)
-                if targets:
-                    print(f'{day}: 尚未定位 {len(targets)} 张', flush=True)
-            print(f'本次已核验 {handled} 张；重新运行会按当前落盘状态选缺口。', flush=True)
+            try:
+                history = history_window(adapter, main_chat, args.chat, session_id)
+                handled = 0
+                for day, targets in sorted(by_day.items()):
+                    if args.max_items and handled >= args.max_items:
+                        break
+                    print(f'{day}: 缺口 {len(targets)} 张', flush=True)
+                    handled += run_day(adapter, history, args.chat, session_id, day, targets,
+                                       args.export_root, export_chat,
+                                       args.max_items - handled if args.max_items else 0)
+                    if targets:
+                        print(f'{day}: 尚未定位 {len(targets)} 张', flush=True)
+                print(f'本次已核验 {handled} 张；重新运行会按当前落盘状态选缺口。', flush=True)
+            finally:
+                try:
+                    close_preview(adapter, args.chat, session_id)
+                finally:
+                    close_history(adapter, args.chat, session_id)
 
 
 if __name__ == '__main__':
