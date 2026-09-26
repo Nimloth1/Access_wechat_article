@@ -13,6 +13,7 @@ from targeted_image_backfill import (
     expired_attempts,
     history_window,
     record_attempt,
+    validated_window_click,
 )
 from src.services.chat_attachment_service import ChatAutomationError
 
@@ -40,6 +41,30 @@ def test_expired_attempts_only_skips_confirmed_expiry(tmp_path):
         assert [entry['result'] for entry in entries] == ['thumbnail', 'expired']
 
 
+def test_validated_window_click_checks_owner_then_posts_client_click():
+    """窗口消息点击前仍执行前台和坐标归属校验。"""
+    control = SimpleNamespace(BoundingRectangle=(110, 220, 130, 240))
+    context = SimpleNamespace(window=SimpleNamespace(handle=1234))
+    adapter = Mock()
+    user32 = Mock()
+    user32.ScreenToClient.side_effect = lambda handle, point: (
+        setattr(point._obj, 'x', point._obj.x - 100) or
+        setattr(point._obj, 'y', point._obj.y - 200) or True)
+    user32.PostMessageW.return_value = True
+
+    with patch('targeted_image_backfill._user32', return_value=user32), \
+            patch('targeted_image_backfill.time.sleep') as sleep_mock:
+        validated_window_click(adapter, context, control)
+
+    adapter._activate.assert_called_once_with(context)
+    adapter._check_point.assert_called_once_with(context, 120, 230)
+    assert user32.PostMessageW.call_args_list == [
+        ((1234, 0x0201, 0x0001, (30 << 16) | 20),),
+        ((1234, 0x0202, 0, (30 << 16) | 20),),
+    ]
+    sleep_mock.assert_called_once_with(0.08)
+
+
 def test_close_history_clicks_only_the_history_close_button():
     """补图收尾关闭聊天记录窗口，不操作微信主窗口。"""
     close_button = SimpleNamespace(ControlTypeName='ButtonControl', Name='关闭')
@@ -49,11 +74,12 @@ def test_close_history_clicks_only_the_history_close_button():
 
     with patch('targeted_image_backfill.one_window', return_value=window) as one_window_mock, \
             patch('targeted_image_backfill.walk', return_value=[other_button, close_button]), \
-            patch('targeted_image_backfill.context_for', return_value='history-context'):
+            patch('targeted_image_backfill.context_for', return_value='history-context'), \
+            patch('targeted_image_backfill.validated_window_click') as click_mock:
         close_history(adapter, '测试群', 'chat-id')
 
     one_window_mock.assert_called_once_with('mmui::SearchMsgUniqueChatWindow', session_id='chat-id')
-    adapter._click.assert_called_once_with('history-context', close_button)
+    click_mock.assert_called_once_with(adapter, 'history-context', close_button)
 
 
 def test_history_window_polls_until_delayed_window_appears():
@@ -66,10 +92,11 @@ def test_history_window_polls_until_delayed_window_appears():
 
     with patch('targeted_image_backfill.one_window', side_effect=[missing, missing, history]) as one_window_mock, \
             patch('targeted_image_backfill.walk', return_value=[history_button]), \
+            patch('targeted_image_backfill.validated_window_click') as click_mock, \
             patch('targeted_image_backfill.time.sleep') as sleep_mock:
         result = history_window(adapter, main, '测试群', 'chat-id')
 
     assert result is history
     assert one_window_mock.call_count == 3
-    adapter._click.assert_called_once_with(main, history_button)
+    click_mock.assert_called_once_with(adapter, main, history_button)
     sleep_mock.assert_called_once_with(0.2)

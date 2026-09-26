@@ -3,7 +3,8 @@
 # version: 1.1 @20260924: 适配聊天记录星期标签，支持按目标消息 ID 文件筛选;
 # version: 1.2 @20260924: 修复月份菜单定位，支持导出与界面会话名不同;
 # version: 1.3 @20260926: 任务结束或异常时关闭聊天记录窗口;
-__version__ = 'v1.3'
+# version: 1.4 @20260926: 微信 Qt 按钮不响应 UIA Click 时改用校验后的窗口消息点击;
+__version__ = 'v1.4'
 __platform__ = 'nt'
 __pc__ = ['PW']
 __py__ = 'py3.11+'
@@ -12,6 +13,8 @@ __py__ = 'py3.11+'
 
 import argparse
 from collections import defaultdict
+import ctypes
+from ctypes import wintypes
 from datetime import date, datetime
 import json
 import re
@@ -28,6 +31,29 @@ from src.services.wechat_attachment_inventory import load_inventory
 PREVIEW_ID = re.compile(r'^PreviewWindow_(.+)_(\d+)_(\d+)_\d+_\d+$')
 IMAGE_ROW = re.compile(r'^图片 .+ (\d{2}:\d{2})$')
 ATTEMPT_LOG = LOG_DIR / 'targeted_image_attempts.jsonl'
+
+
+def _user32():
+    """延迟获取 user32，便于在非 Windows 环境导入并测试纯逻辑。"""
+    return ctypes.windll.user32
+
+
+def validated_window_click(adapter, context, control):
+    """校验屏幕坐标归属后，向已核验窗口发送一次 Qt 可识别的鼠标点击。"""
+    left, top, right, bottom = rect_to_tuple(control.BoundingRectangle)
+    x, y = (left + right) // 2, (top + bottom) // 2
+    adapter._activate(context)
+    adapter._check_point(context, x, y)
+    point = wintypes.POINT(x, y)
+    user32 = _user32()
+    if not user32.ScreenToClient(context.window.handle, ctypes.byref(point)):
+        raise ChatAutomationError('无法把按钮坐标转换为微信窗口坐标')
+    lparam = ((point.y & 0xffff) << 16) | (point.x & 0xffff)
+    if not user32.PostMessageW(context.window.handle, 0x0201, 0x0001, lparam):
+        raise ChatAutomationError('无法向微信窗口发送鼠标按下消息')
+    time.sleep(0.08)
+    if not user32.PostMessageW(context.window.handle, 0x0202, 0, lparam):
+        raise ChatAutomationError('无法向微信窗口发送鼠标释放消息')
 
 
 def parse_args():
@@ -89,7 +115,7 @@ def close_history(adapter, chat, session_id):
     context = context_for(window, chat)
     button = unique([node for node in walk(window.control) if node.ControlTypeName == 'ButtonControl'
                      and node.Name == '关闭'], '聊天记录关闭按钮')
-    adapter._click(context, button)
+    validated_window_click(adapter, context, button)
 
 
 def history_window(adapter, main, chat, session_id):
@@ -101,7 +127,7 @@ def history_window(adapter, main, chat, session_id):
             raise
     button = unique([node for node in walk(main.window.control)
                      if node.ControlTypeName == 'ButtonControl' and node.Name == '聊天记录'], '聊天记录按钮')
-    adapter._click(main, button)
+    validated_window_click(adapter, main, button)
     deadline = time.monotonic() + 5
     while True:
         try:
