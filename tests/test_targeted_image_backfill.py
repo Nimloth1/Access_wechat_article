@@ -11,8 +11,10 @@ from targeted_image_backfill import (
     calendar_day_point,
     close_history,
     expired_attempts,
+    history_window,
     record_attempt,
 )
+from src.services.chat_attachment_service import ChatAutomationError
 
 
 def test_image_row_time_accepts_wechat_weekday_label():
@@ -52,3 +54,22 @@ def test_close_history_clicks_only_the_history_close_button():
 
     one_window_mock.assert_called_once_with('mmui::SearchMsgUniqueChatWindow', session_id='chat-id')
     adapter._click.assert_called_once_with('history-context', close_button)
+
+
+def test_history_window_polls_until_delayed_window_appears():
+    """聊天记录窗口创建较慢时轮询等待，不重复点击入口。"""
+    history_button = SimpleNamespace(ControlTypeName='ButtonControl', Name='聊天记录')
+    main = SimpleNamespace(window=SimpleNamespace(control=object()))
+    history = SimpleNamespace(control=object())
+    adapter = Mock()
+    missing = ChatAutomationError('mmui::SearchMsgUniqueChatWindow需要唯一匹配，实际找到 0 个')
+
+    with patch('targeted_image_backfill.one_window', side_effect=[missing, missing, history]) as one_window_mock, \
+            patch('targeted_image_backfill.walk', return_value=[history_button]), \
+            patch('targeted_image_backfill.time.sleep') as sleep_mock:
+        result = history_window(adapter, main, '测试群', 'chat-id')
+
+    assert result is history
+    assert one_window_mock.call_count == 3
+    adapter._click.assert_called_once_with(main, history_button)
+    sleep_mock.assert_called_once_with(0.2)

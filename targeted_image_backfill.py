@@ -102,8 +102,14 @@ def history_window(adapter, main, chat, session_id):
     button = unique([node for node in walk(main.window.control)
                      if node.ControlTypeName == 'ButtonControl' and node.Name == '聊天记录'], '聊天记录按钮')
     adapter._click(main, button)
-    time.sleep(0.3)
-    return one_window('mmui::SearchMsgUniqueChatWindow', session_id=session_id)
+    deadline = time.monotonic() + 5
+    while True:
+        try:
+            return one_window('mmui::SearchMsgUniqueChatWindow', session_id=session_id)
+        except ChatAutomationError as exc:
+            if '实际找到 0 个' not in str(exc) or time.monotonic() >= deadline:
+                raise
+        time.sleep(0.2)
 
 
 def calendar_day_point(day, panel_bounds):
