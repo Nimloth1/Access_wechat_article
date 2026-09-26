@@ -897,6 +897,7 @@ class WechatChatAdapterTests(unittest.TestCase):
         adapter._activate = Mock()
         adapter._focus_within = lambda control: True
         adapter._click = Mock()
+        adapter._post_click = Mock()
         adapter._pause = Mock()
         adapter.cancelled = lambda: False
         adapter._window = Mock(side_effect=[
@@ -907,17 +908,19 @@ class WechatChatAdapterTests(unittest.TestCase):
         self.assertEqual(context.name, '180k拼团')
         self.assertEqual(adapter._window.call_count, 2)
         value.SetValue.assert_called_once_with('180k拼团')
-        adapter._click.assert_called_once_with(context, result, keep_parent_active=True)
+        adapter._post_click.assert_called_once_with(context, result, keep_parent_active=True)
         for recovered in (True, False):
             with self.subTest(focus_recovered=recovered):
                 adapter._click.reset_mock()
+                adapter._post_click.reset_mock()
                 value.SetValue.reset_mock()
                 adapter._focus_within = Mock(side_effect=[False, recovered])
                 adapter._window = Mock(return_value=SimpleNamespace(control=Node(children=(target,))))
                 if recovered:
                     adapter.open_chat('180k拼团')
                     value.SetValue.assert_called_once_with('180k拼团')
-                    self.assertEqual(adapter._click.call_count, 2)
+                    self.assertEqual(adapter._click.call_count, 1)
+                    adapter._post_click.assert_called_once()
                 else:
                     with self.assertRaisesRegex(ChatAutomationError, '焦点'):
                         adapter.open_chat('180k拼团')
@@ -948,6 +951,7 @@ class WechatChatAdapterTests(unittest.TestCase):
         adapter._activate = Mock()
         adapter._focus_within = lambda control: True
         adapter._click = Mock()
+        adapter._post_click = Mock()
         adapter._pause = Mock()
         adapter.cancelled = lambda: False
         adapter._window = Mock(return_value=SimpleNamespace(control=Node(children=(target,))))
@@ -956,7 +960,7 @@ class WechatChatAdapterTests(unittest.TestCase):
 
         self.assertEqual(context.name, '180k拼团')
         value.SetValue.assert_called_once_with('180k拼团')
-        adapter._click.assert_called_once_with(context, result, keep_parent_active=True)
+        adapter._post_click.assert_called_once_with(context, result, keep_parent_active=True)
 
     def test_current_non_chat_page_still_stops_without_target_name(self):
         """未指定目标时，公众号页不能被误当作可采集聊天页。"""
@@ -994,6 +998,34 @@ class WechatChatAdapterTests(unittest.TestCase):
                 adapter._click(parent, control, keep_parent_active=True)
         adapter._activate.assert_not_called()
         control.Click.assert_not_called()
+
+    def test_post_click_targets_validated_search_popup_window(self):
+        """无物理鼠标时把会话搜索结果点击投递给已核验的搜索弹层。"""
+        adapter = self.adapter(None)
+        parent = ChatContext(SimpleNamespace(handle=10, control=SimpleNamespace(ProcessId=1)), '群')
+        popup = SimpleNamespace(handle=20, control=SimpleNamespace(ProcessId=1))
+        control = Node()
+        control.GetTopLevelControl = lambda: SimpleNamespace(NativeWindowHandle=20)
+        adapter.cancelled = lambda: False
+        adapter._nodes = Mock()
+        adapter._window = lambda window: window
+        adapter._activate = Mock()
+        adapter._check_point = Mock()
+        adapter._pause = Mock()
+        user32 = SimpleNamespace(
+            GetWindow=Mock(return_value=10),
+            ScreenToClient=Mock(return_value=True),
+            PostMessageW=Mock(return_value=True),
+        )
+
+        with patch('ctypes.windll', SimpleNamespace(user32=user32), create=True), patch(
+                'src.modules.window.wechat_chat_adapter.enumerate_desktop_windows', return_value=[popup]):
+            adapter._post_click(parent, control, keep_parent_active=True)
+
+        adapter._activate.assert_called_once_with(parent)
+        self.assertEqual(adapter._check_point.call_args.args[0].window.handle, 20)
+        self.assertEqual(user32.PostMessageW.call_count, 2)
+        self.assertEqual([call.args[1] for call in user32.PostMessageW.call_args_list], [0x0201, 0x0202])
 
     def test_local_search_categories(self):
         """排除网络和记录，保留本地重名歧义及公众号入口，不猜无分类结果。"""

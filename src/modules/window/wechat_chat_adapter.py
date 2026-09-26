@@ -9,10 +9,12 @@
 # version: 2.8 @20260923: 连续页面无日期分隔条时沿用最近核验日期，减少大图逐张回滚;
 # version: 2.9 @20260923: 从公众号等非聊天页可通过左侧会话搜索切换到指定对话;
 # version: 3.0 @20260923: 排除微信日期弹窗，前台切换瞬断时有限重试;
+# version: 3.1 @20260926: 会话搜索结果支持无物理远控鼠标的窗口消息点击;
 """微信聊天 UIA 适配器；控件不可见、身份不明确时停止，不用盲点兜底。"""
 from __future__ import annotations
 
 import ctypes
+from ctypes import wintypes
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date, timedelta
@@ -260,9 +262,9 @@ class WechatChatAdapter:
         return unique([n for n in nodes if n.ControlTypeName == "ListControl" and
                        n.Name in MESSAGE_LIST_NAMES], "消息列表")
 
-    def _click(self, context: ChatContext, control: Any, *, cleanup: bool = False,
-               keep_parent_active: bool = False) -> None:
-        """核验窗口归属后点击；任务取消时仅允许关闭本任务的接收窗口。"""
+    def _click_target(self, context: ChatContext, control: Any, *, cleanup: bool = False,
+                      keep_parent_active: bool = False) -> tuple[ChatContext, int, int]:
+        """核验控件窗口归属和坐标，返回实际接收点击的窗口。"""
         if self.cancelled() and not cleanup:
             raise ChatAutomationError("已取消")
         self._nodes(context)
@@ -288,7 +290,29 @@ class WechatChatAdapter:
         rect = rect_to_tuple(control.BoundingRectangle)
         x, y = (rect[0] + rect[2]) // 2, (rect[1] + rect[3]) // 2
         self._check_point(target_context, x, y)
+        return target_context, x, y
+
+    def _click(self, context: ChatContext, control: Any, *, cleanup: bool = False,
+               keep_parent_active: bool = False) -> None:
+        """核验窗口归属后点击；任务取消时仅允许关闭本任务的接收窗口。"""
+        self._click_target(context, control, cleanup=cleanup, keep_parent_active=keep_parent_active)
         control.Click(simulateMove=False)
+
+    def _post_click(self, context: ChatContext, control: Any, *, cleanup: bool = False,
+                    keep_parent_active: bool = False) -> None:
+        """核验后投递窗口消息点击，供远控已退出而 UIA Click 不生效时使用。"""
+        target, x, y = self._click_target(
+            context, control, cleanup=cleanup, keep_parent_active=keep_parent_active)
+        point = wintypes.POINT(x, y)
+        user32 = ctypes.windll.user32
+        if not user32.ScreenToClient(target.window.handle, ctypes.byref(point)):
+            raise ChatAutomationError('无法把操作坐标转换为微信窗口坐标')
+        lparam = ((point.y & 0xffff) << 16) | (point.x & 0xffff)
+        if not user32.PostMessageW(target.window.handle, 0x0201, 0x0001, lparam):
+            raise ChatAutomationError('无法向微信窗口发送鼠标按下消息')
+        self._pause(0.05)
+        if not user32.PostMessageW(target.window.handle, 0x0202, 0, lparam):
+            raise ChatAutomationError('无法向微信窗口发送鼠标释放消息')
 
     def _check_point(self, context: ChatContext, x: int, y: int) -> None:
         """核验附件坐标归属；遮挡错误纳入任务摘要，并记录前台应用以便诊断。"""
@@ -342,7 +366,7 @@ class WechatChatAdapter:
         nodes = self._nodes(context)
         results = unique([n for n in nodes if n.AutomationId == "search_list"], "对话搜索结果")
         matches = local_chat_matches(results.GetChildren(), name)
-        self._click(context, unique(matches, f"对话“{name}”"), keep_parent_active=True)
+        self._post_click(context, unique(matches, f"对话“{name}”"), keep_parent_active=True)
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline and not self.cancelled():
             context.window = self._window(context.window)
