@@ -4,7 +4,8 @@
 # version: 1.2 @20260924: 修复月份菜单定位，支持导出与界面会话名不同;
 # version: 1.3 @20260926: 任务结束或异常时关闭聊天记录窗口;
 # version: 1.4 @20260926: 微信 Qt 按钮不响应 UIA Click 时改用校验后的窗口消息点击;
-__version__ = 'v1.4'
+# version: 1.5 @20260926: 日期筛选及图片预览操作也使用校验后的窗口消息;
+__version__ = 'v1.5'
 __platform__ = 'nt'
 __pc__ = ['PW']
 __py__ = 'py3.11+'
@@ -38,10 +39,8 @@ def _user32():
     return ctypes.windll.user32
 
 
-def validated_window_click(adapter, context, control):
-    """校验屏幕坐标归属后，向已核验窗口发送一次 Qt 可识别的鼠标点击。"""
-    left, top, right, bottom = rect_to_tuple(control.BoundingRectangle)
-    x, y = (left + right) // 2, (top + bottom) // 2
+def validated_window_point_click(adapter, context, x, y, *, clicks=1):
+    """校验屏幕坐标归属后，向已核验窗口发送 Qt 可识别的鼠标点击。"""
     adapter._activate(context)
     adapter._check_point(context, x, y)
     point = wintypes.POINT(x, y)
@@ -49,11 +48,19 @@ def validated_window_click(adapter, context, control):
     if not user32.ScreenToClient(context.window.handle, ctypes.byref(point)):
         raise ChatAutomationError('无法把按钮坐标转换为微信窗口坐标')
     lparam = ((point.y & 0xffff) << 16) | (point.x & 0xffff)
-    if not user32.PostMessageW(context.window.handle, 0x0201, 0x0001, lparam):
-        raise ChatAutomationError('无法向微信窗口发送鼠标按下消息')
-    time.sleep(0.08)
-    if not user32.PostMessageW(context.window.handle, 0x0202, 0, lparam):
-        raise ChatAutomationError('无法向微信窗口发送鼠标释放消息')
+    for _ in range(clicks):
+        if not user32.PostMessageW(context.window.handle, 0x0201, 0x0001, lparam):
+            raise ChatAutomationError('无法向微信窗口发送鼠标按下消息')
+        time.sleep(0.05)
+        if not user32.PostMessageW(context.window.handle, 0x0202, 0, lparam):
+            raise ChatAutomationError('无法向微信窗口发送鼠标释放消息')
+        time.sleep(0.05)
+
+
+def validated_window_click(adapter, context, control):
+    """点击已核验窗口中的控件中心。"""
+    left, top, right, bottom = rect_to_tuple(control.BoundingRectangle)
+    validated_window_point_click(adapter, context, (left + right) // 2, (top + bottom) // 2)
 
 
 def parse_args():
@@ -101,7 +108,7 @@ def close_preview(adapter, chat, session_id):
     context = context_for(window, chat)
     button = unique([node for node in walk(window.control) if node.ControlTypeName == 'ButtonControl'
                      and node.Name == '关闭'], '图片预览关闭按钮')
-    adapter._click(context, button)
+    validated_window_click(adapter, context, button)
 
 
 def close_history(adapter, chat, session_id):
@@ -154,7 +161,7 @@ def select_day(adapter, history, chat, session_id, day):
     for _ in range(3):
         tab = unique([node for node in walk(history.control) if node.ControlTypeName == 'TabItemControl'
                       and node.Name == '日期'], '日期标签')
-        adapter._click(context, tab)
+        validated_window_click(adapter, context, tab)
         try:
             calendar = one_window('mmui::XPopover')
         except ChatAutomationError as exc:
@@ -171,7 +178,7 @@ def select_day(adapter, history, chat, session_id, day):
                   and re.fullmatch(r'\d+月', node.Name)), None)
     if month != f'{day.month}月':
         combos = [node for node in nodes if node.ControlTypeName == 'ComboBoxControl']
-        adapter._click(context, unique(combos[1:2], '月份下拉框'))
+        validated_window_click(adapter, context, unique(combos[1:2], '月份下拉框'))
         menus = [window for window in enumerate_desktop_windows()
                  if window.process_name.lower() == 'weixin.exe' and window.visible and
                  attach_uia_control(window).control.ClassName == 'mmui::XMenu']
@@ -196,7 +203,7 @@ def select_day(adapter, history, chat, session_id, day):
         if viewport[1] + 8 <= center_y <= viewport[3] - 8:
             # 激活临时菜单窗口会使其关闭；直接校验当前可点击层级后点击。
             adapter._check_point(menu_context, (rect[0] + rect[2]) // 2, (rect[1] + rect[3]) // 2)
-            option.Click(simulateMove=False)
+            validated_window_click(adapter, menu_context, option)
         calendar = one_window('mmui::XPopover')
         context = context_for(calendar, chat)
         if not any(node.ControlTypeName == 'TextControl' and node.Name == f'{day.month}月'
@@ -205,9 +212,7 @@ def select_day(adapter, history, chat, session_id, day):
     panel = unique([node for node in walk(calendar.control) if node.ClassName == 'mmui::DateNumPanel'],
                    '日历日期面板')
     x, y = calendar_day_point(day, rect_to_tuple(panel.BoundingRectangle))
-    adapter._activate(context)
-    adapter._check_point(context, x, y)
-    adapter.auto.Click(x, y)
+    validated_window_point_click(adapter, context, x, y)
     time.sleep(0.2)
     history = one_window('mmui::SearchMsgUniqueChatWindow', session_id=session_id)
     heading = f'{day.year}年{day.month}月{day.day}日'
@@ -230,9 +235,7 @@ def preview_image(adapter, history, chat, row, session_id):
         return None
     x = bounds[0] + round(250 * (view[2] - view[0]) / 1966)
     y = top + min(round(180 * (view[2] - view[0]) / 1966), (bottom - top) // 2)
-    adapter._activate(context)
-    adapter._check_point(context, x, y)
-    row.DoubleClick(x=x - bounds[0], y=y - bounds[1], simulateMove=False, waitTime=0.2)
+    validated_window_point_click(adapter, context, x, y, clicks=2)
     time.sleep(0.2)
     preview = one_window('mmui::PreviewWindow', session_id=session_id)
     match = PREVIEW_ID.fullmatch(preview.control.AutomationId)
@@ -313,7 +316,8 @@ def run_day(adapter, history, chat, session_id, day, targets, export_root, expor
                     buttons = [node for node in nodes if node.ControlTypeName == 'ButtonControl' and
                                node.Name in {'查看原图', '下载原图', 'View Original'}]
                     if buttons:
-                        adapter._click(context_for(preview, chat), unique(buttons, '查看原图按钮'))
+                        validated_window_click(adapter, context_for(preview, chat),
+                                               unique(buttons, '查看原图按钮'))
                     for _ in range(10):
                         time.sleep(0.5)
                         if current_state(export_root, export_chat, day, local_id, timestamp) == 'original':

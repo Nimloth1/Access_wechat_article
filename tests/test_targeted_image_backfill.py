@@ -14,6 +14,7 @@ from targeted_image_backfill import (
     history_window,
     record_attempt,
     validated_window_click,
+    validated_window_point_click,
 )
 from src.services.chat_attachment_service import ChatAutomationError
 
@@ -62,7 +63,24 @@ def test_validated_window_click_checks_owner_then_posts_client_click():
         ((1234, 0x0201, 0x0001, (30 << 16) | 20),),
         ((1234, 0x0202, 0, (30 << 16) | 20),),
     ]
-    sleep_mock.assert_called_once_with(0.08)
+    assert sleep_mock.call_count == 2
+    sleep_mock.assert_called_with(0.05)
+
+
+def test_validated_window_point_double_click_posts_two_complete_clicks():
+    """图片正文可在无物理远控鼠标时用窗口消息双击。"""
+    context = SimpleNamespace(window=SimpleNamespace(handle=4321))
+    adapter = Mock()
+    user32 = Mock()
+    user32.ScreenToClient.return_value = True
+    user32.PostMessageW.return_value = True
+
+    with patch('targeted_image_backfill._user32', return_value=user32), \
+            patch('targeted_image_backfill.time.sleep'):
+        validated_window_point_click(adapter, context, 12, 34, clicks=2)
+
+    assert [args[0][1] for args in user32.PostMessageW.call_args_list] == [
+        0x0201, 0x0202, 0x0201, 0x0202]
 
 
 def test_close_history_clicks_only_the_history_close_button():
