@@ -91,11 +91,10 @@ class WindowsHomeWindowGuard:
             )
         user32 = self._resolve_user32()
         point = _Point(int(target.click_x), int(target.click_y))
-        setter, previous_context = _enter_per_monitor_dpi_context(user32)
-        try:
-            owner_handle = int(user32.WindowFromPoint(point) or 0)
-        finally:
-            _restore_dpi_context(setter, previous_context)
+        # UIA 的 BoundingRectangle 与随后 Control.Click 使用当前线程的屏幕坐标。
+        # 临时切到 Per-Monitor-V2 会在混合 DPI/远程显示环境里把同一坐标再次换算，
+        # 导致 WindowFromPoint 命中 Explorer 的 Backstop Window 而不是微信。
+        owner_handle = int(user32.WindowFromPoint(point) or 0)
 
         if _belongs_to_home(user32, home_window.handle, owner_handle):
             return
@@ -145,25 +144,6 @@ def _belongs_to_home(user32: Any, home_handle: int, owner_handle: int) -> bool:
         return int(user32.GetAncestor(int(owner_handle), GA_ROOT) or 0) == int(home_handle)
     except Exception:
         return False
-
-
-def _enter_per_monitor_dpi_context(user32: Any) -> tuple[Any, Any]:
-    setter = getattr(user32, "SetThreadDpiAwarenessContext", None)
-    previous_context: Any = None
-    if callable(setter):
-        try:
-            setter.argtypes = [ctypes.c_void_p]
-            setter.restype = ctypes.c_void_p
-        except Exception:
-            pass
-        previous_context = setter(ctypes.c_void_p(-4))
-    return setter, previous_context
-
-
-def _restore_dpi_context(setter: Any, previous_context: Any) -> None:
-    if callable(setter) and previous_context:
-        raw_context = getattr(previous_context, "value", previous_context)
-        setter(ctypes.c_void_p(raw_context))
 
 
 __all__ = ["HomeWindowNotClickableError", "WindowsHomeWindowGuard"]
