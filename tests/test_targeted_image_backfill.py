@@ -15,6 +15,7 @@ from targeted_image_backfill import (
     record_attempt,
     validated_window_click,
     validated_window_point_click,
+    validated_window_wheel,
 )
 from src.services.chat_attachment_service import ChatAutomationError
 
@@ -81,6 +82,27 @@ def test_validated_window_point_double_click_posts_two_complete_clicks():
 
     assert [args[0][1] for args in user32.PostMessageW.call_args_list] == [
         0x0201, 0x0202, 0x0201, 0x0202]
+
+
+def test_validated_window_wheel_posts_screen_coordinates_and_negative_delta():
+    """向下翻聊天记录时发送负滚轮增量并保留屏幕坐标。"""
+    control = SimpleNamespace(BoundingRectangle=(100, 200, 300, 600))
+    context = SimpleNamespace(window=SimpleNamespace(handle=9876))
+    adapter = Mock()
+    user32 = Mock()
+    user32.PostMessageW.return_value = True
+
+    with patch('targeted_image_backfill._user32', return_value=user32), \
+            patch('targeted_image_backfill.time.sleep'):
+        validated_window_wheel(adapter, context, control, older=False, steps=2)
+
+    adapter._check_point.assert_called_once_with(context, 200, 400)
+    expected_wparam = ((-120) & 0xffff) << 16
+    expected_lparam = (400 << 16) | 200
+    assert user32.PostMessageW.call_args_list == [
+        ((9876, 0x020A, expected_wparam, expected_lparam),),
+        ((9876, 0x020A, expected_wparam, expected_lparam),),
+    ]
 
 
 def test_close_history_clicks_only_the_history_close_button():

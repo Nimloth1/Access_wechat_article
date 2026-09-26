@@ -5,7 +5,8 @@
 # version: 1.3 @20260926: 任务结束或异常时关闭聊天记录窗口;
 # version: 1.4 @20260926: 微信 Qt 按钮不响应 UIA Click 时改用校验后的窗口消息点击;
 # version: 1.5 @20260926: 日期筛选及图片预览操作也使用校验后的窗口消息;
-__version__ = 'v1.5'
+# version: 1.6 @20260926: 无远控鼠标时用窗口消息滚动聊天记录列表;
+__version__ = 'v1.6'
 __platform__ = 'nt'
 __pc__ = ['PW']
 __py__ = 'py3.11+'
@@ -61,6 +62,22 @@ def validated_window_click(adapter, context, control):
     """点击已核验窗口中的控件中心。"""
     left, top, right, bottom = rect_to_tuple(control.BoundingRectangle)
     validated_window_point_click(adapter, context, (left + right) // 2, (top + bottom) // 2)
+
+
+def validated_window_wheel(adapter, context, control, *, older, steps):
+    """在已核验列表中心投递滚轮消息，不依赖远控软件维持物理鼠标。"""
+    left, top, right, bottom = rect_to_tuple(control.BoundingRectangle)
+    x, y = (left + right) // 2, (top + bottom) // 2
+    adapter._activate(context)
+    adapter._check_point(context, x, y)
+    delta = 120 if older else -120
+    wparam = (delta & 0xffff) << 16
+    lparam = ((y & 0xffff) << 16) | (x & 0xffff)
+    user32 = _user32()
+    for _ in range(steps):
+        if not user32.PostMessageW(context.window.handle, 0x020A, wparam, lparam):
+            raise ChatAutomationError('无法向微信窗口发送滚轮消息')
+        time.sleep(0.05)
 
 
 def parse_args():
@@ -334,7 +351,8 @@ def run_day(adapter, history, chat, session_id, day, targets, export_root, expor
             finally:
                 close_preview(adapter, chat, session_id)
         if targets and (not limit or handled < limit):
-            adapter._wheel(context_for(history, chat), older=False, steps=6)
+            validated_window_wheel(adapter, context_for(history, chat), listing,
+                                   older=False, steps=6)
             time.sleep(0.2)
     return handled
 
