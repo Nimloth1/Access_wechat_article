@@ -12,6 +12,7 @@ from targeted_image_backfill import (
     close_history,
     expired_attempts,
     history_window,
+    preview_image,
     record_attempt,
     validated_window_click,
     validated_window_point_click,
@@ -140,3 +141,24 @@ def test_history_window_polls_until_delayed_window_appears():
     assert one_window_mock.call_count == 3
     click_mock.assert_called_once_with(adapter, main, history_button)
     sleep_mock.assert_called_once_with(0.2)
+
+
+def test_preview_image_waits_for_delayed_preview_window():
+    """图片双击后预览窗口创建较慢时继续轮询。"""
+    listing = SimpleNamespace(AutomationId='search_message_list', BoundingRectangle=(0, 0, 1000, 800))
+    row = SimpleNamespace(BoundingRectangle=(100, 100, 900, 500))
+    history = SimpleNamespace(control=object())
+    preview = SimpleNamespace(control=SimpleNamespace(AutomationId='PreviewWindow_chat-id_123_456_0_0'))
+    adapter = Mock()
+    missing = ChatAutomationError('mmui::PreviewWindow需要唯一匹配，实际找到 0 个')
+
+    with patch('targeted_image_backfill.walk', return_value=[listing]), \
+            patch('targeted_image_backfill.context_for', return_value='history-context'), \
+            patch('targeted_image_backfill.validated_window_point_click') as click_mock, \
+            patch('targeted_image_backfill.one_window', side_effect=[missing, preview]), \
+            patch('targeted_image_backfill.time.sleep') as sleep_mock:
+        result = preview_image(adapter, history, '测试群', row, 'chat-id')
+
+    assert result == (preview, 123, 456)
+    click_mock.assert_called_once()
+    sleep_mock.assert_called_once_with(0.1)

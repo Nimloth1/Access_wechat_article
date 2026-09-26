@@ -6,7 +6,8 @@
 # version: 1.4 @20260926: 微信 Qt 按钮不响应 UIA Click 时改用校验后的窗口消息点击;
 # version: 1.5 @20260926: 日期筛选及图片预览操作也使用校验后的窗口消息;
 # version: 1.6 @20260926: 无远控鼠标时用窗口消息滚动聊天记录列表;
-__version__ = 'v1.6'
+# version: 1.7 @20260926: 图片预览创建较慢时轮询并重试，避免中断整批;
+__version__ = 'v1.7'
 __platform__ = 'nt'
 __pc__ = ['PW']
 __py__ = 'py3.11+'
@@ -252,9 +253,22 @@ def preview_image(adapter, history, chat, row, session_id):
         return None
     x = bounds[0] + round(250 * (view[2] - view[0]) / 1966)
     y = top + min(round(180 * (view[2] - view[0]) / 1966), (bottom - top) // 2)
-    validated_window_point_click(adapter, context, x, y, clicks=2)
-    time.sleep(0.2)
-    preview = one_window('mmui::PreviewWindow', session_id=session_id)
+    preview = None
+    for _ in range(2):
+        validated_window_point_click(adapter, context, x, y, clicks=2)
+        deadline = time.monotonic() + 2
+        while True:
+            try:
+                preview = one_window('mmui::PreviewWindow', session_id=session_id)
+                break
+            except ChatAutomationError as exc:
+                if '实际找到 0 个' not in str(exc) or time.monotonic() >= deadline:
+                    break
+            time.sleep(0.1)
+        if preview is not None:
+            break
+    if preview is None:
+        return None
     match = PREVIEW_ID.fullmatch(preview.control.AutomationId)
     if not match or match.group(1) != session_id:
         raise ChatAutomationError('图片预览消息 ID 无法与目标群对应')
