@@ -7,7 +7,8 @@
 # version: 1.5 @20260926: 日期筛选及图片预览操作也使用校验后的窗口消息;
 # version: 1.6 @20260926: 无远控鼠标时用窗口消息滚动聊天记录列表;
 # version: 1.7 @20260926: 图片预览创建较慢时轮询并重试，避免中断整批;
-__version__ = 'v1.7'
+# version: 1.8 @20260926: Windows 日志固定为 UTF-8，支持含 emoji 的会话名;
+__version__ = 'v1.8'
 __platform__ = 'nt'
 __pc__ = ['PW']
 __py__ = 'py3.11+'
@@ -22,6 +23,7 @@ from datetime import date, datetime
 import json
 import re
 from pathlib import Path
+import sys
 import time
 
 from chat_attachments import DEFAULT_EXPORT_ROOT, LOG_DIR, task_lock
@@ -34,6 +36,13 @@ from src.services.wechat_attachment_inventory import load_inventory
 PREVIEW_ID = re.compile(r'^PreviewWindow_(.+)_(\d+)_(\d+)_\d+_\d+$')
 IMAGE_ROW = re.compile(r'^图片 .+ (\d{2}:\d{2})$')
 ATTEMPT_LOG = LOG_DIR / 'targeted_image_attempts.jsonl'
+
+
+def configure_output_encoding():
+    """避免 Windows 默认 GBK 因会话名含 emoji 而让任务在打印日志时退出。"""
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, 'reconfigure'):
+            stream.reconfigure(encoding='utf-8', errors='backslashreplace')
 
 
 def _user32():
@@ -373,6 +382,7 @@ def run_day(adapter, history, chat, session_id, day, targets, export_root, expor
 
 def main():
     """按缺口日期运行，结束后重新核验清单摘要。"""
+    configure_output_encoding()
     print(f'微信定向原图补齐 {__version__}', flush=True)
     args = parse_args()
     if args.max_items < 0:

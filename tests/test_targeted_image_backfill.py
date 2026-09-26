@@ -10,6 +10,7 @@ from targeted_image_backfill import (
     IMAGE_ROW,
     calendar_day_point,
     close_history,
+    configure_output_encoding,
     expired_attempts,
     history_window,
     preview_image,
@@ -25,6 +26,17 @@ def test_image_row_time_accepts_wechat_weekday_label():
     """日期筛选后微信用星期标签显示图片时间，仍能定位目标分钟。"""
     assert IMAGE_ROW.fullmatch('图片 星期五 09:00').group(1) == '09:00'
     assert IMAGE_ROW.fullmatch('图片 9月18日 09:00').group(1) == '09:00'
+
+
+def test_configure_output_encoding_uses_utf8_for_emoji_chat_names():
+    """Windows 默认 GBK 下也能输出含 emoji 的会话名。"""
+    stdout = Mock()
+    stderr = Mock()
+    with patch('targeted_image_backfill.sys.stdout', stdout), \
+            patch('targeted_image_backfill.sys.stderr', stderr):
+        configure_output_encoding()
+    stdout.reconfigure.assert_called_once_with(encoding='utf-8', errors='backslashreplace')
+    stderr.reconfigure.assert_called_once_with(encoding='utf-8', errors='backslashreplace')
 
 
 def test_calendar_day_point_matches_observed_august_and_september_cells():
