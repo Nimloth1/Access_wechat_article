@@ -8,7 +8,8 @@
 # version: 1.6 @20260926: 无远控鼠标时用窗口消息滚动聊天记录列表;
 # version: 1.7 @20260926: 图片预览创建较慢时轮询并重试，避免中断整批;
 # version: 1.8 @20260926: Windows 日志固定为 UTF-8，支持含 emoji 的会话名;
-__version__ = 'v1.8'
+# version: 1.9 @20260926: 缩小记录列表翻页跨度，避免图片行落在页面间隙;
+__version__ = 'v1.9'
 __platform__ = 'nt'
 __pc__ = ['PW']
 __py__ = 'py3.11+'
@@ -375,7 +376,7 @@ def run_day(adapter, history, chat, session_id, day, targets, export_root, expor
                 close_preview(adapter, chat, session_id)
         if targets and (not limit or handled < limit):
             validated_window_wheel(adapter, context_for(history, chat), listing,
-                                   older=False, steps=6)
+                                   older=False, steps=3)
             time.sleep(0.2)
     return handled
 
