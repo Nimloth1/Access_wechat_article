@@ -11,7 +11,8 @@
 # version: 1.9 @20260926: 缩小记录列表翻页跨度，避免图片行落在页面间隙;
 # version: 2.0 @20260930: 等待日期筛选标题刷新，并在失败时记录实际显示的日期;
 # version: 2.1 @20260930: 未定位图片时记录目标与可见图片时间，便于区分列表缺失和格式变化;
-__version__ = 'v2.1'
+# version: 2.2 @20260930: 日期校验失败时按周日首列重新定位日历，适配微信布局变化;
+__version__ = 'v2.2'
 __platform__ = 'nt'
 __pc__ = ['PW']
 __py__ = 'py3.11+'
@@ -175,17 +176,18 @@ def history_window(adapter, main, chat, session_id):
         time.sleep(0.2)
 
 
-def calendar_day_point(day, panel_bounds):
+def calendar_day_point(day, panel_bounds, *, sunday_first=False):
     """按星期列和月内行计算日期格中心，适配日历的 DPI 缩放。"""
     left, top, right, _ = panel_bounds
     scale = (right - left) / 424
-    column = day.weekday()
-    row = (date(day.year, day.month, 1).weekday() + day.day - 1) // 7
+    offset = 1 if sunday_first else 0
+    column = (day.weekday() + offset) % 7
+    row = ((date(day.year, day.month, 1).weekday() + offset) % 7 + day.day - 1) // 7
     return (round(left + (20 + 64 * column) * scale),
             round(top + (84 + 64 * row) * scale))
 
 
-def select_day(adapter, history, chat, session_id, day):
+def select_day(adapter, history, chat, session_id, day, *, sunday_first=False):
     """在日期日历中选择一天，并核对筛选结果标题。"""
     context = context_for(history, chat)
     for _ in range(3):
@@ -241,10 +243,17 @@ def select_day(adapter, history, chat, session_id, day):
             raise ChatAutomationError(f'月份菜单未切换到 {day.month}月')
     panel = unique([node for node in walk(calendar.control) if node.ClassName == 'mmui::DateNumPanel'],
                    '日历日期面板')
-    x, y = calendar_day_point(day, rect_to_tuple(panel.BoundingRectangle))
+    x, y = calendar_day_point(day, rect_to_tuple(panel.BoundingRectangle),
+                              sunday_first=sunday_first)
     validated_window_point_click(adapter, context, x, y)
     heading = f'{day.year}年{day.month}月{day.day}日'
-    return wait_for_date_heading(session_id, heading)
+    try:
+        return wait_for_date_heading(session_id, heading)
+    except ChatAutomationError:
+        if sunday_first:
+            raise
+        print(f'{day}: 日期筛选未匹配，按周日首列重试', flush=True)
+        return select_day(adapter, history, chat, session_id, day, sunday_first=True)
 
 
 def wait_for_date_heading(session_id, heading):

@@ -44,6 +44,10 @@ def test_calendar_day_point_matches_observed_august_and_september_cells():
     """同一日历尺寸下按正确星期列定位两个月的已验证日期。"""
     assert calendar_day_point(date(2026, 8, 12), (1514, 608, 1938, 1028)) == (1662, 820)
     assert calendar_day_point(date(2026, 9, 8), (1542, 470, 1966, 830)) == (1626, 618)
+    assert calendar_day_point(date(2026, 9, 28), (1542, 470, 1966, 830),
+                              sunday_first=True) == (1626, 810)
+    assert calendar_day_point(date(2026, 9, 29), (1542, 470, 1966, 830),
+                              sunday_first=True) == (1690, 810)
 
 
 def test_wait_for_date_heading_allows_delayed_ui_refresh():
