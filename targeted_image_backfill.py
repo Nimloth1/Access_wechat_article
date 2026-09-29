@@ -9,7 +9,9 @@
 # version: 1.7 @20260926: 图片预览创建较慢时轮询并重试，避免中断整批;
 # version: 1.8 @20260926: Windows 日志固定为 UTF-8，支持含 emoji 的会话名;
 # version: 1.9 @20260926: 缩小记录列表翻页跨度，避免图片行落在页面间隙;
-__version__ = 'v1.9'
+# version: 2.0 @20260930: 等待日期筛选标题刷新，并在失败时记录实际显示的日期;
+# version: 2.1 @20260930: 未定位图片时记录目标与可见图片时间，便于区分列表缺失和格式变化;
+__version__ = 'v2.1'
 __platform__ = 'nt'
 __pc__ = ['PW']
 __py__ = 'py3.11+'
@@ -241,13 +243,24 @@ def select_day(adapter, history, chat, session_id, day):
                    '日历日期面板')
     x, y = calendar_day_point(day, rect_to_tuple(panel.BoundingRectangle))
     validated_window_point_click(adapter, context, x, y)
-    time.sleep(0.2)
-    history = one_window('mmui::SearchMsgUniqueChatWindow', session_id=session_id)
     heading = f'{day.year}年{day.month}月{day.day}日'
-    if not any(node.ControlTypeName == 'TextControl' and node.Name == heading
-               for node in walk(history.control)):
-        raise ChatAutomationError(f'未确认日期筛选结果为 {heading}，停止处理')
-    return history
+    return wait_for_date_heading(session_id, heading)
+
+
+def wait_for_date_heading(session_id, heading):
+    """等待微信异步刷新日期结果，失败时保留实际标题供排查。"""
+    observed = set()
+    for _ in range(15):
+        time.sleep(0.2)
+        history = one_window('mmui::SearchMsgUniqueChatWindow', session_id=session_id)
+        labels = {node.Name for node in walk(history.control)
+                  if node.ControlTypeName == 'TextControl'}
+        if heading in labels:
+            return history
+        observed.update(name for name in labels
+                        if re.fullmatch(r'\d{4}年\d{1,2}月\d{1,2}日', name))
+    shown = ', '.join(sorted(observed)) or '未显示日期标题'
+    raise ChatAutomationError(f'未确认日期筛选结果为 {heading}；页面日期={shown}，停止处理')
 
 
 def preview_image(adapter, history, chat, row, session_id):
@@ -317,6 +330,8 @@ def run_day(adapter, history, chat, session_id, day, targets, export_root, expor
                       f'{datetime.fromtimestamp(item["timestamp"]).minute:02d}'
                       for item in targets.values()}
     examined = set()
+    observed_image_minutes = set()
+    unmatched_image_labels = set()
     previous_layout = None
     stationary = 0
     handled = 0
@@ -336,6 +351,10 @@ def run_day(adapter, history, chat, session_id, day, targets, export_root, expor
             if not targets or (limit and handled >= limit):
                 break
             match = IMAGE_ROW.fullmatch(row.Name)
+            if match:
+                observed_image_minutes.add(match.group(1))
+            elif row.Name.startswith('图片') and len(unmatched_image_labels) < 6:
+                unmatched_image_labels.add(row.Name[:80])
             if not match or match.group(1) not in target_minutes:
                 continue
             marker = (row.Name, tuple(row.GetRuntimeId()), rect_to_tuple(row.BoundingRectangle))
@@ -378,6 +397,12 @@ def run_day(adapter, history, chat, session_id, day, targets, export_root, expor
             validated_window_wheel(adapter, context_for(history, chat), listing,
                                    older=False, steps=3)
             time.sleep(0.2)
+    if targets:
+        remaining_minutes = sorted({f'{datetime.fromtimestamp(item["timestamp"]):%H:%M}'
+                                    for item in targets.values()})
+        print(f'{day}: 未定位目标分钟={remaining_minutes} '
+              f'列表命中分钟={sorted(set(remaining_minutes) & observed_image_minutes)} '
+              f'无法解析图片行={sorted(unmatched_image_labels)}', flush=True)
     return handled
 
 

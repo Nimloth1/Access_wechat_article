@@ -18,6 +18,7 @@ from targeted_image_backfill import (
     validated_window_click,
     validated_window_point_click,
     validated_window_wheel,
+    wait_for_date_heading,
 )
 from src.services.chat_attachment_service import ChatAutomationError
 
@@ -43,6 +44,31 @@ def test_calendar_day_point_matches_observed_august_and_september_cells():
     """同一日历尺寸下按正确星期列定位两个月的已验证日期。"""
     assert calendar_day_point(date(2026, 8, 12), (1514, 608, 1938, 1028)) == (1662, 820)
     assert calendar_day_point(date(2026, 9, 8), (1542, 470, 1966, 830)) == (1626, 618)
+
+
+def test_wait_for_date_heading_allows_delayed_ui_refresh():
+    history = SimpleNamespace(control=object())
+    old = SimpleNamespace(ControlTypeName='TextControl', Name='2026年9月28日')
+    target = SimpleNamespace(ControlTypeName='TextControl', Name='2026年9月29日')
+    with patch('targeted_image_backfill.one_window', return_value=history), \
+            patch('targeted_image_backfill.walk', side_effect=[[old], [target]]), \
+            patch('targeted_image_backfill.time.sleep') as sleep:
+        assert wait_for_date_heading('chat-id', target.Name) is history
+    assert sleep.call_count == 2
+
+
+def test_wait_for_date_heading_reports_actual_date_on_failure():
+    history = SimpleNamespace(control=object())
+    old = SimpleNamespace(ControlTypeName='TextControl', Name='2026年9月28日')
+    with patch('targeted_image_backfill.one_window', return_value=history), \
+            patch('targeted_image_backfill.walk', return_value=[old]), \
+            patch('targeted_image_backfill.time.sleep'):
+        try:
+            wait_for_date_heading('chat-id', '2026年9月29日')
+        except ChatAutomationError as exc:
+            assert '页面日期=2026年9月28日' in str(exc)
+        else:
+            raise AssertionError('expected date mismatch')
 
 
 def test_expired_attempts_only_skips_confirmed_expiry(tmp_path):
