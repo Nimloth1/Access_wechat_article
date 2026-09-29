@@ -25,6 +25,18 @@ class WechatAttachmentInventoryTests(unittest.TestCase):
                 'kind': 'image', 'resource_md5': 'abc', 'dat_paths': [str(thumb), str(original)]
             }), ('original', str(original)))
 
+    def test_decoded_thumbnail_is_not_promoted_by_unverified_original_dat(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            thumb = root / 'abc_t.jpg'
+            thumb.write_bytes(b'decoded thumbnail')
+            original_dat = root / 'abc.dat'
+            original_dat.write_bytes(b'undecodable original')
+            self.assertEqual(attachment_state({
+                'kind': 'image', 'resource_md5': 'abc', 'image_variant': 'thumb',
+                'path': str(thumb), 'dat_paths': [str(original_dat)],
+            }), ('thumbnail', str(thumb)))
+
     def test_numbered_file_copy_is_confirmed(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

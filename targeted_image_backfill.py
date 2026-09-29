@@ -12,7 +12,8 @@
 # version: 2.0 @20260930: 等待日期筛选标题刷新，并在失败时记录实际显示的日期;
 # version: 2.1 @20260930: 未定位图片时记录目标与可见图片时间，便于区分列表缺失和格式变化;
 # version: 2.2 @20260930: 日期校验失败时按周日首列重新定位日历，适配微信布局变化;
-__version__ = 'v2.2'
+# version: 2.3 @20260930: 未定位目标另存结构化诊断，避免监控正文截断后丢失证据;
+__version__ = 'v2.3'
 __platform__ = 'nt'
 __pc__ = ['PW']
 __py__ = 'py3.11+'
@@ -409,9 +410,23 @@ def run_day(adapter, history, chat, session_id, day, targets, export_root, expor
     if targets:
         remaining_minutes = sorted({f'{datetime.fromtimestamp(item["timestamp"]):%H:%M}'
                                     for item in targets.values()})
+        matched_minutes = sorted(set(remaining_minutes) & observed_image_minutes)
         print(f'{day}: 未定位目标分钟={remaining_minutes} '
-              f'列表命中分钟={sorted(set(remaining_minutes) & observed_image_minutes)} '
+              f'列表命中分钟={matched_minutes} '
               f'无法解析图片行={sorted(unmatched_image_labels)}', flush=True)
+        diagnostic = {
+            'at': datetime.now().isoformat(timespec='seconds'),
+            'session_id': session_id,
+            'day': day.isoformat(),
+            'target_keys': sorted(item['key'] for item in targets.values()),
+            'target_minutes': remaining_minutes,
+            'matched_minutes': matched_minutes,
+            'unmatched_image_labels': sorted(unmatched_image_labels),
+        }
+        path = LOG_DIR / 'targeted_image_unlocated.jsonl'
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open('a', encoding='utf-8', newline='\n') as log:
+            log.write(json.dumps(diagnostic, ensure_ascii=False) + '\n')
     return handled
 
 

@@ -85,6 +85,11 @@ def attachment_state(attachment: dict[str, Any]) -> tuple[str, str | None]:
         return "missing", None
     if kind != "image":
         return "pending", None
+    # 已解码缩略图优先于旁边未经验证的原图 DAT。DAT 存在不代表可解码。
+    selected_path = attachment.get("path")
+    selected_variant = str(attachment.get("image_variant") or "").lower()
+    if selected_variant in THUMB_VARIANTS and _exists(selected_path):
+        return "thumbnail", selected_path
     resource_md5 = str(attachment.get("resource_md5") or "")
     candidates: list[tuple[str, str]] = []
     for path in attachment.get("dat_paths") or []:
