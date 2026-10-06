@@ -204,3 +204,26 @@ def test_preview_image_waits_for_delayed_preview_window():
     assert result == (preview, 123, 456)
     click_mock.assert_called_once()
     sleep_mock.assert_called_once_with(0.1)
+
+
+def test_one_window_skips_unavailable_uia_and_reuses_attached_control():
+    """窗口消失或挂接失败不阻断后续有效窗口，也不重复挂接。"""
+    from targeted_image_backfill import one_window
+    missing = SimpleNamespace(process_name='Weixin.exe', visible=True, is_minimized=False, control=None)
+    valid = SimpleNamespace(process_name='Weixin.exe', visible=True, is_minimized=False, control=None)
+    attached = SimpleNamespace(control=SimpleNamespace(ClassName='preview', AutomationId='chat-id'))
+    with patch('targeted_image_backfill.enumerate_desktop_windows', return_value=[missing, valid]), \
+            patch('targeted_image_backfill.attach_uia_control', side_effect=[missing, attached]) as attach:
+        assert one_window('preview', session_id='chat-id') is attached
+    assert attach.call_count == 2
+
+
+def test_one_window_without_uia_uses_existing_missing_window_error():
+    """全都无 UIA 控件时，仍进入已有轮询/清理使用的零匹配分支。"""
+    import pytest
+    from targeted_image_backfill import one_window
+    missing = SimpleNamespace(process_name='Weixin.exe', visible=True, is_minimized=False, control=None)
+    with patch('targeted_image_backfill.enumerate_desktop_windows', return_value=[missing]), \
+            patch('targeted_image_backfill.attach_uia_control', return_value=missing):
+        with pytest.raises(ChatAutomationError, match='实际找到 0 个'):
+            one_window('preview')

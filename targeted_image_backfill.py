@@ -115,13 +115,14 @@ def one_window(class_name, *, session_id=None):
         if (window.process_name.lower() != 'weixin.exe' or not window.visible or
                 window.is_minimized):
             continue
-        control = attach_uia_control(window).control
-        if control.ClassName != class_name:
+        attached = attach_uia_control(window)
+        control = attached.control
+        if control is None or control.ClassName != class_name:
             continue
         if session_id and session_id not in control.AutomationId:
             continue
-        matches.append(window)
-    return attach_uia_control(unique(matches, class_name))
+        matches.append(attached)
+    return unique(matches, class_name)
 
 
 def context_for(window, chat):
