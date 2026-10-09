@@ -962,6 +962,41 @@ class WechatChatAdapterTests(unittest.TestCase):
         value.SetValue.assert_called_once_with('180k拼团')
         adapter._post_click.assert_called_once_with(context, result, keep_parent_active=True)
 
+
+    def test_open_chat_cold_start_without_current_title(self):
+        """无当前对话标题时，指定名字仍可通过左侧搜索打开目标会话。"""
+        target = Node('404K', kind='TextControl')
+        target.AutomationId = 'current_chat_name_label'
+        master = Node(cls='mmui::ChatMasterView')
+        search_field = Node(cls='mmui::XSearchField', parent=master)
+        search = Node('搜索', kind='EditControl', cls='mmui::XValidatorTextEdit', parent=search_field)
+        search.SetFocus = Mock()
+        value = SimpleNamespace(SetValue=Mock())
+        search.GetValuePattern = lambda: value
+        result = Node('404K')
+        results = Node(kind='ListControl', children=(Node('公众号'), result))
+        results.AutomationId = 'search_list'
+        root = Node(kind='WindowControl', children=(search,))
+        adapter = self.adapter(None)
+        adapter.main = SimpleNamespace(control=root)
+        adapter.diagnose = lambda: {'ready': False, 'detail': '未识别到聊天消息列表和标题'}
+        adapter._nodes = lambda context: [search, results]
+        adapter._activate = Mock()
+        adapter._focus_within = lambda control: True
+        adapter._click = Mock()
+        adapter._post_click = Mock()
+        adapter._pause = Mock()
+        adapter.cancelled = lambda: False
+        adapter._window = Mock(return_value=SimpleNamespace(control=Node(children=(target,))))
+
+        context = adapter.open_chat('404K')
+
+        self.assertEqual(context.name, '404K')
+        self.assertFalse(context.switching)
+        value.SetValue.assert_called_once_with('404K')
+        adapter._post_click.assert_called_once_with(context, result, keep_parent_active=True)
+        adapter._activate.assert_called_once()
+
     def test_current_non_chat_page_still_stops_without_target_name(self):
         """未指定目标时，公众号页不能被误当作可采集聊天页。"""
         adapter = self.adapter(None)

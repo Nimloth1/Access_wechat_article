@@ -139,6 +139,7 @@ class ChatContext:
     window: Any
     name: str
     forwarded: bool = False
+    switching: bool = False
     reached_start: bool = False
     dates: dict[tuple, date] = field(default_factory=dict)
     signature_dates: dict[str, date] = field(default_factory=dict)
@@ -242,7 +243,8 @@ class WechatChatAdapter:
         while True:
             context.window = self._window(context.window)
             nodes = walk(context.window.control)
-            if context.forwarded:
+            # 转发内部页、或正在按名字搜索切换会话时，不要求已有当前对话标题。
+            if context.forwarded or context.switching:
                 return nodes
             titles = [n for n in nodes if n.AutomationId.endswith("current_chat_name_label")]
             if len(titles) == 1:
@@ -335,17 +337,29 @@ class WechatChatAdapter:
                 f'目标窗口 {context.window.handle}；{str(exc).replace("文章坐标", "操作坐标").replace("微信主页", "目标微信窗口")}') from exc
 
     def open_chat(self, name: str | None) -> ChatContext:
-        """选择当前对话或精确搜索指定对话；不向聊天输入框输入文字。"""
+        """选择当前对话或精确搜索指定对话；不向聊天输入框输入文字。
+
+        指定 ``name`` 时允许冷启动：即便当前没有可读的对话标题，也会直接找
+        左侧会话搜索框并打开目标会话，供公众号自动进历史消息页使用。
+        """
         diagnostic = self.diagnose()
         if not diagnostic["ready"] and name is None:
             raise ChatAutomationError(diagnostic["detail"])
         nodes = walk(self.main.control)
-        title = unique([n for n in nodes if n.AutomationId.endswith("current_chat_name_label")], "当前对话标题")
-        context = ChatContext(self.main, title.Name.strip())
-        if name is None or name == context.name:
+        titles = [n for n in nodes if n.AutomationId.endswith("current_chat_name_label")]
+        if name is None:
+            title = unique(titles, "当前对话标题")
+            context = ChatContext(self.main, title.Name.strip())
             if not diagnostic["ready"]:
                 raise ChatAutomationError(diagnostic["detail"])
             return context
+        if len(titles) == 1 and titles[0].Name.strip() == name:
+            context = ChatContext(self.main, name)
+            if not diagnostic["ready"]:
+                raise ChatAutomationError(diagnostic["detail"])
+            return context
+        bootstrap = titles[0].Name.strip() if len(titles) == 1 else ""
+        context = ChatContext(self.main, bootstrap, switching=True)
         self._activate(context)
         nodes = self._nodes(context)
         search = unique([n for n in nodes if n.ControlTypeName == "EditControl" and
@@ -370,10 +384,11 @@ class WechatChatAdapter:
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline and not self.cancelled():
             context.window = self._window(context.window)
-            titles = [n for n in walk(context.window.control)
+            opened = [n for n in walk(context.window.control)
                       if n.AutomationId.endswith("current_chat_name_label")]
-            if len(titles) == 1 and titles[0].Name.strip() == name:
+            if len(opened) == 1 and opened[0].Name.strip() == name:
                 context.name = name
+                context.switching = False
                 return context
             self._pause(0.2)
         raise ChatAutomationError("未在等待时间内确认目标对话已打开")
