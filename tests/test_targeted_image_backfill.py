@@ -16,12 +16,119 @@ from targeted_image_backfill import (
     history_window,
     preview_image,
     record_attempt,
+    select_day,
     validated_window_click,
     validated_window_point_click,
     validated_window_wheel,
     wait_for_date_heading,
 )
 from src.services.chat_attachment_service import ChatAutomationError
+
+
+def test_calendar_confirmation_applies_hovered_day_without_dismissing_popup():
+    """旧文件缺口日历要求先更新悬停日期再确认，点击后才应用筛选。"""
+    def node(kind, name='', cls='', bounds=(0, 0, 30, 30)):
+        return SimpleNamespace(ControlTypeName=kind, Name=name, ClassName=cls,
+                               BoundingRectangle=bounds)
+    tab = node('TabItemControl', '日期')
+    panel = node('PaneControl', cls='mmui::DateNumPanel', bounds=(0, 50, 424, 470))
+    confirm = node('ButtonControl', '确定', bounds=(10, 480, 90, 510))
+    history = SimpleNamespace(handle=1, control=object())
+    calendar = SimpleNamespace(handle=2, control=node('WindowControl', cls='mmui::XPopover'))
+    nodes = [node('TextControl', '2026年'), node('TextControl', '3月'), panel, confirm]
+    hovered = applied = False
+    adapter = Mock()
+    user32 = Mock()
+    user32.ScreenToClient.return_value = True
+
+    def post(handle, message, buttons, position):
+        nonlocal hovered, applied
+        if handle == calendar.handle:
+            if message == 0x0200:
+                hovered = True
+            elif message == 0x0202 and position == (495 << 16) | 50:
+                applied = hovered
+        return True
+
+    user32.PostMessageW.side_effect = post
+    with patch('targeted_image_backfill.one_window', return_value=calendar), \
+            patch('targeted_image_backfill.walk', side_effect=lambda control:
+                  [tab] if control is history.control else nodes), \
+            patch('targeted_image_backfill.wait_for_date_heading', return_value=history), \
+            patch('targeted_image_backfill._user32', return_value=user32), \
+            patch('targeted_image_backfill.time.sleep'):
+        select_day(adapter, history, '测试群', 'chat-id', date(2026, 3, 24))
+    assert applied
+    assert all(call.args[0].window is not calendar for call in adapter._activate.call_args_list)
+
+
+@pytest.mark.parametrize('scroll_needed', [False, True, 'stuck', 'blocked'])
+def test_month_popup_stays_open_until_verified_target_is_clicked(scroll_needed):
+    """重现旧菜单被激活而关闭、滚轮不更新目标可见位置的两种失败。"""
+    def node(kind, name='', **values):
+        return SimpleNamespace(ControlTypeName=kind, Name=name, ClassName='',
+                               BoundingRectangle=(10, 10, 30, 30), **values)
+
+    history = SimpleNamespace(handle=1, control=object())
+    calendar = SimpleNamespace(handle=2, control=object())
+    option = node('MenuItemControl', '5月')
+    option.GetInvokePattern = Mock(return_value=SimpleNamespace(Invoke=Mock()))
+    option.BoundingRectangle = (10, -100, 80, -60) if scroll_needed else (10, 50, 80, 90)
+    menu = SimpleNamespace(handle=3, control=SimpleNamespace(
+        ClassName='mmui::XMenu', BoundingRectangle=(0, 0, 100, 200),
+        WheelUp=Mock(), WheelDown=Mock()))
+    panel = node('PaneControl')
+    panel.ClassName = 'mmui::DateNumPanel'
+    panel.BoundingRectangle = (0, 0, 424, 420)
+    tab = node('TabItemControl', '日期')
+    month = node('TextControl', '10月')
+    nodes = [node('TextControl', '2026年'), month, node('ComboBoxControl'),
+             node('ComboBoxControl'), panel]
+    closed = False
+    adapter = Mock()
+
+    def activate(context):
+        nonlocal closed
+        if context.window is menu:
+            closed = True
+
+    def post(handle, message, buttons, position):
+        if handle == menu.handle and not closed:
+            if message == 0x020A and scroll_needed != 'stuck':
+                option.BoundingRectangle = (10, 50, 80, 90)
+            elif message == 0x0202:
+                month.Name = '5月'
+        return True
+
+    adapter._activate.side_effect = activate
+    if scroll_needed == 'blocked':
+        def check_point(context, x, y):
+            if context.window is menu:
+                raise ChatAutomationError('菜单被遮挡')
+        adapter._check_point.side_effect = check_point
+    user32 = Mock()
+    user32.ScreenToClient.return_value = True
+    user32.PostMessageW.side_effect = post
+    menu_window = SimpleNamespace(process_name='Weixin.exe', visible=True)
+    with patch('targeted_image_backfill.one_window', side_effect=lambda cls, **kw:
+               menu if cls == 'mmui::XMenu' else calendar), \
+            patch('targeted_image_backfill.enumerate_desktop_windows', return_value=[menu_window]), \
+            patch('targeted_image_backfill.attach_uia_control', return_value=menu), \
+            patch('targeted_image_backfill.walk', side_effect=lambda control:
+                  [tab] if control is history.control else [option] if control is menu.control else nodes), \
+            patch('targeted_image_backfill.wait_for_date_heading', return_value=history), \
+            patch('targeted_image_backfill._user32', return_value=user32), \
+            patch('targeted_image_backfill.time.sleep'):
+        if scroll_needed in ('stuck', 'blocked'):
+            with pytest.raises(ChatAutomationError, match='未进入可见区域|菜单被遮挡'):
+                select_day(adapter, history, '测试群', 'chat-id', date(2026, 5, 6))
+            assert not any(call.args[0] == menu.handle and call.args[1] in (0x0201, 0x0202)
+                           for call in user32.PostMessageW.call_args_list)
+            return
+        assert select_day(adapter, history, '测试群', 'chat-id', date(2026, 5, 6)) is history
+    assert month.Name == '5月'
+    assert not closed
+    assert adapter._check_point.call_count >= 3
 
 
 def test_image_row_time_accepts_wechat_weekday_label():

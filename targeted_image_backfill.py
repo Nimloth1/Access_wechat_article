@@ -14,7 +14,9 @@
 # version: 2.2 @20260930: 日期校验失败时按周日首列重新定位日历，适配微信布局变化;
 # version: 2.3 @20260930: 未定位目标另存结构化诊断，避免监控正文截断后丢失证据;
 # version: 2.4 @20261010: 日期标题滞留前一天时按附件行末时间核验，避免误报筛选失败;
-__version__ = 'v2.4'
+# version: 2.5 @20261010: 月份菜单不再激活弹层，滚动后核验可见选项与实际月份;
+#                           兼容需确认的日期弹层，更新悬停日期后核验实际筛选结果;
+__version__ = 'v2.5'
 __platform__ = 'nt'
 __pc__ = ['PW']
 __py__ = 'py3.11+'
@@ -58,15 +60,22 @@ def _user32():
     return ctypes.windll.user32
 
 
-def validated_window_point_click(adapter, context, x, y, *, clicks=1):
+def validated_window_point_click(adapter, context, x, y, *, clicks=1, activate=True):
     """校验屏幕坐标归属后，向已核验窗口发送 Qt 可识别的鼠标点击。"""
-    adapter._activate(context)
+    calendar_popup = getattr(getattr(context.window, 'control', None), 'ClassName', '') == 'mmui::XPopover'
+    if activate and not calendar_popup:
+        adapter._activate(context)
     adapter._check_point(context, x, y)
     point = wintypes.POINT(x, y)
     user32 = _user32()
     if not user32.ScreenToClient(context.window.handle, ctypes.byref(point)):
         raise ChatAutomationError('无法把按钮坐标转换为微信窗口坐标')
     lparam = ((point.y & 0xffff) << 16) | (point.x & 0xffff)
+    if calendar_popup:
+        # 日期面板依赖悬停状态；直接投递按钮事件可能仍选中上一次日期。
+        if not user32.PostMessageW(context.window.handle, 0x0200, 0, lparam):
+            raise ChatAutomationError('无法更新已核验日历的悬停位置')
+        time.sleep(0.1)
     for _ in range(clicks):
         if not user32.PostMessageW(context.window.handle, 0x0201, 0x0001, lparam):
             raise ChatAutomationError('无法向微信窗口发送鼠标按下消息')
@@ -82,11 +91,12 @@ def validated_window_click(adapter, context, control):
     validated_window_point_click(adapter, context, (left + right) // 2, (top + bottom) // 2)
 
 
-def validated_window_wheel(adapter, context, control, *, older, steps):
+def validated_window_wheel(adapter, context, control, *, older, steps, activate=True):
     """在已核验列表中心投递滚轮消息，不依赖远控软件维持物理鼠标。"""
     left, top, right, bottom = rect_to_tuple(control.BoundingRectangle)
     x, y = (left + right) // 2, (top + bottom) // 2
-    adapter._activate(context)
+    if activate:
+        adapter._activate(context)
     adapter._check_point(context, x, y)
     delta = 120 if older else -120
     wparam = (delta & 0xffff) << 16
@@ -216,10 +226,7 @@ def select_day(adapter, history, chat, session_id, day, *, sunday_first=False):
     if month != f'{day.month}月':
         combos = [node for node in nodes if node.ControlTypeName == 'ComboBoxControl']
         validated_window_click(adapter, context, unique(combos[1:2], '月份下拉框'))
-        menus = [window for window in enumerate_desktop_windows()
-                 if window.process_name.lower() == 'weixin.exe' and window.visible and
-                 attach_uia_control(window).control.ClassName == 'mmui::XMenu']
-        menu = attach_uia_control(unique(menus, '月份菜单'))
+        menu = one_window('mmui::XMenu')
         menu_context = context_for(menu, chat)
         for _ in range(20):
             option = unique([node for node in walk(menu.control) if node.ControlTypeName == 'MenuItemControl'
@@ -230,27 +237,47 @@ def select_day(adapter, history, chat, session_id, day, *, sunday_first=False):
             center_y = (rect[1] + rect[3]) // 2
             if viewport[1] + 8 <= center_y <= viewport[3] - 8:
                 break
-            adapter._check_point(menu_context, (viewport[0] + viewport[2]) // 2,
-                                 (viewport[1] + viewport[3]) // 2)
-            (menu.control.WheelUp if center_y < viewport[1] + 8 else menu.control.WheelDown)(wheelTimes=1)
-            time.sleep(0.1)
+            # 临时菜单不能激活；向已核验窗口投递滚轮后重新读取选项矩形。
+            validated_window_wheel(adapter, menu_context, menu.control,
+                                   older=center_y < viewport[1] + 8, steps=1, activate=False)
+            time.sleep(0.2)
         else:
-            # 菜单在部分会话中不响应滚轮，使用控件的语义调用并在下方核验月份。
-            option.GetInvokePattern().Invoke()
-        if viewport[1] + 8 <= center_y <= viewport[3] - 8:
-            # 激活临时菜单窗口会使其关闭；直接校验当前可点击层级后点击。
-            adapter._check_point(menu_context, (rect[0] + rect[2]) // 2, (rect[1] + rect[3]) // 2)
-            validated_window_click(adapter, menu_context, option)
-        calendar = one_window('mmui::XPopover')
-        context = context_for(calendar, chat)
-        if not any(node.ControlTypeName == 'TextControl' and node.Name == f'{day.month}月'
+            raise ChatAutomationError(f'月份菜单目标 {day.month}月未进入可见区域；'
+                                      f'选项={rect}，菜单={bounds}')
+        validated_window_point_click(adapter, menu_context, (rect[0] + rect[2]) // 2,
+                                     center_y, activate=False)
+        for _ in range(15):
+            calendar = one_window('mmui::XPopover')
+            if any(node.ControlTypeName == 'TextControl' and node.Name == f'{day.month}月'
                    for node in walk(calendar.control)):
+                break
+            time.sleep(0.2)
+        else:
             raise ChatAutomationError(f'月份菜单未切换到 {day.month}月')
+        context = context_for(calendar, chat)
     panel = unique([node for node in walk(calendar.control) if node.ClassName == 'mmui::DateNumPanel'],
                    '日历日期面板')
-    x, y = calendar_day_point(day, rect_to_tuple(panel.BoundingRectangle),
+    panel_bounds = rect_to_tuple(panel.BoundingRectangle)
+    x, y = calendar_day_point(day, panel_bounds,
                               sunday_first=sunday_first)
+    print(f'{day}: 日历面板={panel_bounds}，日期坐标=({x}, {y})，周日首列={sunday_first}', flush=True)
     validated_window_point_click(adapter, context, x, y)
+    time.sleep(0.2)
+    try:
+        remaining = one_window('mmui::XPopover')
+    except ChatAutomationError as exc:
+        if '实际找到 0 个' not in str(exc):
+            raise
+        print(f'{day}: 日期点击后弹层已关闭', flush=True)
+    else:
+        if remaining.handle != calendar.handle:
+            raise ChatAutomationError('日期弹层已改变，停止确认')
+        confirms = [node for node in walk(remaining.control)
+                    if node.ControlTypeName == 'ButtonControl' and node.Name == '确定']
+        if confirms:
+            print(f'{day}: 确认日期选择', flush=True)
+            validated_window_click(adapter, context_for(remaining, chat),
+                                   unique(confirms, '日期确认按钮'))
     heading = f'{day.year}年{day.month}月{day.day}日'
     try:
         return wait_for_date_heading(session_id, heading)
