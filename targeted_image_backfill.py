@@ -13,7 +13,8 @@
 # version: 2.1 @20260930: 未定位图片时记录目标与可见图片时间，便于区分列表缺失和格式变化;
 # version: 2.2 @20260930: 日期校验失败时按周日首列重新定位日历，适配微信布局变化;
 # version: 2.3 @20260930: 未定位目标另存结构化诊断，避免监控正文截断后丢失证据;
-__version__ = 'v2.3'
+# version: 2.4 @20261010: 日期标题滞留前一天时按附件行末时间核验，避免误报筛选失败;
+__version__ = 'v2.4'
 __platform__ = 'nt'
 __pc__ = ['PW']
 __py__ = 'py3.11+'
@@ -32,7 +33,7 @@ import sys
 import time
 
 from chat_attachments import DEFAULT_EXPORT_ROOT, LOG_DIR, task_lock
-from src.modules.window.wechat_chat_adapter import ChatContext, WechatChatAdapter, walk, unique
+from src.modules.window.wechat_chat_adapter import ChatContext, WechatChatAdapter, message_day, walk, unique
 from src.modules.window.wechat_home_window_finder import attach_uia_control, enumerate_desktop_windows, rect_to_tuple
 from src.services.chat_attachment_service import ChatAutomationError
 from src.services.wechat_attachment_inventory import load_inventory
@@ -40,6 +41,8 @@ from src.services.wechat_attachment_inventory import load_inventory
 
 PREVIEW_ID = re.compile(r'^PreviewWindow_(.+)_(\d+)_(\d+)_\d+_\d+$')
 IMAGE_ROW = re.compile(r'^图片 .+ (\d{2}:\d{2})$')
+ROW_DATE = re.compile(r'(?:^|\s)((?:(?:\d{4}年)?\d{1,2}月\d{1,2}日(?:\s+星期[一二三四五六日天])?'
+                      r'|今天|昨天|前天|星期[一二三四五六日天])\s+\d{1,2}:\d{2})$')
 ATTEMPT_LOG = LOG_DIR / 'targeted_image_attempts.jsonl'
 
 
@@ -259,15 +262,28 @@ def select_day(adapter, history, chat, session_id, day, *, sunday_first=False):
 
 
 def wait_for_date_heading(session_id, heading):
-    """等待微信异步刷新日期结果，失败时保留实际标题供排查。"""
+    """用日期标题或附件行末日期核验结果，兼容顶部保留前一天分隔条。"""
+    today = date.today()
+    target_day = message_day(heading, today)
     observed = set()
     for _ in range(15):
         time.sleep(0.2)
         history = one_window('mmui::SearchMsgUniqueChatWindow', session_id=session_id)
-        labels = {node.Name for node in walk(history.control)
+        nodes = walk(history.control)
+        labels = {node.Name for node in nodes
                   if node.ControlTypeName == 'TextControl'}
         if heading in labels:
             return history
+        # 跳到稀疏消息日期时，微信可能沿用上一条分隔标题；附件时间仍是目标日。
+        for listing in nodes:
+            if listing.ControlTypeName != 'ListControl' or listing.AutomationId != 'search_message_list':
+                continue
+            for row in listing.GetChildren():
+                if not row.Name.startswith(('图片 ', '文件 ', '聊天记录')):
+                    continue
+                stamp = ROW_DATE.search(row.Name)
+                if stamp and target_day is not None and message_day(stamp.group(1), today) == target_day:
+                    return history
         observed.update(name for name in labels
                         if re.fullmatch(r'\d{4}年\d{1,2}月\d{1,2}日', name))
     shown = ', '.join(sorted(observed)) or '未显示日期标题'

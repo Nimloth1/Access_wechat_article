@@ -5,6 +5,7 @@ from datetime import date
 import json
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
+import pytest
 
 from targeted_image_backfill import (
     IMAGE_ROW,
@@ -73,6 +74,48 @@ def test_wait_for_date_heading_reports_actual_date_on_failure():
             assert '页面日期=2026年9月28日' in str(exc)
         else:
             raise AssertionError('expected date mismatch')
+
+
+@pytest.mark.parametrize('label', [
+    '图片 昨天 09:17',
+    '图片 星期五 09:17',
+    '图片 10月9日 09:17',
+    '文件 2026年10月9日 星期五 09:17',
+    '聊天记录\n群聊的聊天记录\n昨天 09:17',
+])
+def test_date_selection_accepts_target_row_below_previous_day_heading(label):
+    """微信保留上一条日期标题时，用附件行末的明确日期核验目标日。"""
+    history = SimpleNamespace(control=object())
+    old = SimpleNamespace(ControlTypeName='TextControl', Name='2026年10月8日')
+    listing = SimpleNamespace(ControlTypeName='ListControl', AutomationId='search_message_list',
+                              GetChildren=lambda: [SimpleNamespace(Name=label)])
+    with patch('targeted_image_backfill.one_window', return_value=history), \
+            patch('targeted_image_backfill.walk', return_value=[old, listing]), \
+            patch('targeted_image_backfill.date', wraps=date) as clock, \
+            patch('targeted_image_backfill.time.sleep'):
+        clock.today.return_value = date(2026, 10, 10)
+        assert wait_for_date_heading('chat-id', '2026年10月9日') is history
+
+
+@pytest.mark.parametrize('label', [
+    '图片 前天 09:17',
+    '图片 09:17',
+    '图片 10月9日 内容里的日期 10月8日 09:17',
+    '文本 昨天 09:17',
+])
+def test_date_selection_rejects_rows_without_target_attachment_date(label):
+    """正文日期、纯时刻和其他日期不能替代目标附件的明确时间标签。"""
+    history = SimpleNamespace(control=object())
+    old = SimpleNamespace(ControlTypeName='TextControl', Name='2026年10月8日')
+    listing = SimpleNamespace(ControlTypeName='ListControl', AutomationId='search_message_list',
+                              GetChildren=lambda: [SimpleNamespace(Name=label)])
+    with patch('targeted_image_backfill.one_window', return_value=history), \
+            patch('targeted_image_backfill.walk', return_value=[old, listing]), \
+            patch('targeted_image_backfill.date', wraps=date) as clock, \
+            patch('targeted_image_backfill.time.sleep'):
+        clock.today.return_value = date(2026, 10, 10)
+        with pytest.raises(ChatAutomationError, match='页面日期=2026年10月8日'):
+            wait_for_date_heading('chat-id', '2026年10月9日')
 
 
 def test_expired_attempts_only_skips_confirmed_expiry(tmp_path):
