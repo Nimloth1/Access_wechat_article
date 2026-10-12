@@ -297,3 +297,15 @@ def test_auto_accessibility_precedes_activation_and_restores(monkeypatch):
             assert diagnostic['compatibility_used']
             raise RuntimeError('任务失败')
     assert not enabled[0]
+
+
+def test_diagnose_external_desktop_lock_is_409(monkeypatch):
+    """另一个进程占用共享桌面锁时明确返回 409，不误报服务或微信就绪。"""
+    import chat_attachments
+    monkeypatch.setattr(chat_attachments, 'task_lock', Mock(
+        side_effect=RuntimeError('另一个附件任务正在运行，请先停止它')))
+    with TestClient(create_agent_app(token='test', runner=Mock())) as client:
+        assert client.get('/agent/v2/health', headers=AUTH).json()['active_job'] is None
+        response = client.get('/agent/v2/diagnose', headers=AUTH)
+        assert response.status_code == 409
+        assert '另一个附件任务' in response.json()['detail']

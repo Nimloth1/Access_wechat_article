@@ -32,7 +32,7 @@
 | 查询、等待、取消任务 | `status JOB_ID`、`wait JOB_ID`、`cancel JOB_ID` | 中断 SSH/客户端不会自动取消任务 |
 | 聊天日期定位与可见消息动作 | `chat-v2`、`chat-action` | API 提供，未作为本轮公众号采集的实机验收项；不是完整聊天导出 |
 
-本轮实机已自动打开 13 个公众号主页；新增归档 269 篇，96 个缺正文目标取得 50 个（45 个新抓、5 个旧归档），46 个未取得。不能保证账号主页展示所有目标，也不能仅凭未找到就判定文章已删除。
+2026-10-11 批次实机已自动打开 13 个公众号主页；新增归档 269 篇，96 个缺正文目标取得 50 个（45 个新抓、5 个旧归档），46 个未取得。2026-10-12 的两次服务重启后，404K 标准两篇命令均 completed，额外重抓两篇正文验证成功。不能保证账号主页展示所有目标，也不能仅凭未找到就判定文章已删除。
 
 ## PM 上调用的最小示例
 
@@ -92,6 +92,8 @@ $taskAwaArgs = @('content', 'ARTICLE_ID')
 ## 获取现有交接资料与正文
 
 本轮交接目录：`D:\projects\d\access_wechat_article\output\weress-capture-20261011`。
+
+新恢复复测及最新 52 篇队列补抓目录：`D:\projects\d\access_wechat_article\output\weress-capture-20261012`。读取该目录 `handoff.json`、`targets-52.csv`、`report.md`；旧目录用于历史对照，不代表当前 WeRSS 缺失清单。新交接逐目标包含 `werss_id`、`awa_id`、`awa_url`、`archive_path`、`html_path`、`body_caption_path`（若有）、`match_basis`、`body_valid`。`captured` 为本轮新增匹配，`existing` 为旧归档验证可用；`not_obtained` / `body_empty` 不计正文成功。已有归档也需 PM 确认尚未回填，匹配需核对。
 
 | 文件 | 内容 |
 | --- | --- |

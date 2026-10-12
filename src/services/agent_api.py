@@ -149,8 +149,13 @@ def desktop_diagnose(mode):
     from chat_attachments import task_lock
     from src.modules.window.wechat_chat_adapter import WechatChatAdapter
 
-    with task_lock(), auto.UIAutomationInitializerInThread():
-        return WechatChatAdapter().account_diagnose(mode)
+    try:
+        with task_lock(), auto.UIAutomationInitializerInThread():
+            return WechatChatAdapter().account_diagnose(mode)
+    except RuntimeError as exc:
+        if str(exc) == '另一个附件任务正在运行，请先停止它':
+            raise JobConflict(str(exc)) from exc
+        raise
 
 
 def create_agent_app(backend=None, *, token, runner=None, diagnoser=None):
