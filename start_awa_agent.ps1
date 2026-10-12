@@ -7,7 +7,10 @@ $env:PYTHONIOENCODING = 'utf-8'
 if (-not $env:AWA_AGENT_TOKEN) { throw 'AWA_AGENT_TOKEN is not configured for this user' }
 $taskLogDirectory = Join-Path $PSScriptRoot 'data\logs'
 New-Item -ItemType Directory -Path $taskLogDirectory -Force | Out-Null
-& "$PSScriptRoot\.venv\Scripts\python.exe" "$PSScriptRoot\awa_agent.py" serve `
-    1>> "$taskLogDirectory\awa_agent_serve.out.log" `
-    2>> "$taskLogDirectory\awa_agent_serve.err.log"
-exit $LASTEXITCODE
+$taskLaunchStamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+$taskProcess = Start-Process -FilePath "$PSScriptRoot\.venv\Scripts\python.exe" `
+    -ArgumentList ('"{0}" serve' -f "$PSScriptRoot\awa_agent.py") `
+    -WorkingDirectory $PSScriptRoot -WindowStyle Hidden -Wait -PassThru `
+    -RedirectStandardOutput "$taskLogDirectory\awa_agent_serve-$taskLaunchStamp.out.log" `
+    -RedirectStandardError "$taskLogDirectory\awa_agent_serve-$taskLaunchStamp.err.log"
+exit $taskProcess.ExitCode

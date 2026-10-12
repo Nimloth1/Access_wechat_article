@@ -309,3 +309,30 @@ def test_diagnose_external_desktop_lock_is_409(monkeypatch):
         response = client.get('/agent/v2/diagnose', headers=AUTH)
         assert response.status_code == 409
         assert '另一个附件任务' in response.json()['detail']
+
+
+def test_real_windows_lock_conflict_before_marker_read(monkeypatch, tmp_path):
+    """真实跨进程锁验证：锁标记读取失败也必须归为共享桌面冲突。"""
+    import os
+    import subprocess
+    import sys
+    import chat_attachments
+    if os.name != 'nt':
+        pytest.skip('需要 Windows msvcrt 文件锁')
+    monkeypatch.setattr(chat_attachments, 'LOG_DIR', tmp_path)
+    code = '''import sys
+from pathlib import Path
+import chat_attachments
+chat_attachments.LOG_DIR = Path(sys.argv[1])
+try:
+    with chat_attachments.task_lock():
+        raise AssertionError('不应取得第二把锁')
+except RuntimeError as exc:
+    print(str(exc))
+'''
+    with chat_attachments.task_lock():
+        child = subprocess.run([sys.executable, '-c', code, str(tmp_path)],
+                               capture_output=True, text=True, encoding='utf-8', timeout=10,
+                               env={**os.environ, 'PYTHONIOENCODING': 'utf-8'})
+    assert child.returncode == 0, child.stderr
+    assert '另一个附件任务正在运行' in child.stdout

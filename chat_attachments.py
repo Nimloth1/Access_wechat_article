@@ -187,12 +187,12 @@ def task_lock():
         raise RuntimeError('聊天附件操作仅支持 Windows') from exc
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     with (LOG_DIR / 'task.lock').open('a+b') as lock:
-        lock.seek(0)
-        if not lock.read(1):
-            lock.write(b'0')
-            lock.flush()
-        lock.seek(0)
         try:
+            lock.seek(0)
+            if not lock.read(1):
+                lock.write(b'0')
+                lock.flush()
+            lock.seek(0)
             msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
         except OSError as exc:
             raise RuntimeError('另一个附件任务正在运行，请先停止它') from exc
