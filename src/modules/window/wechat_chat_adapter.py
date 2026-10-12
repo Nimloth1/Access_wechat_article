@@ -10,6 +10,7 @@
 # version: 2.9 @20260923: 从公众号等非聊天页可通过左侧会话搜索切换到指定对话;
 # version: 3.0 @20260923: 排除微信日期弹窗，前台切换瞬断时有限重试;
 # version: 3.1 @20260926: 会话搜索结果支持无物理远控鼠标的窗口消息点击;
+# version: 3.2 @20261012: 公众号任务兼容读屏、最小化恢复及独立账号窗口导航;
 """微信聊天 UIA 适配器；控件不可见、身份不明确时停止，不用盲点兜底。"""
 from __future__ import annotations
 
@@ -185,13 +186,67 @@ class WechatChatAdapter:
 
     def _locate_main(self) -> Any:
         """Locate the WeChat shell without requiring readable UIA descendants."""
-        windows = [w for w in enumerate_desktop_windows()
+        self.main = attach_uia_control(unique(self._main_windows(), "微信主窗口"))
+        return self.main
+
+    def _main_windows(self) -> list[Any]:
+        """只匹配微信主壳；允许任务恢复最小化窗口，排除日期和账号弹窗。"""
+        return [w for w in enumerate_desktop_windows()
                    if w.process_name.lower() in {"weixin.exe", "wechat.exe"}
                    and w.title in {"微信", "Weixin", "WeChat"}
-                   and w.class_name == "Qt51514QWindowIcon" and w.visible and not w.is_minimized
-                   and w.rect[2] - w.rect[0] >= 400 and w.rect[3] - w.rect[1] >= 400]
-        self.main = attach_uia_control(unique(windows, "微信主窗口"))
-        return self.main
+                   and w.class_name == "Qt51514QWindowIcon" and w.visible
+                   and (w.is_minimized or
+                        w.rect[2] - w.rect[0] >= 400 and w.rect[3] - w.rect[1] >= 400)]
+
+    def _search_edits(self, nodes: list[Any]) -> list[Any]:
+        """只计数左侧会话搜索框，排除群成员搜索。"""
+        return [n for n in nodes if n.ControlTypeName == 'EditControl'
+                and n.ClassName == 'mmui::XValidatorTextEdit'
+                and n.Name in {'搜索', 'Search', '搜尋'} and is_chat_list_search(n)]
+
+    @contextmanager
+    def account_accessibility(self, mode: str = 'auto', *, activate: bool = False):
+        """必要时启用已核验兼容读屏，整个采集结束后恢复；诊断不激活窗口。"""
+        self._locate_main()
+        raw_nodes = walk(self.main.control)
+        raw_count = len(self._search_edits(raw_nodes))
+        enabled = mode == 'on' or mode == 'auto' and raw_count == 0
+        with self.compatibility(enabled):
+            # 空壳 UIA 的 SetActive 可能阻塞，先启用读屏，再激活并刷新窗口。
+            if activate:
+                self._activate(ChatContext(self.main, '', switching=True))
+                self.main = self._window(self.main)
+            nodes = walk(self.main.control) if enabled else raw_nodes
+            count = len(self._search_edits(nodes))
+            yield dict(wechat_ready=count == 1 and not self.main.is_minimized,
+                       main_window_count=1, search_edit_count=count,
+                       raw_search_edit_count=raw_count, node_count=len(nodes),
+                       compatibility_used=enabled, accessibility=mode,
+                       detail='微信搜索框可读' if count == 1 else '微信会话搜索框不可唯一识别')
+
+    def account_diagnose(self, mode: str = 'auto') -> dict:
+        """检查交互桌面及公众号搜索能力；不暴露聊天正文，不切换账号。"""
+        result = dict(wechat_ready=False, main_window_count=0, search_edit_count=0,
+                      compatibility_used=False, accessibility=mode)
+        try:
+            user32 = ctypes.WinDLL('user32', use_last_error=True)
+            user32.OpenInputDesktop.argtypes = [ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
+            user32.OpenInputDesktop.restype = ctypes.c_void_p
+            user32.CloseDesktop.argtypes = [ctypes.c_void_p]
+            desktop = user32.OpenInputDesktop(0, False, 0x100)
+            if not desktop:
+                raise ChatAutomationError('桌面不可交互，请解锁 Windows')
+            user32.CloseDesktop(desktop)
+            windows = self._main_windows()
+            result['main_window_count'] = len(windows)
+            window = unique(windows, '微信主窗口')
+            if window.is_minimized:
+                raise ChatAutomationError('微信主窗口已最小化；任务可自动恢复后重查')
+            with self.account_accessibility(mode) as probe:
+                result.update(probe)
+        except Exception as exc:
+            result.update(wechat_ready=False, detail=f'{type(exc).__name__}: {exc}')
+        return result
 
     def _pause(self, seconds: float) -> None:
         """短间隔等待以响应取消。"""
@@ -516,8 +571,20 @@ class WechatChatAdapter:
 
     def open_account(self, name: str) -> None:
         """精确搜索本地公众号会话，通过明确的历史消息入口打开主页。"""
-        context = self.open_chat(name)
-        labels = {'查看历史消息', '历史消息', '全部消息', 'View History', 'All Messages'}
+        try:
+            context = self.open_chat(name)
+        except ChatAutomationError as exc:
+            if str(exc) != '未在等待时间内确认目标对话已打开':
+                raise
+            # 搜索已唯一命中目标，但新版微信可能将公众号打开在独立窗口。
+            windows = [w for w in enumerate_desktop_windows()
+                       if w.title == name and w.process_name.lower() in {'weixin.exe', 'wechat.exe'}
+                       and w.visible and not w.is_minimized]
+            window = attach_uia_control(unique(windows, '独立公众号窗口'))
+            if window.control.ProcessId != self.main.control.ProcessId:
+                raise ChatAutomationError('独立公众号窗口不属于当前微信进程')
+            context = ChatContext(window, name, switching=True)
+        labels = {'公众号主页', '查看历史消息', '历史消息', '全部消息', 'View History', 'All Messages'}
         entries = [n for n in self._nodes(context) if n.ControlTypeName in {'ButtonControl', 'HyperlinkControl'}
                    and n.Name.strip() in labels and not n.IsOffscreen]
         if not entries:
@@ -527,7 +594,11 @@ class WechatChatAdapter:
             self._pause(0.5)
             entries = [n for n in self._nodes(context) if n.ControlTypeName in {'ButtonControl', 'HyperlinkControl'}
                        and n.Name.strip() in labels and not n.IsOffscreen]
-        self._click(context, unique(entries, '公众号历史消息入口'))
+        entry = unique(entries, '公众号历史消息入口')
+        if entry.Name.strip() == '公众号主页':
+            self._post_click(context, entry)
+        else:
+            self._click(context, entry)
         self._pause(1)
 
     def _expand_dates(self, context: ChatContext, listing: Any = None) -> None:

@@ -195,3 +195,105 @@ def test_v2_cli(monkeypatch, capsys):
     assert call.call_args.args[0] == 'chat-actions'
     assert awa_agent.main(['content', '1']) == 0
     assert call.call_args.args[0] == 'articles/1/content'
+
+
+def test_diagnose_auth_readiness_busy_and_cli(monkeypatch):
+    """服务可达不等于微信就绪；占用时不允许触碰读屏标志。"""
+    import awa_agent
+    probe = Mock(return_value={'wechat_ready': False, 'search_edit_count': 0, 'main_window_count': 1})
+    app = create_agent_app(token='test', runner=Mock(), diagnoser=probe)
+    with TestClient(app) as client:
+        assert client.get('/agent/v2/diagnose').status_code == 401
+        result = client.get('/agent/v2/diagnose', headers=AUTH).json()
+        assert result['service_ready'] and not result['wechat_ready']
+        assert client.get('/agent/v2/diagnose?accessibility=bad', headers=AUTH).status_code == 422
+        app.state.jobs.active = 'busy'
+        assert client.get('/agent/v2/diagnose', headers=AUTH).status_code == 409
+        assert probe.call_count == 1
+        app.state.jobs.active = None
+    monkeypatch.setenv('AWA_AGENT_TOKEN', 'test')
+    monkeypatch.setattr(awa_agent, 'call_api', Mock(return_value=result))
+    assert awa_agent.main(['diagnose']) == 1
+    result['wechat_ready'] = True
+    assert awa_agent.main(['diagnose', '--accessibility', 'on']) == 0
+    assert awa_agent.call_api.call_args.args[0] == 'diagnose?accessibility=on'
+
+
+def test_article_compatibility_restores_on_navigation_failure(monkeypatch):
+    """导航错误不能启动采集，并必须退出兼容上下文恢复微信状态。"""
+    import chat_attachments
+    import uiautomation
+    from contextlib import contextmanager
+    states = []
+    @contextmanager
+    def compatibility(self, mode, *, activate):
+        """模拟已核验的运行时兼容开关。"""
+        states.append(('enabled', mode, activate))
+        try:
+            yield {'wechat_ready': True}
+        finally:
+            states.append('restored')
+    monkeypatch.setattr(chat_attachments, 'task_lock', nullcontext)
+    monkeypatch.setattr(uiautomation, 'UIAutomationInitializerInThread', nullcontext)
+    monkeypatch.setattr(WechatChatAdapter, 'account_accessibility', compatibility)
+    monkeypatch.setattr(WechatChatAdapter, 'open_account', Mock(side_effect=RuntimeError('导航失败')))
+    backend = SimpleNamespace(main_flow_service=Mock())
+    with pytest.raises(RuntimeError, match='导航失败'):
+        desktop_runner(backend)('article', {'account': '号', 'open_account': True, 'accessibility': 'auto'}, Event())
+    assert states == [('enabled', 'auto', True), 'restored']
+    backend.main_flow_service.start.assert_not_called()
+
+
+def test_independent_account_window_requires_exact_name_and_process(monkeypatch):
+    """仅搜索唯一命中后打开的同进程、同名称公众号窗口可进入主页。"""
+    import src.modules.window.wechat_chat_adapter as module
+    adapter = WechatChatAdapter.__new__(WechatChatAdapter)
+    adapter.main = SimpleNamespace(control=SimpleNamespace(ProcessId=123))
+    adapter.open_chat = Mock(side_effect=ChatAutomationError('未在等待时间内确认目标对话已打开'))
+    window = SimpleNamespace(title='404K', process_name='Weixin.exe', visible=True,
+                             is_minimized=False, control=SimpleNamespace(ProcessId=123))
+    monkeypatch.setattr(module, 'enumerate_desktop_windows', lambda: [window])
+    monkeypatch.setattr(module, 'attach_uia_control', lambda w: w)
+    button = SimpleNamespace(Name='公众号主页', ControlTypeName='ButtonControl', IsOffscreen=False)
+    adapter._nodes, adapter._post_click, adapter._pause = Mock(return_value=[button]), Mock(), Mock()
+    adapter.open_account('404K')
+    assert adapter._post_click.call_args.args[0].window is window
+    adapter._post_click.reset_mock()
+    window.control.ProcessId = 456
+    with pytest.raises(ChatAutomationError, match='不属于当前微信'):
+        adapter.open_account('404K')
+    adapter._post_click.assert_not_called()
+    adapter.open_chat.side_effect = ChatAutomationError('对话搜索框需要唯一匹配，实际找到 0 个')
+    with pytest.raises(ChatAutomationError, match='搜索框'):
+        adapter.open_account('404K')
+    adapter._post_click.assert_not_called()
+
+
+def test_auto_accessibility_precedes_activation_and_restores(monkeypatch):
+    """空壳窗口激活前先启用兼容；异常退出必须恢复原值。"""
+    import src.modules.window.wechat_chat_adapter as module
+    from contextlib import contextmanager
+    enabled = [False]
+    @contextmanager
+    def temporary(pid):
+        """模拟兼容读屏位及正常异常恢复。"""
+        enabled[0] = True
+        try:
+            yield
+        finally:
+            enabled[0] = False
+    window = SimpleNamespace(control=SimpleNamespace(ProcessId=123), is_minimized=False)
+    adapter = WechatChatAdapter.__new__(WechatChatAdapter)
+    adapter.main = window
+    adapter._locate_main = Mock()
+    adapter._window = Mock(return_value=window)
+    adapter._search_edits = lambda nodes: nodes
+    adapter._activate = lambda context: enabled[0] or pytest.fail('空壳激活前未启用兼容')
+    monkeypatch.setattr(module, 'walk', lambda control: [object()] if enabled[0] else [])
+    monkeypatch.setattr(module, 'temporary_accessibility', temporary)
+    with pytest.raises(RuntimeError, match='任务失败'):
+        with adapter.account_accessibility('auto', activate=True) as diagnostic:
+            assert diagnostic['wechat_ready'] and diagnostic['search_edit_count'] == 1
+            assert diagnostic['compatibility_used']
+            raise RuntimeError('任务失败')
+    assert not enabled[0]

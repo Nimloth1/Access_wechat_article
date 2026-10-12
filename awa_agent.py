@@ -1,10 +1,11 @@
 # encoding: UTF-8
 # version: 1.0 @20260920: 增加本机 Agent 服务和 JSON 命令行客户端;
 # version: 2.0 @20260920: 增加公众号自动导航、可见消息操作和归档正文读取;
+# version: 2.1 @20261012: 固化 MTA 主线程初始化，增加微信就绪诊断和兼容读屏选项;
 """PW 交互桌面运行 serve；SSH 会话运行其余客户端命令。"""
 from __future__ import annotations
 
-__version__ = 'v2.0'
+__version__ = 'v2.1'
 __platform__ = 'both'
 __pc__ = ['PW', 'AW', 'BW', 'UU', 'PM']
 __py__ = 'py3.13+'
@@ -27,6 +28,8 @@ def parse_args(argv=None):
     sub = parser.add_subparsers(dest='command', required=True)
     sub.add_parser('serve', help='仅在已登录、未锁屏的 Windows 桌面启动')
     sub.add_parser('health')
+    diagnostic = sub.add_parser('diagnose', help='检查微信搜索控件；不切换对话')
+    diagnostic.add_argument('--accessibility', choices=['auto', 'off', 'on'], default='auto')
     chat = sub.add_parser('chat', aliases=['chat-v2'])
     chat.add_argument('--chat', required=True)
     chat.add_argument('--date', required=True)
@@ -40,6 +43,7 @@ def parse_args(argv=None):
     article.add_argument('--archive-offline', action='store_true')
     article.add_argument('--include-collected', action='store_true')
     article.add_argument('--already-open', action='store_true', help='V2 跳过自动打开公众号')
+    article.add_argument('--accessibility', choices=['auto', 'off', 'on'], default='auto', help='V2 兼容读屏模式')
     action = sub.add_parser('chat-action')
     action.add_argument('--chat', required=True)
     action.add_argument('--action', choices=['read', 'scroll', 'click'], default='read')
@@ -91,7 +95,10 @@ def serve(token):
     """先独占默认端口，再初始化数据库和队列，避免与 GUI 后端争用。"""
     if os.name != 'nt':
         raise RuntimeError('服务端仅支持 Windows；客户端可跨平台调用')
+    # UIA 客户端为进程单例，必须在存活的 MTA 主线程创建，不能由短命请求线程首次创建。
+    sys.coinit_flags = 0
     try:
+        import uiautomation as auto
         import uvicorn
         from dev_server import create_dev_backend
         from src.services.agent_api import create_agent_app
@@ -101,6 +108,7 @@ def serve(token):
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
         listener.bind(('127.0.0.1', 8766))
         listener.listen(128)
+        auto.GetRootControl()
         backend = create_dev_backend(project_root=Path(__file__).resolve().parent)
         app = create_agent_app(backend, token=token)
         print('awa_agent ' + __version__ + ' http://127.0.0.1:8766', file=sys.stderr)
@@ -127,6 +135,8 @@ def main(argv=None):
                 already_open = payload.pop('already_open')
                 if args.command == 'articles-v2':
                     payload['open_account'] = not already_open
+                else:
+                    payload.pop('accessibility')
             path = 'chat-actions' if args.command == 'chat-action' else (
                 'chat-jobs' if args.command.startswith('chat') else 'article-jobs')
             options = {'version': 2} if args.command.endswith('-v2') or args.command == 'chat-action' else {}
@@ -143,10 +153,13 @@ def main(argv=None):
             result = call_api(f'accounts/{args.account_id}/articles?page={args.page}', token)
         elif args.command == 'content':
             result = call_api(f'articles/{args.article_id}/content', token, version=2)
+        elif args.command == 'diagnose':
+            result = call_api('diagnose?accessibility=' + args.accessibility, token, version=2)
         else:
             result = call_api(args.command, token)
         print(json.dumps(result, ensure_ascii=False))
-        return 1 if result.get('status') in {'failed', 'cancelled', 'timed_out'} else 0
+        return 1 if (result.get('status') in {'failed', 'cancelled', 'timed_out'} or
+                     args.command == 'diagnose' and not result.get('wechat_ready')) else 0
     except HTTPError as exc:
         print(json.dumps({'error': 'http_error', 'status': exc.code,
                           'detail': exc.read().decode('utf-8', errors='replace')}, ensure_ascii=False))

@@ -2,9 +2,10 @@
 """仅供本机 Agent 客户端使用的桌面任务 API。"""
 from __future__ import annotations
 
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, ExitStack
 from datetime import date
 import secrets
+import time
 from typing import Literal
 
 try:
@@ -44,6 +45,7 @@ class ArticleRequest(JobRequest):
 class ArticleRequestV2(ArticleRequest):
     """默认自动打开公众号，也允许复用手动打开的主页。"""
     open_account: bool = True
+    accessibility: Literal['auto', 'off', 'on'] = 'auto'
 
 
 class ChatAction(JobRequest):
@@ -65,7 +67,7 @@ def desktop_runner(backend):
         from src.modules.window.wechat_chat_adapter import WechatChatAdapter
         from src.services.main_flow.main_flow_models import MainFlowCommand
 
-        with task_lock(), auto.UIAutomationInitializerInThread():
+        with task_lock(), auto.UIAutomationInitializerInThread(), ExitStack() as scope:
             if stop.is_set():
                 return {'reason': 'cancelled'}
             if kind in {'chat', 'chat_v2', 'chat_action'}:
@@ -74,9 +76,23 @@ def desktop_runner(backend):
                     if kind == 'chat_action':
                         return run_chat_action(adapter, request, stop)
                     return navigate_chat(adapter, request, stop)
+            adapter = WechatChatAdapter(stop)
+            diagnostic = None
+            if 'accessibility' in request:
+                diagnostic = scope.enter_context(adapter.account_accessibility(
+                    request['accessibility'], activate=True))
+                if not diagnostic['wechat_ready']:
+                    raise RuntimeError(diagnostic['detail'])
             if request.get('open_account'):
-                WechatChatAdapter(stop).open_account(request['account'])
-            probe = backend.article_detail_card_probe_service.read_first_visible_card()
+                adapter.open_account(request['account'])
+            deadline = time.monotonic() + (10 if request.get('open_account') else 0)
+            while True:
+                probe = backend.article_detail_card_probe_service.read_first_visible_card()
+                if probe.get('ok') and probe.get('accountName') == request['account']:
+                    break
+                if stop.is_set() or time.monotonic() >= deadline:
+                    break
+                stop.wait(0.25)
             if not probe.get('ok'):
                 raise RuntimeError(probe.get('message', '无法读取公众号主页'))
             if probe.get('accountName') != request['account']:
@@ -96,7 +112,10 @@ def desktop_runner(backend):
                 raise RuntimeError(snapshot.message)
             if snapshot.status == 'cancelled':
                 stop.set()
-            return snapshot.to_payload()
+            result = snapshot.to_payload()
+            if diagnostic is not None:
+                result['wechat_diagnostic'] = diagnostic
+            return result
     return run
 
 
@@ -124,8 +143,18 @@ def run_chat_action(adapter, request, stop):
     return adapter.page_snapshot(context)
 
 
-def create_agent_app(backend=None, *, token, runner=None):
-    """创建独立 Agent API；不注册配置修改、删除归档或诊断接口。"""
+def desktop_diagnose(mode):
+    """在桌面互斥和 COM 初始化内检测微信；不读取文章或聊天正文。"""
+    import uiautomation as auto
+    from chat_attachments import task_lock
+    from src.modules.window.wechat_chat_adapter import WechatChatAdapter
+
+    with task_lock(), auto.UIAutomationInitializerInThread():
+        return WechatChatAdapter().account_diagnose(mode)
+
+
+def create_agent_app(backend=None, *, token, runner=None, diagnoser=None):
+    """创建独立 Agent API；诊断和任务共用互斥，不注册配置修改或删除接口。"""
     if not token:
         raise ValueError('AWA_AGENT_TOKEN 不能为空')
     jobs = AgentJobs(runner or desktop_runner(backend))
@@ -142,7 +171,7 @@ def create_agent_app(backend=None, *, token, runner=None):
                 from dev_server import shutdown_backend
                 await run_in_threadpool(shutdown_backend, backend)
 
-    app = FastAPI(title='WeChat Agent API', version='2.0', lifespan=lifespan)
+    app = FastAPI(title='WeChat Agent API', version='2.1', lifespan=lifespan)
     app.state.jobs = jobs
 
     @app.middleware('http')
@@ -163,7 +192,15 @@ def create_agent_app(backend=None, *, token, runner=None):
     @app.get('/agent/v2/health')
     def health():
         """说明服务可达，不宣称微信桌面已就绪。"""
-        return {'status': 'ready', 'active_job': jobs.active, 'version': '2.0'}
+        return {'status': 'ready', 'active_job': jobs.active, 'version': '2.1'}
+
+    @app.get('/agent/v2/diagnose')
+    def diagnose(accessibility: Literal['auto', 'off', 'on'] = 'auto'):
+        """独立的微信就绪检查；任务占用时拒绝诊断，避免兼容标志并发修改。"""
+        with jobs.lock:
+            if jobs.active or jobs.closing:
+                raise JobConflict('桌面任务正在运行或服务正在关闭，暂不诊断')
+            return {'service_ready': True, **(diagnoser or desktop_diagnose)(accessibility)}
 
     @app.post('/agent/v2/chat-jobs', status_code=202)
     def chat_v2(payload: ChatRequest, idempotency_key: str | None = Header(default=None, max_length=200)):

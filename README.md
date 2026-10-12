@@ -61,6 +61,8 @@ V1 提供本机 API 与 JSON CLI，支持群聊日期定位、向历史滚动，
 
 V2 增加公众号自动导航、可见消息文本及按标识继续滚动/单击、归档正文读取，并兼容 V1。使用方式和支持边界见 [Agent API / CLI V2](doc/agent-api-v2.md)。
 
+V2.1 固化主线程 MTA/UIA 初始化、兼容读屏和独立公众号窗口导航；提交前使用 `awa_agent.py diagnose` 检查微信搜索能力，`health` 只表示服务可达。PW 服务启动脚本为 `start_awa_agent.ps1`，跨机补抓及归档交接见 [PM Agent 接入说明](doc/pm-agent-handoff.md)。
+
 ## ✨ 核心亮点
 
 - **面向学术研究场景** —— 服务传播学、社会科学、公共议题研究、内容分析、课程论文和课题项目中的公开文章材料整理工作。

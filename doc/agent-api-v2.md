@@ -12,12 +12,25 @@ V2 增加公众号自动打开、可见聊天消息读取与继续操作、归�
 .\.venv\Scripts\python.exe awa_agent.py chat-action --chat "某个群" --action scroll --page-token PAGE_TOKEN --scroll-pages 1 --wait
 .\.venv\Scripts\python.exe awa_agent.py chat-action --chat "某个群" --action click --page-token PAGE_TOKEN --message-id MESSAGE_ID --wait
 .\.venv\Scripts\python.exe awa_agent.py articles-v2 --account "某公众号" --limit 1 --wait
+.\.venv\Scripts\python.exe awa_agent.py diagnose
 .\.venv\Scripts\python.exe awa_agent.py accounts
 .\.venv\Scripts\python.exe awa_agent.py saved-articles ACCOUNT_ID
 .\.venv\Scripts\python.exe awa_agent.py content ARTICLE_ID
 ```
 
 `PAGE_TOKEN` 和 `MESSAGE_ID` 必须替换为前一任务 `result.page_token` 和 `result.visible_messages[].id`。可复用 `status`、`wait`、`cancel` 查询任何版本的任务。提交命令均支持 `--idempotency-key` 和 `--timeout-seconds`；推荐点击使用唯一幂等键，网络重试沿用该键。
+
+### V2.1 微信就绪诊断与可重启服务
+
+`serve` 在主线程设定 COM MTA 并初始化 UIA 客户端，之后才创建后端。PW 的 `AWA_Agent_Service` 计划任务以 maegl 的交互会话运行 `start_awa_agent.ps1`，登录时启动；无需特殊 `python -c` 初始化命令。服务停止前先确认没有活动任务；运行中不要强制重启。
+
+`health` 仍仅表示服务可达。提交前调用 `diagnose`：`service_ready=true` 且 `wechat_ready=true`、`main_window_count=1`、`search_edit_count=1` 才表示当前会话可通过受支持方式打开公众号。CLI 未就绪退出码为 1；诊断过程中不输入搜索、不切换账号。桌面被任务占用时返回 409。
+
+`articles-v2` 与 `diagnose` 支持 `--accessibility auto|off|on`，API 参数为 `accessibility`，默认 `auto`。自动模式只在没有搜索框时临时启用已校验微信映像的兼容读屏；整个任务（或诊断）退出后恢复标志。`compatibility_used=true` 表示诊断在兼容上下文内得到结果，不表示开关永久开启。未知微信映像明确失败，不猜测内存地址。
+
+任务可恢复已最小化的主窗口；诊断对最小化窗口报告未就绪，PM 可等待桌面恢复后再提交。服务无法自动登录微信或解锁 Windows。搜索后打开独立公众号窗口时，校验账号名称、微信进程以及明确的“公众号主页”按钮，再核对实际主页账号才开始采集。导航失败时不会复用其他账号的主页。
+
+`limit` 限制新增成功数，默认跳过已有归档；若目标已全部归档，任务可能扫描主页后 completed 且成功数为 0。验证正文应同时查看已归档文章。需要只重抓两篇做正文冒烟时，可显式使用 `--include-collected`。
 
 ## API
 
@@ -30,6 +43,7 @@ V2 增加公众号自动打开、可见聊天消息读取与继续操作、归�
 | POST | `/agent/v2/article-jobs` | 与 V1 相同参数，新增 `open_account`，默认 true |
 | GET | `/agent/v2/articles/{id}/content` | 已归档正文纯文本 |
 | GET | `/agent/v2/health` | 服务状态，不代表微信就绪 |
+| GET | `/agent/v2/diagnose?accessibility=auto` | 微信搜索能力诊断；不切换账号 |
 | GET / POST | `/agent/v2/jobs/{id}` / `/agent/v2/jobs/{id}/cancel` | 查询 / 取消 |
 | GET | `/agent/v2/accounts`、`/agent/v2/accounts/{id}/articles` | 原归档列表，支持原分页参数 |
 
