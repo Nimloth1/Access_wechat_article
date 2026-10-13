@@ -11,6 +11,7 @@
 # version: 3.0 @20260923: 排除微信日期弹窗，前台切换瞬断时有限重试;
 # version: 3.1 @20260926: 会话搜索结果支持无物理远控鼠标的窗口消息点击;
 # version: 3.2 @20261012: 公众号任务兼容读屏、最小化恢复及独立账号窗口导航;
+# version: 3.3 @20261013: 微信已在前台仍被局部遮挡时强制置顶并复查坐标;
 """微信聊天 UIA 适配器；控件不可见、身份不明确时停止，不用盲点兜底。"""
 from __future__ import annotations
 
@@ -263,7 +264,7 @@ class WechatChatAdapter:
             raise ChatAutomationError("微信窗口不可见或已最小化")
         return attach_uia_control(current)
 
-    def _activate(self, context: ChatContext) -> None:
+    def _activate(self, context: ChatContext, *, force: bool = False) -> None:
         """桌面不可交互时停止，在获得前台窗口后才允许输入或调用控件。"""
         user32 = ctypes.WinDLL('user32', use_last_error=True)
         user32.OpenInputDesktop.argtypes = [ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
@@ -273,8 +274,10 @@ class WechatChatAdapter:
         if not desktop:
             raise ChatAutomationError('桌面不可交互，请解锁 Windows 并保持登录会话连接后重试')
         user32.CloseDesktop(desktop)
+        if force:
+            context.window = self._window(context.window)
         for _ in range(5):
-            self.guard.activate(context.window)
+            self.guard.activate(context.window, force=force)
             if user32.GetForegroundWindow():
                 return
             self._pause(0.2)
@@ -346,7 +349,13 @@ class WechatChatAdapter:
         self._activate(context if keep_parent_active else target_context)
         rect = rect_to_tuple(control.BoundingRectangle)
         x, y = (rect[0] + rect[2]) // 2, (rect[1] + rect[3]) // 2
-        self._check_point(target_context, x, y)
+        try:
+            self._check_point(target_context, x, y)
+        except AttachmentNotClickableError:
+            if target_context is not context or keep_parent_active:
+                raise
+            self._activate(context, force=True)
+            self._check_point(context, x, y)
         return target_context, x, y
 
     def _click(self, context: ChatContext, control: Any, *, cleanup: bool = False,
@@ -816,7 +825,7 @@ class WechatChatAdapter:
     def _wheel(self, context: ChatContext, *, older: bool, steps: int = 1) -> None:
         """只在已核验消息视口内部发送滚轮，重新校验窗口和取消状态。"""
         for attempt in range(2):
-            self._activate(context)
+            self._activate(context, force=bool(attempt))
             # 文件下载可能唤起查看器；重新激活后再读取布局，不能复用失焦前的位置。
             listing = self._list(context)
             if self.cancelled():
@@ -903,7 +912,7 @@ class WechatChatAdapter:
                 self._pause(0.6 if tooltip else 0.3)
                 if self.cancelled():
                     raise ChatAutomationError('已取消')
-                self._activate(context)
+                self._activate(context, force=True)
                 bubble = self._fresh_target(context, message)
 
     def _locate_bubble_point(self, context: ChatContext, message: ChatMessage, bubble: Any) -> tuple[int, int]:

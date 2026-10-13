@@ -13,6 +13,7 @@ from targeted_image_backfill import (
     close_history,
     configure_output_encoding,
     expired_attempts,
+    ensure_clickable,
     history_window,
     preview_image,
     record_attempt,
@@ -22,6 +23,7 @@ from targeted_image_backfill import (
     validated_window_wheel,
     wait_for_date_heading,
 )
+from src.modules.window.wechat_chat_adapter import AttachmentNotClickableError
 from src.services.chat_attachment_service import ChatAutomationError
 
 
@@ -275,6 +277,41 @@ def test_validated_window_point_double_click_posts_two_complete_clicks():
 
     assert [args[0][1] for args in user32.PostMessageW.call_args_list] == [
         0x0201, 0x0202, 0x0201, 0x0202]
+
+
+def test_occluded_point_forces_foreground_then_rechecks():
+    context = SimpleNamespace(window=SimpleNamespace(control=SimpleNamespace(ClassName='other')))
+    adapter = Mock()
+    adapter._check_point.side_effect = [AttachmentNotClickableError('blocked'), None]
+
+    ensure_clickable(adapter, context, 12, 34)
+
+    assert adapter._activate.call_args_list == [
+        ((context,), {}), ((context,), {'force': True})]
+    assert adapter._check_point.call_count == 2
+
+
+def test_occluded_point_still_fails_after_one_foreground_retry():
+    context = SimpleNamespace(window=SimpleNamespace(control=SimpleNamespace(ClassName='other')))
+    adapter = Mock()
+    adapter._check_point.side_effect = AttachmentNotClickableError('blocked')
+
+    with pytest.raises(AttachmentNotClickableError, match='blocked'):
+        ensure_clickable(adapter, context, 12, 34)
+
+    assert adapter._activate.call_count == 2
+    assert adapter._check_point.call_count == 2
+
+
+def test_calendar_popup_never_forces_foreground():
+    context = SimpleNamespace(window=SimpleNamespace(control=SimpleNamespace(ClassName='mmui::XPopover')))
+    adapter = Mock()
+    adapter._check_point.side_effect = AttachmentNotClickableError('blocked')
+
+    with pytest.raises(AttachmentNotClickableError):
+        ensure_clickable(adapter, context, 12, 34)
+
+    adapter._activate.assert_not_called()
 
 
 def test_validated_window_wheel_posts_screen_coordinates_and_negative_delta():

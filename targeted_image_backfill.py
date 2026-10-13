@@ -16,7 +16,8 @@
 # version: 2.4 @20261010: 日期标题滞留前一天时按附件行末时间核验，避免误报筛选失败;
 # version: 2.5 @20261010: 月份菜单不再激活弹层，滚动后核验可见选项与实际月份;
 #                           兼容需确认的日期弹层，更新悬停日期后核验实际筛选结果;
-__version__ = 'v2.5'
+# version: 2.6 @20261013: 点击或滚动位置被遮挡时强制置顶微信并重新核验一次;
+__version__ = 'v2.6'
 __platform__ = 'nt'
 __pc__ = ['PW']
 __py__ = 'py3.11+'
@@ -35,7 +36,8 @@ import sys
 import time
 
 from chat_attachments import DEFAULT_EXPORT_ROOT, LOG_DIR, task_lock
-from src.modules.window.wechat_chat_adapter import ChatContext, WechatChatAdapter, message_day, walk, unique
+from src.modules.window.wechat_chat_adapter import (AttachmentNotClickableError, ChatContext,
+                                                     WechatChatAdapter, message_day, walk, unique)
 from src.modules.window.wechat_home_window_finder import attach_uia_control, enumerate_desktop_windows, rect_to_tuple
 from src.services.chat_attachment_service import ChatAutomationError
 from src.services.wechat_attachment_inventory import load_inventory
@@ -60,12 +62,24 @@ def _user32():
     return ctypes.windll.user32
 
 
-def validated_window_point_click(adapter, context, x, y, *, clicks=1, activate=True):
-    """校验屏幕坐标归属后，向已核验窗口发送 Qt 可识别的鼠标点击。"""
+def ensure_clickable(adapter, context, x, y, *, activate=True):
+    """遮挡时强制置顶一次，重新核验坐标；弹层保持原有焦点。"""
     calendar_popup = getattr(getattr(context.window, 'control', None), 'ClassName', '') == 'mmui::XPopover'
     if activate and not calendar_popup:
         adapter._activate(context)
-    adapter._check_point(context, x, y)
+    try:
+        adapter._check_point(context, x, y)
+    except AttachmentNotClickableError:
+        if not activate or calendar_popup:
+            raise
+        adapter._activate(context, force=True)
+        adapter._check_point(context, x, y)
+
+
+def validated_window_point_click(adapter, context, x, y, *, clicks=1, activate=True):
+    """校验屏幕坐标归属后，向已核验窗口发送 Qt 可识别的鼠标点击。"""
+    calendar_popup = getattr(getattr(context.window, 'control', None), 'ClassName', '') == 'mmui::XPopover'
+    ensure_clickable(adapter, context, x, y, activate=activate)
     point = wintypes.POINT(x, y)
     user32 = _user32()
     if not user32.ScreenToClient(context.window.handle, ctypes.byref(point)):
@@ -95,9 +109,7 @@ def validated_window_wheel(adapter, context, control, *, older, steps, activate=
     """在已核验列表中心投递滚轮消息，不依赖远控软件维持物理鼠标。"""
     left, top, right, bottom = rect_to_tuple(control.BoundingRectangle)
     x, y = (left + right) // 2, (top + bottom) // 2
-    if activate:
-        adapter._activate(context)
-    adapter._check_point(context, x, y)
+    ensure_clickable(adapter, context, x, y, activate=activate)
     delta = 120 if older else -120
     wparam = (delta & 0xffff) << 16
     lparam = ((y & 0xffff) << 16) | (x & 0xffff)

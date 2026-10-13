@@ -44,7 +44,7 @@ class WindowsHomeWindowGuard:
         self._activation_wait_seconds = max(0.0, float(activation_wait_seconds))
         self._sleep = sleep
 
-    def activate(self, home_window: WindowInfo) -> None:
+    def activate(self, home_window: WindowInfo, *, force: bool = False) -> None:
         if self._platform_name != "Windows":
             raise HomeWindowNotClickableError("微信主页激活仅支持 Windows")
         if home_window.handle <= 0:
@@ -56,7 +56,7 @@ class WindowsHomeWindowGuard:
                 f"微信主页窗口已经失效：{home_window.handle}"
             )
         is_iconic = bool(user32.IsIconic(int(home_window.handle)))
-        if not is_iconic:
+        if not is_iconic and not force:
             foreground = int(user32.GetForegroundWindow() or 0)
             if _belongs_to_home(user32, home_window.handle, foreground):
                 # 关闭文章标签后主页通常已经在前台，直接复用可省去固定激活等待。
