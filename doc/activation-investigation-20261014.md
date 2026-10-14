@@ -4,6 +4,34 @@
 调查对象：2026-10-14 02:30 的 daily-original-backfill；目标日期 2026-10-13。
 代码基线：457bf26，main 与 origin/main 同步后开始调查。
 
+## 2026-10-14 后续实现：自动记录受阻现场
+
+已按用户要求补充取证日志；原来的坐标归属核验、停止条件和一次 force 重试保持不变。
+`src/modules/window/window_diagnostics.py` 直接读取原始 HWND，不通过过滤窗口标题的枚举器。
+首次受阻就输出 `[window-diagnostic] ` 前缀的一行 JSON；即使 force 后成功，首次现场仍保留。
+定向补图与适配器点击路径分别标记 `before_force` / `after_force`；其他坐标核验使用 `point_check`。
+输入桌面不可访问或激活后没有前台窗口时也记录诊断，前者保留实际失败 API 的错误码和访问权限。
+
+每条记录包含时间、点击点、原始遮挡句柄、采样时命中句柄、目标及前台句柄。
+相关窗口（含根窗和直接 owner）记录有效性、PID、线程、进程名/路径/启动时间、
+标题、类名、矩形、可见/最小化状态、扩展样式、TOPMOST/TOOLWINDOW/NOACTIVATE、DPI、
+窗口线程桌面及进程会话 ID。另记录采集线程桌面、输入桌面、当前会话连接状态及锁屏标志、
+当前线程 DPI awareness 与虚拟屏幕范围。读取失败以 null 和 `errors` 保留，
+窗口已经失效则明确记录 `valid=false`，不会将后续命中的窗口误归因为原始遮挡。
+
+日志写入标准输出，现有夜间包装脚本已将其落到
+`I:\wechat_digest\logs\group_article_original_backfill\*_images_*.log`，无需修改调度或 HC。
+检索示例：
+
+```powershell
+rg '\[window-diagnostic\]' 'I:\wechat_digest\logs\group_article_original_backfill' -g '*.log'
+```
+
+只读实机采样已成功得到 `Default` 输入/线程桌面、会话 3、`state=0`、`flags=1`、
+`locked=false`，且诊断错误为空。此验证没有激活或点击微信。
+锁屏和无标题遮挡的失败路径由模拟 API 测试验证；尚未用一次真实夜间失败验证新日志。
+下文的 TOPMOST 回退及更严格桌面前置校验仍为建议，本次未实施。
+
 ## 结论与边界
 
 1. **已确认 force 路径执行，但它不等于真正 TOPMOST。** 原始堆栈先在

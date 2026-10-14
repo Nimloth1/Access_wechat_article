@@ -104,7 +104,7 @@ def test_month_popup_stays_open_until_verified_target_is_clicked(scroll_needed):
 
     adapter._activate.side_effect = activate
     if scroll_needed == 'blocked':
-        def check_point(context, x, y):
+        def check_point(context, x, y, *, phase):
             if context.window is menu:
                 raise ChatAutomationError('菜单被遮挡')
         adapter._check_point.side_effect = check_point
@@ -254,7 +254,7 @@ def test_validated_window_click_checks_owner_then_posts_client_click():
         validated_window_click(adapter, context, control)
 
     adapter._activate.assert_called_once_with(context)
-    adapter._check_point.assert_called_once_with(context, 120, 230)
+    adapter._check_point.assert_called_once_with(context, 120, 230, phase='before_force')
     assert user32.PostMessageW.call_args_list == [
         ((1234, 0x0201, 0x0001, (30 << 16) | 20),),
         ((1234, 0x0202, 0, (30 << 16) | 20),),
@@ -289,6 +289,8 @@ def test_occluded_point_forces_foreground_then_rechecks():
     assert adapter._activate.call_args_list == [
         ((context,), {}), ((context,), {'force': True})]
     assert adapter._check_point.call_count == 2
+    assert [call.kwargs['phase'] for call in adapter._check_point.call_args_list] == [
+        'before_force', 'after_force']
 
 
 def test_occluded_point_still_fails_after_one_foreground_retry():
@@ -326,7 +328,7 @@ def test_validated_window_wheel_posts_screen_coordinates_and_negative_delta():
             patch('targeted_image_backfill.time.sleep'):
         validated_window_wheel(adapter, context, control, older=False, steps=2)
 
-    adapter._check_point.assert_called_once_with(context, 200, 400)
+    adapter._check_point.assert_called_once_with(context, 200, 400, phase='before_force')
     expected_wparam = ((-120) & 0xffff) << 16
     expected_lparam = (400 << 16) | 200
     assert user32.PostMessageW.call_args_list == [

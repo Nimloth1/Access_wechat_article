@@ -429,26 +429,49 @@ class WechatChatAdapterTests(unittest.TestCase):
         adapter = self.adapter(None)
         adapter.guard = SimpleNamespace(ensure_target_clickable=Mock(
             side_effect=HomeWindowNotClickableError('文章坐标不在微信主页可点击层级')))
-        user32 = SimpleNamespace(GetForegroundWindow=Mock(return_value=2))
-        window = SimpleNamespace(handle=2, process_name='viewer.exe', class_name='Viewer')
-        with patch('ctypes.windll', SimpleNamespace(user32=user32), create=True), patch(
-                'src.modules.window.wechat_chat_adapter.enumerate_desktop_windows', return_value=[window]):
+        snapshot = {'roles': {'foreground': 2}, 'windows': {'2': {
+            'process': {'name': 'viewer.exe'}, 'class_name': 'Viewer'}}}
+        with patch('src.modules.window.wechat_chat_adapter.record_window_diagnostic',
+                   return_value=snapshot) as record:
             with self.assertRaisesRegex(ChatAutomationError, 'viewer.exe') as error:
                 adapter._check_point(ChatContext(SimpleNamespace(handle=1), 'A'), 10, 20)
         self.assertNotIn('文章坐标', str(error.exception))
+        record.assert_called_once_with(1, blocker_handle=0, point=(10, 20), phase='point_check')
 
     def test_obstruction_reports_blocker_even_when_wechat_is_foreground(self):
         """前台是微信不能解释遮挡，必须另记点击点真正所属的 PDF 窗口。"""
         adapter = self.adapter(None)
         adapter.guard = SimpleNamespace(ensure_target_clickable=Mock(side_effect=
             HomeWindowNotClickableError('坐标被遮挡', owner_handle=3)))
-        user32 = SimpleNamespace(GetForegroundWindow=Mock(return_value=1), GetAncestor=Mock(return_value=2))
-        windows = [SimpleNamespace(handle=1, process_name='Weixin.exe', class_name='Qt'),
-                   SimpleNamespace(handle=2, process_name='msedge.exe', class_name='Chrome', rect=(0, 0, 1000, 1000))]
-        with patch('ctypes.windll', SimpleNamespace(user32=user32), create=True), patch(
-                'src.modules.window.wechat_chat_adapter.enumerate_desktop_windows', return_value=windows):
+        snapshot = {'roles': {'foreground': 1}, 'windows': {
+            '1': {'process': {'name': 'Weixin.exe'}, 'class_name': 'Qt'},
+            '3': {'root': 2}, '2': {'process': {'name': 'msedge.exe'},
+                                  'class_name': 'Chrome', 'rect': (0, 0, 1000, 1000)}}}
+        with patch('src.modules.window.wechat_chat_adapter.record_window_diagnostic',
+                   return_value=snapshot):
             with self.assertRaisesRegex(AttachmentNotClickableError, '遮挡窗口：msedge.exe'):
                 adapter._check_point(ChatContext(SimpleNamespace(handle=1), 'A'), 10, 20)
+
+    def test_diagnostics_capture_both_obstructions_without_sending_click(self):
+        """首次受阻和强制激活后仍受阻均记录，持续遮挡不发送点击。"""
+        adapter = self.adapter(None)
+        adapter.cancelled = lambda: False
+        adapter._nodes = Mock()
+        adapter._activate = Mock()
+        adapter.guard = SimpleNamespace(ensure_target_clickable=Mock(side_effect=
+            HomeWindowNotClickableError('遮挡', owner_handle=3)))
+        context = ChatContext(SimpleNamespace(handle=1), 'A')
+        control = Node(rect=(0, 0, 20, 40))
+        control.GetTopLevelControl = lambda: SimpleNamespace(NativeWindowHandle=1)
+        control.Click = Mock()
+        with patch('src.modules.window.wechat_chat_adapter.record_window_diagnostic',
+                   return_value={}) as record:
+            with self.assertRaises(AttachmentNotClickableError):
+                adapter._click(context, control)
+        self.assertEqual([call.kwargs['phase'] for call in record.call_args_list],
+                         ['before_force', 'after_force'])
+        self.assertTrue(all(call.kwargs['blocker_handle'] == 3 for call in record.call_args_list))
+        control.Click.assert_not_called()
 
     def test_forward_stationary_scroll_marks_start_but_outer_does_not(self):
         """有限转发的稳定边缘可确认起点，外层懒加载不能据此报告全部完成。"""
@@ -869,8 +892,11 @@ class WechatChatAdapterTests(unittest.TestCase):
         adapter = self.adapter(None)
         adapter.guard = SimpleNamespace(activate=Mock())
         user32 = SimpleNamespace(OpenInputDesktop=Mock(return_value=None), CloseDesktop=Mock())
-        with patch('ctypes.WinDLL', return_value=user32, create=True), self.assertRaisesRegex(ChatAutomationError, '解锁'):
-            adapter._activate(ChatContext(None, 'A'))
+        with patch('ctypes.WinDLL', return_value=user32, create=True), patch(
+                'src.modules.window.wechat_chat_adapter.record_window_diagnostic') as record, \
+                self.assertRaisesRegex(ChatAutomationError, '解锁'):
+            adapter._activate(ChatContext(SimpleNamespace(handle=1), 'A'))
+        self.assertEqual(record.call_args.kwargs['phase'], 'activation_input_desktop_failed')
         adapter.guard.activate.assert_not_called()
 
     def test_chat_navigation_waits_for_exact_title(self):

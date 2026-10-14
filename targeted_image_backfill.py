@@ -17,7 +17,8 @@
 # version: 2.5 @20261010: 月份菜单不再激活弹层，滚动后核验可见选项与实际月份;
 #                           兼容需确认的日期弹层，更新悬停日期后核验实际筛选结果;
 # version: 2.6 @20261013: 点击或滚动位置被遮挡时强制置顶微信并重新核验一次;
-__version__ = 'v2.6'
+# version: 2.7 @20261014: 遮挡现场日志区分强制激活前后的坐标核验;
+__version__ = 'v2.7'
 __platform__ = 'nt'
 __pc__ = ['PW']
 __py__ = 'py3.11+'
@@ -68,12 +69,12 @@ def ensure_clickable(adapter, context, x, y, *, activate=True):
     if activate and not calendar_popup:
         adapter._activate(context)
     try:
-        adapter._check_point(context, x, y)
+        adapter._check_point(context, x, y, phase='before_force')
     except AttachmentNotClickableError:
         if not activate or calendar_popup:
             raise
         adapter._activate(context, force=True)
-        adapter._check_point(context, x, y)
+        adapter._check_point(context, x, y, phase='after_force')
 
 
 def validated_window_point_click(adapter, context, x, y, *, clicks=1, activate=True):

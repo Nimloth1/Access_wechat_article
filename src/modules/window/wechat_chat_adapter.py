@@ -12,6 +12,7 @@
 # version: 3.1 @20260926: 会话搜索结果支持无物理远控鼠标的窗口消息点击;
 # version: 3.2 @20261012: 公众号任务兼容读屏、最小化恢复及独立账号窗口导航;
 # version: 3.3 @20261013: 微信已在前台仍被局部遮挡时强制置顶并复查坐标;
+# version: 3.4 @20261014: 遮挡及桌面不可交互时记录原始窗口元数据和会话状态;
 """微信聊天 UIA 适配器；控件不可见、身份不明确时停止，不用盲点兜底。"""
 from __future__ import annotations
 
@@ -31,6 +32,7 @@ from src.modules.window.home_window_activation import HomeWindowNotClickableErro
 from src.modules.window.article_date_filter import normalize_home_date_text
 from src.modules.window.wechat_accessibility import temporary_accessibility
 from src.modules.window.wechat_home_window_finder import attach_uia_control, enumerate_desktop_windows, rect_to_tuple
+from src.modules.window.window_diagnostics import record_window_diagnostic
 from src.services.chat_attachment_service import ChatAutomationError, ChatMessage, ChatPage, older_prefix, page_identity
 
 
@@ -272,6 +274,9 @@ class WechatChatAdapter:
         user32.CloseDesktop.argtypes = [ctypes.c_void_p]
         desktop = user32.OpenInputDesktop(0, False, 0x100)
         if not desktop:
+            record_window_diagnostic(context.window.handle, phase='activation_input_desktop_failed',
+                                     failure={'api': 'OpenInputDesktop', 'access': 0x100,
+                                              'winerror': ctypes.get_last_error()})
             raise ChatAutomationError('桌面不可交互，请解锁 Windows 并保持登录会话连接后重试')
         user32.CloseDesktop(desktop)
         if force:
@@ -281,6 +286,7 @@ class WechatChatAdapter:
             if user32.GetForegroundWindow():
                 return
             self._pause(0.2)
+        record_window_diagnostic(context.window.handle, phase='activation_no_foreground')
         raise ChatAutomationError('未能获得可交互的前台窗口，停止操作')
 
     def diagnose(self) -> dict:
@@ -350,12 +356,12 @@ class WechatChatAdapter:
         rect = rect_to_tuple(control.BoundingRectangle)
         x, y = (rect[0] + rect[2]) // 2, (rect[1] + rect[3]) // 2
         try:
-            self._check_point(target_context, x, y)
+            self._check_point(target_context, x, y, phase='before_force')
         except AttachmentNotClickableError:
             if target_context is not context or keep_parent_active:
                 raise
             self._activate(context, force=True)
-            self._check_point(context, x, y)
+            self._check_point(context, x, y, phase='after_force')
         return target_context, x, y
 
     def _click(self, context: ChatContext, control: Any, *, cleanup: bool = False,
@@ -380,21 +386,27 @@ class WechatChatAdapter:
         if not user32.PostMessageW(target.window.handle, 0x0202, 0, lparam):
             raise ChatAutomationError('无法向微信窗口发送鼠标释放消息')
 
-    def _check_point(self, context: ChatContext, x: int, y: int) -> None:
-        """核验附件坐标归属；遮挡错误纳入任务摘要，并记录前台应用以便诊断。"""
+    def _check_point(self, context: ChatContext, x: int, y: int, *, phase: str = 'point_check') -> None:
+        """核验附件坐标归属；记录原始 HWND 快照后将遮挡错误纳入任务摘要。"""
         from types import SimpleNamespace
         try:
             self.guard.ensure_target_clickable(context.window, SimpleNamespace(
                 home_window_handle=context.window.handle, click_x=x, click_y=y))
         except HomeWindowNotClickableError as exc:
-            foreground = ctypes.windll.user32.GetForegroundWindow()
-            desktop_windows = enumerate_desktop_windows()
-            windows = [w for w in desktop_windows if w.handle == foreground]
-            detail = f'{windows[0].process_name} / {windows[0].class_name}' if windows else '不可识别'
-            owner = exc.owner_handle
-            root = ctypes.windll.user32.GetAncestor(owner, 2) if owner else 0
-            blockers = [w for w in desktop_windows if w.handle in {owner, root}]
-            blocker = f'{blockers[0].process_name} / {blockers[0].class_name} / {blockers[0].rect}' if blockers else f'句柄 {owner}'
+            snapshot = record_window_diagnostic(context.window.handle, blocker_handle=exc.owner_handle,
+                                                point=(x, y), phase=phase)
+
+            def describe(handle):
+                """用原始快照概述应用；子窗口缺少身份时查询已记录的根窗口。"""
+                windows = snapshot.get('windows', {})
+                window = windows.get(str(handle)) or {}
+                if not (window.get('process') or {}).get('name'):
+                    window = windows.get(str(window.get('root'))) or window
+                process = (window.get('process') or {}).get('name') or '不可识别'
+                return f'{process} / {window.get("class_name", "")} / {window.get("rect")} / 句柄 {handle}'
+
+            detail = describe(snapshot.get('roles', {}).get('foreground', 0))
+            blocker = describe(exc.owner_handle)
             raise AttachmentNotClickableError(
                 f'附件操作位置被遮挡或窗口已变化，已停止；前台应用：{detail}；'
                 f'遮挡窗口：{blocker}；'
