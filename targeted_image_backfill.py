@@ -18,7 +18,8 @@
 #                           兼容需确认的日期弹层，更新悬停日期后核验实际筛选结果;
 # version: 2.6 @20261013: 点击或滚动位置被遮挡时强制置顶微信并重新核验一次;
 # version: 2.7 @20261014: 遮挡现场日志区分强制激活前后的坐标核验;
-__version__ = 'v2.7'
+# version: 2.8 @20261016: 末尾未定位时重建日期查询一次，支持不下载的预览身份验证;
+__version__ = 'v2.8'
 __platform__ = 'nt'
 __pc__ = ['PW']
 __py__ = 'py3.11+'
@@ -131,6 +132,9 @@ def parse_args():
     parser.add_argument('--retry-expired', action='store_true', help='重试微信已明确提示过期的图片')
     parser.add_argument('--target-ids-file', type=Path, help='每行一个完整消息 ID，如 群ID:消息ID')
     parser.add_argument('--export-root', type=Path, default=DEFAULT_EXPORT_ROOT)
+    parser.add_argument('--locate-only', action='store_true',
+                        help='仅定位指定消息并核验预览 ID，不点击原图或写入下载结果')
+    parser.add_argument('--diagnostic-log', type=Path, help='逐页列表与预览身份诊断 JSONL')
     return parser.parse_args()
 
 
@@ -390,7 +394,39 @@ def record_attempt(key, result):
         log.flush()
 
 
-def run_day(adapter, history, chat, session_id, day, targets, export_root, export_chat, limit):
+def write_diagnostic(path, event, **data):
+    """将定位现场写到独立日志，不改清单、原图缓存或导出。"""
+    if path is None:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open('a', encoding='utf-8', newline='\n') as stream:
+        stream.write(json.dumps({'at': datetime.now().isoformat(), 'event': event, **data},
+                                ensure_ascii=False) + '\n')
+
+
+def run_day(adapter, history, chat, session_id, day, targets, export_root, export_chat, limit,
+            *, locate_only=False, diagnostic_log=None):
+    """列表末尾仍缺目标时重建查询一次，不在同一结果集上空滚。"""
+    handled = 0
+    for attempt in range(2):
+        handled += scan_day(adapter, history, chat, session_id, day, targets,
+                            export_root, export_chat, limit - handled if limit else 0,
+                            locate_only=locate_only, diagnostic_log=diagnostic_log,
+                            attempt=attempt)
+        if not targets or (limit and handled >= limit) or adapter.cancelled():
+            break
+        if attempt == 0:
+            print(f'{day}: 列表扫描仍有 {len(targets)} 张未定位，关闭旧记录窗口并重建日期查询一次',
+                  flush=True)
+            write_diagnostic(diagnostic_log, 'rebuild_date_query', old_handle=history.handle,
+                             remaining_keys=sorted(item['key'] for item in targets.values()))
+            close_history(adapter, chat, session_id)
+            history = history_window(adapter, adapter.open_chat(chat), chat, session_id)
+    return handled
+
+
+def scan_day(adapter, history, chat, session_id, day, targets, export_root, export_chat, limit,
+             *, locate_only=False, diagnostic_log=None, attempt=0):
     """只打开目标分钟的图片，用预览 ID 精确匹配待补消息。"""
     history = select_day(adapter, history, chat, session_id, day)
     target_minutes = {f'{datetime.fromtimestamp(item["timestamp"]).hour:02d}:'
@@ -402,16 +438,29 @@ def run_day(adapter, history, chat, session_id, day, targets, export_root, expor
     previous_layout = None
     stationary = 0
     handled = 0
+    stop_reason = 'page_limit'
     for page in range(300):
+        if adapter.cancelled():
+            raise ChatAutomationError('已取消')
         if not targets or (limit and handled >= limit):
+            stop_reason = 'item_limit' if targets else 'complete'
             break
         history = one_window('mmui::SearchMsgUniqueChatWindow', session_id=session_id)
         listing = unique([node for node in walk(history.control) if node.AutomationId == 'search_message_list'],
                          '筛选消息列表')
         rows = list(listing.GetChildren())
         layout = tuple((node.Name, rect_to_tuple(node.BoundingRectangle)) for node in rows)
+        listing_rect = rect_to_tuple(listing.BoundingRectangle)
+        if diagnostic_log is not None:
+            write_diagnostic(diagnostic_log, 'date_list_page', page=page, attempt=attempt,
+                             window_handle=history.handle, session_id=session_id,
+                             day=day.isoformat(), listing_rect=listing_rect,
+                             rows=[{'name': node.Name[:2000], 'tail': node.Name[-100:],
+                                    'automation_id': node.AutomationId,
+                                    'rect': rect_to_tuple(node.BoundingRectangle)} for node in rows])
         stationary = stationary + 1 if layout == previous_layout else 0
         if stationary >= 2:
+            stop_reason = 'stationary'
             break
         previous_layout = layout
         for row in rows:
@@ -436,6 +485,18 @@ def run_day(adapter, history, chat, session_id, day, targets, export_root, expor
             try:
                 if key not in targets:
                     print(f'{day} {local_id}: 非缺口图片，跳过', flush=True)
+                    continue
+                if locate_only:
+                    automation_id = preview.control.AutomationId
+                    write_diagnostic(diagnostic_log, 'preview_verified',
+                                     session_id=session_id, message_id=targets[key]['message_id'],
+                                     timestamp=timestamp, local_id=local_id, automation_id=automation_id)
+                    print(f'仅定位核验 message_id={targets[key]["message_id"]} '
+                          f'local_id={local_id} AutomationId={automation_id}', flush=True)
+                    handled += 1
+                    del targets[key]
+                    target_minutes = {f'{datetime.fromtimestamp(item["timestamp"]):%H:%M}'
+                                      for item in targets.values()}
                     continue
                 nodes = walk(preview.control)
                 expired = any('已过期或被清理' in node.Name for node in nodes)
@@ -472,6 +533,7 @@ def run_day(adapter, history, chat, session_id, day, targets, export_root, expor
               f'列表命中分钟={matched_minutes} '
               f'无法解析图片行={sorted(unmatched_image_labels)}', flush=True)
         diagnostic = {
+            'event': 'unlocated',
             'at': datetime.now().isoformat(timespec='seconds'),
             'session_id': session_id,
             'day': day.isoformat(),
@@ -479,8 +541,18 @@ def run_day(adapter, history, chat, session_id, day, targets, export_root, expor
             'target_minutes': remaining_minutes,
             'matched_minutes': matched_minutes,
             'unmatched_image_labels': sorted(unmatched_image_labels),
+            'attempt': attempt,
+            'stop_reason': stop_reason,
+            'scan_pages': page + 1,
+            'window_handle': history.handle,
+            'listing_rect': listing_rect,
+            # 使用当页快照；滚动或关闭预览后，旧 UIA 行可能已经重建。
+            'last_rows': [{'name': name[:200], 'tail': name[-100:], 'rect': bounds}
+                          for name, bounds in layout],
         }
-        path = LOG_DIR / 'targeted_image_unlocated.jsonl'
+        path = diagnostic_log if locate_only else LOG_DIR / 'targeted_image_unlocated.jsonl'
+        if path is None:
+            return handled
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open('a', encoding='utf-8', newline='\n') as log:
             log.write(json.dumps(diagnostic, ensure_ascii=False) + '\n')
@@ -494,6 +566,8 @@ def main():
     args = parse_args()
     if args.max_items < 0:
         raise ValueError('--max-items 不能为负数')
+    if args.locate_only and (not args.target_ids_file or not args.diagnostic_log):
+        raise ValueError('--locate-only 必须指定 --target-ids-file 和 --diagnostic-log')
     export_chat = args.export_chat or args.chat
     session_id, items = load_inventory(args.export_root, export_chat, since=args.since)
     if args.target_ids_file:
@@ -502,9 +576,14 @@ def main():
         if not target_ids:
             raise ValueError('目标消息 ID 文件为空')
         items = [item for item in items if f'{item["session_id"]}:{item["message_id"]}' in target_ids]
+        if args.locate_only:
+            found_ids = {f'{item["session_id"]}:{item["message_id"]}' for item in items
+                         if item['kind'] == 'image'}
+            if found_ids != target_ids:
+                raise ValueError(f'导出中未找到指定图片消息 ID：{sorted(target_ids - found_ids)}')
     pending = {(item['timestamp'], item['local_id']): item for item in items
-               if item['kind'] == 'image' and item['state'] != 'original'}
-    if not args.retry_expired:
+               if item['kind'] == 'image' and (args.locate_only or item['state'] != 'original')}
+    if not args.locate_only and not args.retry_expired:
         expired = expired_attempts()
         pending = {key: item for key, item in pending.items() if item['key'] not in expired}
         if expired:
@@ -529,10 +608,13 @@ def main():
                     print(f'{day}: 缺口 {len(targets)} 张', flush=True)
                     handled += run_day(adapter, history, args.chat, session_id, day, targets,
                                        args.export_root, export_chat,
-                                       args.max_items - handled if args.max_items else 0)
+                                       args.max_items - handled if args.max_items else 0,
+                                       locate_only=args.locate_only, diagnostic_log=args.diagnostic_log)
                     if targets:
                         print(f'{day}: 尚未定位 {len(targets)} 张', flush=True)
                 print(f'本次已核验 {handled} 张；重新运行会按当前落盘状态选缺口。', flush=True)
+                if args.locate_only and any(by_day.values()):
+                    raise ChatAutomationError('只定位验证未找到全部指定图片，不能判为验证通过')
             finally:
                 try:
                     close_preview(adapter, args.chat, session_id)

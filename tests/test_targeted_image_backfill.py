@@ -2,10 +2,12 @@
 """核验日期入口的定位计算与已过期图片续跑记录。"""
 
 from datetime import date
+from contextlib import nullcontext
 import json
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 import pytest
+import targeted_image_backfill as backfill
 
 from targeted_image_backfill import (
     IMAGE_ROW,
@@ -416,3 +418,153 @@ def test_one_window_without_uia_uses_existing_missing_window_error():
             patch('targeted_image_backfill.attach_uia_control', return_value=missing):
         with pytest.raises(ChatAutomationError, match='实际找到 0 个'):
             one_window('preview')
+
+
+def test_stalled_date_query_rebuilds_window_and_verifies_preview_without_downloading(tmp_path):
+    """旧日期列表停在文字末尾时重建窗口，从新结果精确核验消息身份。"""
+    stamp, local_id = 1792073150, 6368
+    target = {'key': 'chat-id:6368:1792073150', 'message_id': 4186492, 'timestamp': stamp}
+    targets = {(stamp, local_id): target}
+    old, fresh = SimpleNamespace(handle=1, control='old'), SimpleNamespace(handle=2, control='fresh')
+    text = SimpleNamespace(Name='机构数据10月...更多 昨天 22:05', ClassName='mmui::ChatTextItemView',
+                           AutomationId='row', BoundingRectangle=(0, 400, 600, 465))
+    image = SimpleNamespace(Name='图片 昨天 22:05', AutomationId='row',
+                            BoundingRectangle=(0, 100, 600, 400), GetRuntimeId=lambda: [1])
+    listings = {key: SimpleNamespace(AutomationId='search_message_list',
+                                     BoundingRectangle=(0, 0, 600, 500),
+                                     GetChildren=lambda row=row: [row])
+                for key, row in [('old', text), ('fresh', image)]}
+    preview = SimpleNamespace(control=SimpleNamespace(
+        AutomationId='PreviewWindow_chat-id_1792073150_6368_0_0'))
+    active = [old]
+    adapter = Mock()
+    adapter.cancelled.return_value = False
+
+    def reopen(*args):
+        """模拟丢弃旧查询后，新窗口暴露此前缺失的图片行。"""
+        active[0] = fresh
+        return fresh
+
+    evidence = tmp_path / 'locate.jsonl'
+    with patch.object(backfill, 'select_day', side_effect=lambda a, h, *args: h), \
+            patch.object(backfill, 'one_window', side_effect=lambda *args, **kw: active[0]), \
+            patch.object(backfill, 'walk', side_effect=lambda control: [listings[control]]), \
+            patch.object(backfill, 'history_window', side_effect=reopen) as history, \
+            patch.object(backfill, 'close_history') as close, \
+            patch.object(backfill, 'preview_image', return_value=(preview, stamp, local_id)), \
+            patch.object(backfill, 'close_preview'), patch.object(backfill, 'validated_window_wheel'), \
+            patch.object(backfill, 'validated_window_click') as download, \
+            patch.object(backfill, 'current_state') as state, \
+            patch.object(backfill, 'record_attempt') as attempt, patch.object(backfill.time, 'sleep'):
+        count = backfill.run_day(adapter, old, '群', 'chat-id', date(2026, 10, 15), targets,
+                                 tmp_path, '群', 0, locate_only=True, diagnostic_log=evidence)
+    assert count == 1 and not targets
+    close.assert_called_once_with(adapter, '群', 'chat-id')
+    history.assert_called_once()
+    download.assert_not_called()
+    state.assert_not_called()
+    attempt.assert_not_called()
+    records = [json.loads(line) for line in evidence.read_text(encoding='utf-8').splitlines()]
+    assert [item['event'] for item in records].count('rebuild_date_query') == 1
+    verified = [item for item in records if item['event'] == 'preview_verified']
+    assert verified[0]['message_id'] == 4186492
+    assert verified[0]['automation_id'] == preview.control.AutomationId
+    assert any(item['event'] == 'unlocated' and item['last_rows'][0]['tail'].endswith('22:05')
+               for item in records)
+
+
+@pytest.mark.parametrize('handled,limit,cancelled,scans', [(0, 0, False, 2), (1, 1, False, 1),
+                                                        (0, 0, True, 1)])
+def test_query_rebuild_is_bounded_and_respects_limit_or_cancel(handled, limit, cancelled, scans):
+    """第二个查询仍缺消息时保留缺口，不无限重试；限额和取消时不重建。"""
+    adapter = Mock()
+    adapter.cancelled.return_value = cancelled
+    targets = {(1, 1): {'key': 'chat:1:1'}}
+    with patch.object(backfill, 'scan_day', return_value=handled) as scan, \
+            patch.object(backfill, 'close_history') as close, \
+            patch.object(backfill, 'history_window', return_value=SimpleNamespace(handle=2)):
+        backfill.run_day(adapter, SimpleNamespace(handle=1), '群', 'chat', date(2026, 10, 15),
+                         targets, None, '群', limit)
+    assert scan.call_count == scans
+    assert close.call_count == scans - 1
+    assert targets
+
+
+@pytest.mark.parametrize('automation_id', ['PreviewWindow_other_123_456_0_0', 'invalid'])
+def test_preview_image_rejects_wrong_session_or_unparseable_identity(automation_id):
+    """刷新查询也不能放松预览 AutomationId 的群身份校验。"""
+    listing = SimpleNamespace(AutomationId='search_message_list', BoundingRectangle=(0, 0, 1000, 800))
+    row = SimpleNamespace(BoundingRectangle=(100, 100, 900, 500))
+    preview = SimpleNamespace(control=SimpleNamespace(AutomationId=automation_id))
+    with patch.object(backfill, 'walk', return_value=[listing]), \
+            patch.object(backfill, 'validated_window_point_click'), \
+            patch.object(backfill, 'one_window', return_value=preview):
+        with pytest.raises(ChatAutomationError, match='无法与目标群对应'):
+            preview_image(Mock(), SimpleNamespace(control=object()), '群', row, 'chat-id')
+
+
+@pytest.mark.parametrize('located', [False, True])
+def test_locate_cli_includes_originals_and_requires_actual_location(tmp_path, located):
+    """四图已完成也必须实际定位；未定位时抛错，不能以空待办返回成功。"""
+    ids = tmp_path / 'ids.txt'
+    ids.write_text('chat:42\n', encoding='utf-8')
+    options = SimpleNamespace(chat='群', export_chat=None, export_root=tmp_path,
+                              since=date(2026, 10, 15), max_items=0, target_ids_file=ids,
+                              locate_only=True, diagnostic_log=tmp_path / 'evidence.jsonl')
+    item = {'session_id': 'chat', 'message_id': 42, 'kind': 'image', 'state': 'original',
+            'timestamp': 1792073150, 'local_id': 6368, 'key': 'chat:6368:1792073150'}
+    adapter = Mock()
+    adapter.compatibility.return_value = nullcontext()
+
+    def scan(*args, **kwargs):
+        """只有实际核验成功的模拟结果才能清除目标。"""
+        assert kwargs['locate_only']
+        assert args[5] == {(item['timestamp'], item['local_id']): item}
+        if located:
+            args[5].clear()
+        return int(located)
+
+    with patch.object(backfill, 'parse_args', return_value=options), \
+            patch.object(backfill, 'load_inventory', return_value=('chat', [item])), \
+            patch.object(backfill, 'task_lock', return_value=nullcontext()), \
+            patch.object(backfill, 'WechatChatAdapter', return_value=adapter), \
+            patch.object(backfill, 'close_preview'), patch.object(backfill, 'close_history'), \
+            patch.object(backfill, 'history_window'), patch.object(backfill, 'expired_attempts') as expired, \
+            patch.object(backfill, 'run_day', side_effect=scan) as run:
+        if located:
+            backfill.main()
+        else:
+            with pytest.raises(ChatAutomationError, match='未找到全部'):
+                backfill.main()
+        run.assert_called_once()
+        expired.assert_not_called()
+
+
+@pytest.mark.parametrize('expired', [False, True])
+def test_normal_scan_preserves_original_download_and_expiration_rules(tmp_path, expired):
+    """正常任务仍按真实过期提示处理，不能让重建查询改变原图或过期判定。"""
+    stamp, local_id = 1792073150, 6368
+    targets = {(stamp, local_id): {'key': 'chat:6368:1792073150', 'timestamp': stamp}}
+    row = SimpleNamespace(Name='图片 昨天 22:05', BoundingRectangle=(0, 0, 600, 400),
+                          GetRuntimeId=lambda: [1])
+    listing = SimpleNamespace(AutomationId='search_message_list', GetChildren=lambda: [row],
+                              BoundingRectangle=(0, 0, 600, 500))
+    history, preview = SimpleNamespace(control='history'), SimpleNamespace(control='preview')
+    nodes = [SimpleNamespace(Name='图片已过期或被清理' if expired else '查看原图',
+                             ControlTypeName='TextControl' if expired else 'ButtonControl')]
+    adapter = Mock()
+    adapter.cancelled.return_value = False
+    with patch.object(backfill, 'select_day', return_value=history), \
+            patch.object(backfill, 'one_window', return_value=history), \
+            patch.object(backfill, 'walk', side_effect=lambda control:
+                         [listing] if control == 'history' else nodes), \
+            patch.object(backfill, 'preview_image', return_value=(preview, stamp, local_id)), \
+            patch.object(backfill, 'current_state', return_value='original'), \
+            patch.object(backfill, 'record_attempt') as record, \
+            patch.object(backfill, 'validated_window_click') as click, \
+            patch.object(backfill, 'close_preview'), patch.object(backfill.time, 'sleep'):
+        count = backfill.scan_day(adapter, history, '群', 'chat', date(2026, 10, 15),
+                                  targets, tmp_path, '群', 0)
+    assert count == 1 and not targets
+    assert click.call_count == int(not expired)
+    record.assert_called_once_with('chat:6368:1792073150', 'expired' if expired else 'original')
