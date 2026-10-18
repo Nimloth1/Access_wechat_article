@@ -1,14 +1,16 @@
 ﻿# encoding: UTF-8
+# version: 1.1 @20261018: 显式指定监控日期，按开始日期命名任务。
 # version: 1.0 @20261017: 安装一次性的交互桌面关屏诊断任务。
 [CmdletBinding()]
 param(
-    [DateTimeOffset]$StartAt = '2026-10-17T23:00:00+08:00',
-    [DateTimeOffset]$EndAt = '2026-10-18T09:00:00+08:00',
-    [string]$TaskName = 'Codex-Screen-Idle-20261017'
+    [Parameter(Mandatory = $true)][DateTimeOffset]$StartAt,
+    [Parameter(Mandatory = $true)][DateTimeOffset]$EndAt,
+    [string]$TaskName = ''
 )
 
 $ErrorActionPreference = 'Stop'
 if ($EndAt -le $StartAt -or $EndAt -le [DateTimeOffset]::Now) { throw 'Invalid or expired monitoring window.' }
+if (-not $TaskName) { $TaskName = 'Codex-Screen-Idle-' + $StartAt.ToString('yyyyMMdd') }
 $scriptPath = Join-Path $PSScriptRoot 'watch-screen-idle.ps1'
 if (-not (Test-Path -LiteralPath $scriptPath)) { throw "Collector missing: $scriptPath" }
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()

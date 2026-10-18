@@ -1,15 +1,17 @@
 ﻿# encoding: UTF-8
+# version: 1.1 @20261018: 修复计划任务默认日志路径绑定失败。
 # version: 1.0 @20261017: 夜间只读关屏诊断，采集输入空闲、电源和 Deskflow 时间线。
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][DateTimeOffset]$StartAt,
     [Parameter(Mandatory = $true)][DateTimeOffset]$EndAt,
-    [string]$OutputDirectory = (Join-Path $PSScriptRoot '..\data\screen-idle'),
+    [string]$OutputDirectory = '',
     [ValidateRange(1, 60)][int]$IntervalSeconds = 5
 )
 
 $ErrorActionPreference = 'Stop'
 if ($EndAt -le $StartAt) { throw 'EndAt must be later than StartAt.' }
+if (-not $OutputDirectory) { $OutputDirectory = Join-Path $PSScriptRoot '..\data\screen-idle' }
 $OutputDirectory = [IO.Path]::GetFullPath($OutputDirectory)
 New-Item -ItemType Directory -Force -Path $OutputDirectory | Out-Null
 $runDirectory = Join-Path $OutputDirectory ($StartAt.ToString('yyyyMMdd-HHmmss'))
