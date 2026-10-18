@@ -13,6 +13,7 @@
 # version: 3.2 @20261012: 公众号任务兼容读屏、最小化恢复及独立账号窗口导航;
 # version: 3.3 @20261013: 微信已在前台仍被局部遮挡时强制置顶并复查坐标;
 # version: 3.4 @20261014: 遮挡及桌面不可交互时记录原始窗口元数据和会话状态;
+# version: 3.5 @20261018: 显式窗口消息模式支持锁屏，保留同会话窗口和消息身份核验;
 """微信聊天 UIA 适配器；控件不可见、身份不明确时停止，不用盲点兜底。"""
 from __future__ import annotations
 
@@ -22,6 +23,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 import hashlib
+import os
 from pathlib import Path
 import re
 from threading import Event
@@ -170,6 +172,10 @@ class WechatChatAdapter:
         self.guard = WindowsHomeWindowGuard()
         self.main = None
         self.today = date.today()
+        self._message_transport = None
+        if os.environ.get('WECHAT_WINDOW_MESSAGES') == '1':
+            from src.modules.window.wechat_window_messages import WindowMessageTransport
+            self._message_transport = WindowMessageTransport()
 
     def cancelled(self) -> bool:
         """检查停止按钮和 F9，不向其他窗口发送按键。"""
@@ -268,6 +274,10 @@ class WechatChatAdapter:
 
     def _activate(self, context: ChatContext, *, force: bool = False) -> None:
         """桌面不可交互时停止，在获得前台窗口后才允许输入或调用控件。"""
+        transport = getattr(self, '_message_transport', None)
+        if transport is not None:
+            transport.activate(context, force=force)
+            return
         user32 = ctypes.WinDLL('user32', use_last_error=True)
         user32.OpenInputDesktop.argtypes = [ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
         user32.OpenInputDesktop.restype = ctypes.c_void_p
@@ -334,6 +344,9 @@ class WechatChatAdapter:
         if self.cancelled() and not cleanup:
             raise ChatAutomationError("已取消")
         self._nodes(context)
+        if (getattr(self, '_message_transport', None) is not None
+                and control.ProcessId != context.window.control.ProcessId):
+            raise ChatAutomationError('窗口消息控件进程与目标窗口不符')
         target_context = context
         handle = control.GetTopLevelControl().NativeWindowHandle
         if handle and handle != context.window.handle:
@@ -367,6 +380,9 @@ class WechatChatAdapter:
     def _click(self, context: ChatContext, control: Any, *, cleanup: bool = False,
                keep_parent_active: bool = False) -> None:
         """核验窗口归属后点击；任务取消时仅允许关闭本任务的接收窗口。"""
+        if getattr(self, '_message_transport', None) is not None:
+            self._post_click(context, control, cleanup=cleanup, keep_parent_active=keep_parent_active)
+            return
         self._click_target(context, control, cleanup=cleanup, keep_parent_active=keep_parent_active)
         control.Click(simulateMove=False)
 
@@ -388,6 +404,10 @@ class WechatChatAdapter:
 
     def _check_point(self, context: ChatContext, x: int, y: int, *, phase: str = 'point_check') -> None:
         """核验附件坐标归属；记录原始 HWND 快照后将遮挡错误纳入任务摘要。"""
+        transport = getattr(self, '_message_transport', None)
+        if transport is not None:
+            transport.check_point(context, x, y, phase=phase)
+            return
         from types import SimpleNamespace
         try:
             self.guard.ensure_target_clickable(context.window, SimpleNamespace(
@@ -418,6 +438,9 @@ class WechatChatAdapter:
         指定 ``name`` 时允许冷启动：即便当前没有可读的对话标题，也会直接找
         左侧会话搜索框并打开目标会话，供公众号自动进历史消息页使用。
         """
+        transport = getattr(self, '_message_transport', None)
+        if transport is not None:
+            return transport.open_chat(self, name)
         diagnostic = self.diagnose()
         if not diagnostic["ready"] and name is None:
             raise ChatAutomationError(diagnostic["detail"])
@@ -836,6 +859,10 @@ class WechatChatAdapter:
 
     def _wheel(self, context: ChatContext, *, older: bool, steps: int = 1) -> None:
         """只在已核验消息视口内部发送滚轮，重新校验窗口和取消状态。"""
+        transport = getattr(self, '_message_transport', None)
+        if transport is not None:
+            transport.wheel(self, context, older=older, steps=steps)
+            return
         for attempt in range(2):
             self._activate(context, force=bool(attempt))
             # 文件下载可能唤起查看器；重新激活后再读取布局，不能复用失焦前的位置。
@@ -875,7 +902,8 @@ class WechatChatAdapter:
         if self.cancelled():
             raise ChatAutomationError('已取消')
         self._activate(context)
-        if ctypes.windll.user32.GetForegroundWindow() != context.window.handle:
+        background = getattr(self, '_message_transport', None) is not None
+        if not background and ctypes.windll.user32.GetForegroundWindow() != context.window.handle:
             raise ChatAutomationError('未能激活附件所在窗口，未点击')
         self._open_bubble(context, message, bubble)
         deadline = time.monotonic() + 5
@@ -883,7 +911,7 @@ class WechatChatAdapter:
         while time.monotonic() < deadline and not self.cancelled():
             matches = []
             parent_pid = context.window.control.ProcessId
-            foreground = ctypes.windll.user32.GetForegroundWindow()
+            foreground = 0 if background else ctypes.windll.user32.GetForegroundWindow()
             for w in enumerate_desktop_windows():
                 if w.handle in ancestors or not w.visible or w.is_minimized or w.process_name.lower() not in {"weixin.exe", "wechat.exe"}:
                     continue
@@ -891,7 +919,7 @@ class WechatChatAdapter:
                 # 旧窗口必须由这次点击带到前台。已可见的转发还须与卡片标题相符；
                 # 不接管内容身份未确认的旧图片预览，也不进入任意已打开的同名窗口。
                 if previous is not None:
-                    if foreground != w.handle:
+                    if background or foreground != w.handle:
                         continue
                     if previous.visible and not (class_name == FORWARD_CLASS and
                             w.title.strip() and w.title.strip() in label):
@@ -909,6 +937,8 @@ class WechatChatAdapter:
 
     def _bubble_point(self, context: ChatContext, message: ChatMessage, bubble: Any) -> tuple[int, int]:
         """遮挡时重新激活、读取与采样一次；不重复已经发送的附件点击。"""
+        if getattr(self, '_message_transport', None) is not None:
+            raise ChatAutomationError('后台模式不支持通用像素定位；请使用已核验附件正文路线')
         for attempt in range(4):
             if self.cancelled():
                 raise ChatAutomationError('已取消')
@@ -1002,6 +1032,8 @@ class WechatChatAdapter:
 
     def _open_bubble(self, context: ChatContext, message: ChatMessage, bubble: Any) -> None:
         """仅双击图片和转发正文；文件不经过这个入口。"""
+        if getattr(self, '_message_transport', None) is not None:
+            raise ChatAutomationError('后台模式不支持通用物理双击；请使用窗口消息附件路线')
         if message.kind not in {'image', 'forward'}:
             raise ChatAutomationError('不允许双击文件')
         x, y = self._bubble_point(context, message, bubble)
@@ -1141,6 +1173,8 @@ class WechatChatAdapter:
     def _download_file(self, context: ChatContext, message: ChatMessage, timeout: float,
                        verify_existing: bool = False) -> str:
         """使用下载按钮或未下载文档的单击入口；已可用文件不再打开。"""
+        if getattr(self, '_message_transport', None) is not None:
+            raise ChatAutomationError('后台模式不支持通用文件打开；请使用明确下载按钮')
         deadline = time.monotonic() + timeout
         clicked = False
         while time.monotonic() < deadline and not self.cancelled():
@@ -1209,6 +1243,8 @@ class WechatChatAdapter:
 
     def _file_menu(self, context: ChatContext, message: ChatMessage) -> list[Any]:
         """在已核验文件正文内打开右键菜单，避开整行空白区。"""
+        if getattr(self, '_message_transport', None) is not None:
+            raise ChatAutomationError('后台模式不支持通用右键菜单')
         bubble = self._fresh_target(context, message)
         self._activate(context)
         if self.cancelled():
@@ -1222,6 +1258,8 @@ class WechatChatAdapter:
 
     def _dismiss_menu(self, context: ChatContext) -> None:
         """只有当前对话中仍有本任务菜单时才发送退出菜单的按键。"""
+        if getattr(self, '_message_transport', None) is not None:
+            raise ChatAutomationError('后台模式不发送全局Escape')
         if any(n.ControlTypeName == 'MenuItemControl' and n.ClassName == 'mmui::XMenuView'
                for n in self._nodes(context)):
             self._activate(context)

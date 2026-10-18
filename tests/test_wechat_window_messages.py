@@ -1,0 +1,82 @@
+"""锁屏消息路径拒绝错进程、跨会话和越界输入；默认交互路径保持关闭。"""
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
+import pytest
+from src.modules.window.wechat_window_messages import WindowMessageTransport
+from src.modules.window.wechat_chat_adapter import WechatChatAdapter
+from src.services.chat_attachment_service import ChatAutomationError
+
+
+@pytest.fixture
+def target():
+    live = dict(pid=42, session=3, started=100, name='Weixin.exe', visible=True, iconic=False, exists=True)
+    reader = Mock()
+    reader.session.return_value = {'id': 3, 'info': {'locked': True}}
+    reader.user32.IsWindow.side_effect = lambda h: live['exists']
+    reader.user32.IsWindowVisible.side_effect = lambda h: live['visible']
+    reader.user32.IsIconic.side_effect = lambda h: live['iconic']
+    reader.user32.GetWindowThreadProcessId.side_effect = lambda h, p: setattr(p._obj, 'value', live['pid']) or 1
+    reader.kernel32.ProcessIdToSessionId.side_effect = lambda pid, p: setattr(p._obj, 'value', live['session']) or True
+    def rect(h, p):
+        for k,v in zip(['left','top','right','bottom'],[100,200,400,600]):
+            setattr(p._obj,k,v)
+        return True
+    reader.user32.GetWindowRect.side_effect = rect
+    process = Mock()
+    process.name.side_effect = lambda: live['name']
+    process.create_time.side_effect = lambda: live['started']
+    context = SimpleNamespace(window=SimpleNamespace(handle=123,control=SimpleNamespace(ProcessId=42)))
+    with patch('src.modules.window.wechat_window_messages._Reader',return_value=reader), \
+         patch('src.modules.window.wechat_window_messages.psutil.Process',return_value=process):
+        yield WindowMessageTransport(),context,live,reader
+
+
+def test_locked_session_window_validation_does_not_require_foreground(target):
+    transport,context,live,reader=target
+    reader.user32.GetForegroundWindow.side_effect=AssertionError('must not inspect global foreground')
+    transport.check_point(context,100,200)
+    transport.check_point(context,399,599)
+    reader.user32.GetForegroundWindow.assert_not_called()
+
+
+@pytest.mark.parametrize('field,value',[('pid',99),('session',4),('session',0),('name','LockApp.exe'),('visible',False),('iconic',True),('exists',False)])
+def test_wrong_or_unusable_window_rejected(target,field,value):
+    transport,context,live,_=target
+    live[field]=value
+    with pytest.raises(ChatAutomationError):transport.check_point(context,200,300)
+
+
+def test_reused_process_identity_rejected(target):
+    transport,context,live,_=target
+    transport.check_point(context,200,300)
+    live['started']=101
+    with pytest.raises(ChatAutomationError):transport.check_point(context,200,300)
+
+
+@pytest.mark.parametrize('x,y',[(99,300),(400,300),(200,199),(200,600)])
+def test_outside_window_never_allowed(target,x,y):
+    transport,context,_,_=target
+    with pytest.raises(ChatAutomationError):transport.check_point(context,x,y)
+
+
+def test_explicit_transport_delegates_without_foreground_activation():
+    adapter=object.__new__(WechatChatAdapter)
+    adapter._message_transport=Mock()
+    with patch('ctypes.WinDLL',side_effect=AssertionError('physical activation forbidden')):
+        adapter._activate('context')
+    adapter._message_transport.activate.assert_called_once_with('context',force=False)
+
+
+def test_message_click_does_not_fall_back_to_uia_mouse():
+    adapter=object.__new__(WechatChatAdapter)
+    adapter._message_transport=Mock();adapter._post_click=Mock()
+    control=Mock();control.Click.side_effect=AssertionError('physical input forbidden')
+    adapter._click('context',control)
+    adapter._post_click.assert_called_once_with('context',control,cleanup=False,keep_parent_active=False)
+    control.Click.assert_not_called()
+
+
+@pytest.mark.parametrize('method,args',[('_bubble_point',(None,None,None)),('_open_bubble',(None,None,None)),('_download_file',(None,None,1)),('_file_menu',(None,None)),('_dismiss_menu',(None,))])
+def test_unsupported_routes_fail_before_any_global_input(method,args):
+    adapter=object.__new__(WechatChatAdapter);adapter._message_transport=Mock()
+    with pytest.raises(ChatAutomationError,match='后台模式'):getattr(adapter,method)(*args)
