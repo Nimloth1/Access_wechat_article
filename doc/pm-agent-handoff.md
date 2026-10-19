@@ -140,3 +140,15 @@ scp PW:D:/projects/d/access_wechat_article/output/weress-capture-20261011/handof
 可给 PM Agent 的指令：
 
 > 先通过 SSH 读取 PW 的 `D:/projects/d/access_wechat_article/doc/pm-agent-handoff.md`，按其客户端示例检查 health、diagnose 和现有归档。PW AWA 可从微信 PC 公众号主页补抓；先每账号 2 篇验证，再串行扩大。不要把 AWA 未提供的队列或指定 URL 接口当成已存在功能。此次只采集归档、输出交接结果，不修改 WeRSS、不回填。
+
+
+## 2026-10-19 维修补充
+
+长期 serve 实例启动于 10-13 的 force 参数修复之前，已在空闲状态重启，避免
+磁盘代码与运行时不一致。失败任务调用栈现在进入服务 stderr 日志。更新代码后须
+在 active_job 为空时重启现役 AWA_Agent_Service，并验证实际任务结果。
+
+锁屏控制实验保存在 codex/2026-10-19-awa-locked-probe（0e4fcf4），未部署。
+91 测试及10子测试通过，仅导航、只读页面定位和内部渲染焦点得到实测；
+正文捕获仍未通过文章标签打开验收，回填0，不能声称锁屏公众号已修好。
+正式 main 保持原启动方式。PM 证据见 feishu-healthchecks/awa-dispatch-repair-20261019/。

@@ -87,6 +87,8 @@ class AgentJobs:
         try:
             result = self.runner(job['kind'], job['request'], job['stop'])
         except Exception as exc:
+            import traceback
+            traceback.print_exc()
             error = f'{type(exc).__name__}: {exc}'
         finally:
             timer.cancel()
