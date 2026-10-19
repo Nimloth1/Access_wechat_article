@@ -106,7 +106,7 @@ class WechatHomeScroller:
             self._home_guard.activate(home_window)
         except HomeWindowNotClickableError:
             return False
-        if not _foreground_belongs_to_window(
+        if not self._home_guard.message_mode and not _foreground_belongs_to_window(
             user32,
             home_window.handle,
         ):
@@ -117,6 +117,12 @@ class WechatHomeScroller:
             home_handle=home_window.handle,
         )
         x, y = _scroll_point(home_window, visible_targets)
+        if self._home_guard.message_mode:
+            from types import SimpleNamespace
+            self._home_guard.ensure_target_clickable(home_window, SimpleNamespace(
+                home_window_handle=home_window.handle, click_x=x, click_y=y))
+            from src.modules.window.article_clicker import _resolve_click_message_target, _Point
+            target_handle = _resolve_click_message_target(user32, home_window.handle, _Point(x, y))
         steps = (
             self._wheel_steps
             if wheel_steps is None

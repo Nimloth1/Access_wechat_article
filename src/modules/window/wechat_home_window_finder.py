@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable
 import ctypes
 from ctypes import wintypes
+import os
 import platform
 from pathlib import Path
 import time
@@ -198,8 +199,20 @@ def enumerate_win32_windows(*, user32: Any | None = None) -> list[WindowInfo]:
 
 def attach_uia_control(window: WindowInfo) -> WindowInfo:
     """按已找到的窗口句柄挂接 UIA 控件，供后续读取文章结构。"""
-    if window.control is not None or window.handle <= 0:
+    message_browser = (os.environ.get("WECHAT_WINDOW_MESSAGES") == "1"
+                       and window.process_name.lower() == WECHAT_HOME_PROCESS
+                       and WECHAT_CHROME_CLASS_MARKER in window.class_name.lower())
+    if window.handle <= 0:
         return window
+    if window.control is not None and not message_browser:
+        return window
+    if message_browser:
+        import uiautomation as auto
+        control = auto.ControlFromHandle(_active_message_render(window))
+        if control is None:
+            raise RuntimeError("后台模式未读到活动网页渲染控件")
+        from dataclasses import replace
+        return replace(window, control=control)
     try:
         import uiautomation as auto
 
@@ -218,6 +231,19 @@ def attach_uia_control(window: WindowInfo) -> WindowInfo:
         is_minimized=window.is_minimized,
         control=control,
     )
+
+
+def _active_message_render(window: WindowInfo) -> int:
+    """只挂接当前原生渲染窗口，排除仍暴露 UIA 的后台旧主页。"""
+    from src.modules.window.article_clicker import _resolve_click_message_target, _Point
+    left, top, right, bottom = window.rect
+    target = _resolve_click_message_target(
+        _USER32, window.handle, _Point((left + right) // 2, top + (bottom - top) * 2 // 3))
+    name = ctypes.create_unicode_buffer(256)
+    _USER32.GetClassNameW(target, name, 256)
+    if name.value != "Chrome_RenderWidgetHostHWND":
+        raise RuntimeError("后台模式无法唯一核验活动网页渲染窗口")
+    return target
 
 
 def enumerate_uia_windows(

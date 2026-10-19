@@ -5,6 +5,7 @@ from collections.abc import Callable, Mapping
 import ctypes
 from ctypes import wintypes
 import hashlib
+import os
 import platform
 import re
 import time
@@ -366,12 +367,18 @@ class UiaWechatBrowserTabAdapter:
             normalize_article_title(item) for item in EXPLICIT_HOME_TITLES
         }:
             raise RuntimeError("拒绝关闭公众号主页标签")
-        self._require_close_owner_window(selected.owner_handle)
+        owner = self._require_close_owner_window(selected.owner_handle)
 
         if not selected.is_active and not selected.tab_id.startswith("window:"):
             raise RuntimeError("拒绝关闭非活动文章标签，避免 Ctrl+W 关闭错误标签")
         if selected.tab_id.startswith("window:"):
             raise RuntimeError("未读取到文章标签或网页文档，无法安全确认关闭")
+
+        if os.environ.get("WECHAT_WINDOW_MESSAGES") == "1":
+            self._close_message_button(selected, owner)
+            if not self._wait_until_document_title_changes(selected):
+                raise RuntimeError("窗口消息关闭后未确认文章页变化，已停止")
+            return
 
         # 仅点击已匹配文章标题的标签行内关闭按钮；窗口级快捷键只作兜底，
         # 不使用顶层关闭按钮、中键点击或 WM_CLOSE，避免关闭主页窗口。
@@ -393,6 +400,26 @@ class UiaWechatBrowserTabAdapter:
             self._document_keyboard_closer(selected.owner_handle)
         if not self._wait_until_document_title_changes(selected):
             raise RuntimeError("关闭按钮和 Ctrl+W 均已尝试，但文章标签仍处于活动状态")
+
+    def _close_message_button(self, selected: BrowserTabInfo, owner: Any) -> None:
+        """只点已核对标题的文章标签关闭按钮，禁止全局输入及关闭顶层窗口。"""
+        from types import SimpleNamespace
+        from src.modules.window.wechat_window_messages import WindowMessageTransport
+        control = selected.control
+        buttons = [item for item in control.GetChildren() if _is_close_button_control(item)]
+        if len(buttons) != 1:
+            raise RuntimeError("后台模式无法唯一确认文章标签关闭按钮")
+        button = buttons[0]
+        if button.ProcessId != owner.control.ProcessId or button.IsOffscreen:
+            raise RuntimeError("后台模式文章关闭按钮不属于可见的目标进程")
+        bounds = rect_to_tuple(button.BoundingRectangle)
+        x, y = (bounds[0] + bounds[2]) // 2, (bounds[1] + bounds[3]) // 2
+        transport = WindowMessageTransport(process_names={"wechatappex.exe"})
+        context = SimpleNamespace(window=owner)
+        transport.activate(context)
+        transport.check_point(context, x, y)
+        from src.modules.window.article_clicker import invoke_accessible_action
+        invoke_accessible_action(button)
 
     def _require_close_owner_window(self, owner_handle: int) -> Any:
         owner = next(
@@ -913,6 +940,8 @@ def _activate_keyboard_target(
 
 
 def _activate_tab_control(control: Any) -> None:
+    if os.environ.get("WECHAT_WINDOW_MESSAGES") == "1":
+        return
     # UIA 控件激活有时比 Win32 前台切换更容易把 Chromium 标签页设为键盘目标。
     if control is None:
         return

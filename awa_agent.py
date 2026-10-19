@@ -26,7 +26,8 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--version', action='version', version=__version__)
     sub = parser.add_subparsers(dest='command', required=True)
-    sub.add_parser('serve', help='仅在已登录、未锁屏的 Windows 桌面启动')
+    server = sub.add_parser('serve', help='在已登录的 Windows 会话启动')
+    server.add_argument('--window-messages', action='store_true', help='使用已核验窗口消息，支持锁屏且禁止全局输入')
     sub.add_parser('health')
     diagnostic = sub.add_parser('diagnose', help='检查微信搜索控件；不切换对话')
     diagnostic.add_argument('--accessibility', choices=['auto', 'off', 'on'], default='auto')
@@ -124,6 +125,8 @@ def main(argv=None):
         if not token:
             raise ValueError('请先配置 AWA_AGENT_TOKEN 环境变量')
         if args.command == 'serve':
+            if args.window_messages:
+                os.environ['WECHAT_WINDOW_MESSAGES'] = '1'
             serve(token)
             return 0
         if args.command in {'chat', 'articles', 'chat-v2', 'articles-v2', 'chat-action'}:

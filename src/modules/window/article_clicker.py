@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 from dataclasses import dataclass
+import os
 import platform
 import time
 from typing import Any, Callable
@@ -37,13 +38,71 @@ class ArticleClicker:
         self._native_click = native_click or _post_message_click
         # 兼容旧工厂/测试注入参数，但主页点击不再调用 UIA Click 或系统鼠标。
         del uia_click, screen_click
+        self._article_message_transport = None
 
     def click(self, target: ArticleTarget) -> ClickResult:
+        if os.environ.get("WECHAT_WINDOW_MESSAGES") == "1":
+            return self._invoke_message_article(target)
         return self.click_point(
             target.home_window_handle,
             target.click_x,
             target.click_y,
         )
+
+    def _resolve_message_target(self, target: ArticleTarget) -> ArticleTarget:
+        """队列只传元数据；在执行线程重新读取同一主页，绑定唯一文章控件。"""
+        from src.modules.window.wechat_home_window_finder import enumerate_win32_windows, attach_uia_control
+        from src.modules.window.wechat_home_reader import WechatHomeReader
+        from src.modules.window.article_card_reader import UiaArticleCardReader
+        windows = [w for w in enumerate_win32_windows() if w.handle == target.home_window_handle]
+        if len(windows) != 1:
+            raise RuntimeError("后台文章主页句柄已失效")
+        window = attach_uia_control(windows[0])
+        if WechatHomeReader().read(window).account_name != target.account_name:
+            raise RuntimeError("后台文章主页账号已变化")
+        rows = UiaArticleCardReader().read_viewport(window, account_name=target.account_name).targets
+        matches = [r for r in rows if " ".join(r.title.split()) == " ".join(target.title.split())
+                   and (not target.published_date or r.published_date == target.published_date)]
+        if len(matches) != 1:
+            raise RuntimeError(f"后台文章当前不可唯一定位: {target.title}; matches={len(matches)}")
+        return matches[0]
+
+    def _invoke_message_article(self, target: ArticleTarget) -> ClickResult:
+        """后台模式调用精确文章卡片的 UIA Invoke，不把合成鼠标事件当作成功。"""
+        from types import SimpleNamespace
+        from src.modules.window.wechat_home_window_finder import rect_to_tuple
+        if target.control is None:
+            target = self._resolve_message_target(target)
+        if self._article_message_transport is None:
+            from src.modules.window.wechat_window_messages import WindowMessageTransport
+            self._article_message_transport = WindowMessageTransport(process_names={"wechatappex.exe"})
+        context = SimpleNamespace(window=SimpleNamespace(
+            handle=target.home_window_handle, control=target.control))
+        self._article_message_transport.activate(context)
+        self._article_message_transport.check_point(context, target.click_x, target.click_y)
+        expected = " ".join(target.title.split())
+        current = target.control
+        for _ in range(5):
+            if current is None:
+                break
+            if current.ProcessId != target.control.ProcessId:
+                raise RuntimeError("文章卡片进程归属改变，已停止调用")
+            pattern = current.GetPattern(10000)  # UIA InvokePattern
+            if pattern is not None:
+                queue, nodes = [current], []
+                while queue:
+                    node = queue.pop()
+                    nodes.append(node)
+                    if len(nodes) > 32:
+                        raise RuntimeError("文章可调用卡片范围超限，已停止")
+                    queue.extend(node.GetChildren())
+                matches = [node for node in nodes if " ".join(node.Name.split()) == expected]
+                left, top, right, bottom = rect_to_tuple(current.BoundingRectangle)
+                if len(matches) == 1 and left <= target.click_x < right and top <= target.click_y < bottom:
+                    method = invoke_accessible_action(current)
+                    return ClickResult(method, target.home_window_handle, target.click_x, target.click_y)
+            current = current.GetParentControl()
+        raise RuntimeError("后台模式未找到已核对文章标题的可调用卡片")
 
     def click_point(
         self,
@@ -68,6 +127,20 @@ class ArticleClicker:
             )
         except Exception as native_error:
             raise RuntimeError(f"Win32 点击失败：{native_error}") from native_error
+
+
+def invoke_accessible_action(control: Any) -> str:
+    """优先使用控件明确提供的 MSAA 默认动作；不在一次调用失败后重发。"""
+    legacy = control.GetPattern(10018)  # LegacyIAccessiblePattern
+    action = legacy.DefaultAction if legacy is not None else ""
+    if isinstance(action, str) and action.strip().lower() in {"按", "按下", "点击", "单击", "press", "click"}:
+        legacy.DoDefaultAction()
+        return "uia_legacy_default_action"
+    pattern = control.GetPattern(10000)
+    if pattern is None:
+        raise RuntimeError("后台控件没有可调用的动作")
+    pattern.Invoke()
+    return "uia_invoke"
 
 
 class _Point(ctypes.Structure):
@@ -105,6 +178,8 @@ def _post_message_click(hwnd: int, screen_x: int, screen_y: int) -> None:
 
 def _resolve_click_message_target(user32: Any, home_hwnd: int, point: _Point) -> int:
     """只允许把消息发给主页本身或鼠标点下方的主页子窗口。"""
+    if os.environ.get("WECHAT_WINDOW_MESSAGES") == "1":
+        return _message_child_at_point(user32, home_hwnd, point)
     try:
         candidate = int(user32.WindowFromPoint(point) or 0)
         if candidate == int(home_hwnd):
@@ -114,6 +189,38 @@ def _resolve_click_message_target(user32: Any, home_hwnd: int, point: _Point) ->
     except Exception:
         pass
     return int(home_hwnd)
+
+
+def _message_child_at_point(user32: Any, home_hwnd: int, point: _Point) -> int:
+    """只在已核验主页内部按原生子窗口层级命中，锁屏不会改变接收窗口。"""
+    from ctypes import wintypes
+    query = user32.ChildWindowFromPointEx
+    try:
+        query.argtypes = [wintypes.HWND, _Point, wintypes.UINT]
+        query.restype = wintypes.HWND
+    except AttributeError:
+        pass
+    root_pid = wintypes.DWORD()
+    user32.GetWindowThreadProcessId(home_hwnd, ctypes.byref(root_pid))
+    if not root_pid.value:
+        raise RuntimeError("主页进程身份无法核验")
+    current = int(home_hwnd)
+    for _ in range(8):
+        local = _Point(point.x, point.y)
+        if not user32.ScreenToClient(current, ctypes.byref(local)):
+            raise RuntimeError("后台子窗口坐标转换失败")
+        # Chromium 渲染 HWND 带透明样式，但仍是定向消息接收者；不能按全屏命中跳过它。
+        child = int(query(current, local, 1 | 2) or 0)
+        if not child:
+            raise RuntimeError("后台子窗口命中失败，已停止点击")
+        if child == current:
+            return current
+        pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(child, ctypes.byref(pid))
+        if not user32.IsChild(home_hwnd, child) or pid.value != root_pid.value:
+            raise RuntimeError("后台点击子窗口不属于已核验的微信主页进程")
+        current = child
+    raise RuntimeError("后台子窗口层级超限，已停止点击")
 
 
 def _screen_to_client_physical(user32: Any, hwnd: int, point: _Point) -> None:

@@ -5,15 +5,16 @@ import ctypes
 from ctypes import wintypes
 import time
 import psutil
-from src.modules.window.wechat_chat_adapter import ChatContext,walk,unique,local_chat_matches
+from src.modules.window.wechat_chat_adapter import ChatContext,walk,unique,local_chat_matches,enumerate_desktop_windows
 from src.modules.window.wechat_home_window_finder import rect_to_tuple
 from src.modules.window.window_diagnostics import _Reader
 from src.services.chat_attachment_service import ChatAutomationError
 
 
 class WindowMessageTransport:
-    def __init__(self):
+    def __init__(self, *, process_names=None):
         """记录调用者会话及目标进程身份，拒绝跨会话操作。"""
+        self._message_process_names = frozenset(process_names or {'weixin.exe', 'wechat.exe'})
         self._message_owners = {}
         self._message_session = _Reader().session()['id']
 
@@ -32,7 +33,7 @@ class WindowMessageTransport:
         identity = (pid.value,process.create_time())
         if (session.value != self._message_session or not self._message_session
                 or pid.value != window.control.ProcessId
-                or process.name().lower() not in {'weixin.exe','wechat.exe'}):
+                or process.name().lower() not in self._message_process_names):
             raise ChatAutomationError('窗口消息目标不是同会话的已核验微信')
         if window.handle in self._message_owners and self._message_owners[window.handle] != identity:
             raise ChatAutomationError('窗口消息句柄被其他进程复用')
@@ -55,6 +56,38 @@ class WindowMessageTransport:
             if not u.PostMessageW(context.window.handle,msg,1 if msg in (0x001C,0x0006) else 0,0):
                 raise ChatAutomationError('无法投递微信窗口焦点消息')
         time.sleep(.1)
+        self._focus_browser(context)
+
+    def _focus_browser(self, context):
+        """只设置已核验浏览器队列的渲染焦点，不改变系统前台或输入桌面。"""
+        if psutil.Process(context.window.control.ProcessId).name().lower() != 'wechatappex.exe':
+            return
+        from src.modules.window.wechat_home_window_finder import _active_message_render
+        reader = _Reader(); user = reader.user32
+        from types import SimpleNamespace
+        child = _active_message_render(SimpleNamespace(
+            handle=context.window.handle, rect=self.verify_window(context)))
+        target_thread = user.GetWindowThreadProcessId(context.window.handle, None)
+        current_thread = reader.kernel32.GetCurrentThreadId()
+        if not target_thread or not current_thread:
+            raise ChatAutomationError('浏览器输入线程无法核验')
+        msg = wintypes.MSG()
+        user.PeekMessageW(ctypes.byref(msg), None, 0, 0, 0)
+        for name in ('SetActiveWindow', 'SetFocus'):
+            function = getattr(user, name)
+            function.argtypes = [wintypes.HWND]; function.restype = wintypes.HWND
+        user.GetFocus.restype = wintypes.HWND
+        attached = current_thread != target_thread
+        if attached and not user.AttachThreadInput(current_thread, target_thread, True):
+            raise ChatAutomationError('无法连接已核验浏览器的输入队列')
+        try:
+            user.SetActiveWindow(context.window.handle)
+            user.SetFocus(child)
+            if int(user.GetFocus() or 0) != child:
+                raise ChatAutomationError('浏览器渲染焦点未确认，已停止')
+        finally:
+            if attached:
+                user.AttachThreadInput(current_thread, target_thread, False)
 
     def check_point(self, context, x, y, *, phase='point_check'):
         """窗口消息只接受已核验窗口内部的坐标，不用全屏命中替代归属。"""
@@ -85,6 +118,16 @@ class WindowMessageTransport:
         match = unique(local_chat_matches(listing.GetChildren(),name),'精确会话')
         adapter._post_click(context,match,keep_parent_active=True)
         for _ in range(25):
+            # 新版微信可能已把公众号打开为独立窗口，主壳 UIA 同时失效。
+            # 先核对该窗口，再交回 open_account 的既有独立窗口路线。
+            independent = [w for w in enumerate_desktop_windows()
+                           if w.title == name and w.visible and not w.is_minimized
+                           and w.process_name.lower() in {'weixin.exe', 'wechat.exe'}]
+            if len(independent) == 1:
+                candidate = ChatContext(adapter._window(independent[0]), name, switching=True)
+                if candidate.window.control.ProcessId == adapter.main.control.ProcessId:
+                    self.verify_window(candidate)
+                    raise ChatAutomationError('未在等待时间内确认目标对话已打开')
             titles = [n for n in walk(adapter.main.control) if n.AutomationId.endswith('current_chat_name_label')]
             if len(titles)==1 and titles[0].Name.strip()==name:
                 return ChatContext(adapter.main,name)

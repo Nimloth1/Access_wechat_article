@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import os
 import platform
 import time
 from typing import Any, Callable
@@ -43,8 +44,24 @@ class WindowsHomeWindowGuard:
         self._platform_name = platform_name or platform.system()
         self._activation_wait_seconds = max(0.0, float(activation_wait_seconds))
         self._sleep = sleep
+        self._message_transport = None
+
+    @property
+    def message_mode(self) -> bool:
+        return os.environ.get("WECHAT_WINDOW_MESSAGES") == "1"
+
+    def _window_messages(self):
+        if self._message_transport is None:
+            from src.modules.window.wechat_window_messages import WindowMessageTransport
+            self._message_transport = WindowMessageTransport(
+                process_names={"weixin.exe", "wechat.exe", "wechatappex.exe"})
+        return self._message_transport
 
     def activate(self, home_window: WindowInfo, *, force: bool = False) -> None:
+        if self.message_mode:
+            from types import SimpleNamespace
+            self._window_messages().activate(SimpleNamespace(window=home_window), force=force)
+            return
         if self._platform_name != "Windows":
             raise HomeWindowNotClickableError("微信主页激活仅支持 Windows")
         if home_window.handle <= 0:
@@ -89,6 +106,11 @@ class WindowsHomeWindowGuard:
             raise HomeWindowNotClickableError(
                 "目标文章与当前微信主页窗口句柄不一致"
             )
+        if self.message_mode:
+            from types import SimpleNamespace
+            self._window_messages().check_point(
+                SimpleNamespace(window=home_window), target.click_x, target.click_y)
+            return
         user32 = self._resolve_user32()
         point = _Point(int(target.click_x), int(target.click_y))
         # UIA 的 BoundingRectangle 与随后 Control.Click 使用当前线程的屏幕坐标。
