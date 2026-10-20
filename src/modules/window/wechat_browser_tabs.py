@@ -407,6 +407,12 @@ class UiaWechatBrowserTabAdapter:
         from src.modules.window.wechat_window_messages import WindowMessageTransport
         control = selected.control
         buttons = [item for item in control.GetChildren() if _is_close_button_control(item)]
+        if len(buttons) != 1 and owner is not None:
+            # 正文只挂接活动 render；标签栏在其外层，不能从 Document 向下找。
+            import uiautomation as auto
+            shell = auto.ControlFromHandle(selected.owner_handle)
+            button = _find_message_article_close_button(shell, selected.title)
+            buttons = [button] if button is not None else []
         if len(buttons) != 1:
             raise RuntimeError("后台模式无法唯一确认文章标签关闭按钮")
         button = buttons[0]
@@ -417,7 +423,10 @@ class UiaWechatBrowserTabAdapter:
         transport = WindowMessageTransport(process_names={"wechatappex.exe"})
         context = SimpleNamespace(window=owner)
         transport.activate(context)
-        transport.check_point(context, x, y)
+        # Chromium 的语义标签行可能暴露零坐标；只调用精确标题行的动作，
+        # 不把零坐标转成窗口左上角点击，也不退回全局键盘输入。
+        if _valid_rect(bounds):
+            transport.check_point(context, x, y)
         from src.modules.window.article_clicker import invoke_accessible_action
         invoke_accessible_action(button)
 
@@ -563,6 +572,25 @@ class UiaWechatBrowserTabAdapter:
             for child in children or []:
                 queue.append((child, depth + 1))
         return tabs
+
+
+def _find_message_article_close_button(root: Any, title: str) -> Any | None:
+    queue = deque([(root, 0)])
+    matches = []
+    visited = 0
+    while queue and visited < 4096:
+        node, depth = queue.popleft()
+        visited += 1
+        children = list(node.GetChildren() or [])
+        if _control_has_direct_title_and_close(node, title, children=children):
+            buttons = [child for child in children if _is_close_button_control(child)]
+            if len(buttons) == 1:
+                matches.append(buttons[0])
+        if depth < 20:
+            queue.extend((child, depth + 1) for child in children)
+    if queue or len(matches) != 1:
+        return None
+    return matches[0]
 
 
 def normalize_article_title(title: str) -> str:

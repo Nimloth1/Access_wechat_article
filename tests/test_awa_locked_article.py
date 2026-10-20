@@ -275,3 +275,50 @@ def test_browser_focus_targets_only_owned_queue_and_always_detaches(locked,focus
     reader.user32.SetForegroundWindow.assert_not_called()
     reader.user32.GetForegroundWindow.assert_not_called()
     reader.user32.SendInput.assert_not_called()
+
+
+def test_shell_close_lookup_rejects_window_close_and_duplicate_titles():
+    from src.modules.window.wechat_browser_tabs import _find_message_article_close_button
+    def node(kind, name='', children=()):
+        return SimpleNamespace(ControlTypeName=kind, Name=name, GetChildren=lambda: list(children))
+    close = node('ButtonControl', '关闭')
+    row = node('PaneControl', children=[node('TextControl', '文章甲'), close])
+    shell = node('PaneControl', children=[node('ButtonControl', '关闭'), row])
+    assert _find_message_article_close_button(shell, '文章甲') is close
+    assert _find_message_article_close_button(shell, '文章乙') is None
+    duplicate = node('PaneControl', children=[row, row])
+    assert _find_message_article_close_button(duplicate, '文章甲') is None
+
+
+def test_message_close_rebinds_shell_button_without_clicking_zero_coordinates(locked):
+    import uiautomation
+    from src.modules.window import wechat_browser_tabs as tabs
+    from src.modules.window import wechat_window_messages as messages
+    from src.modules.window import article_clicker
+    adapter = UiaWechatBrowserTabAdapter()
+    document = SimpleNamespace(GetChildren=lambda: [])
+    button = SimpleNamespace(ProcessId=42, IsOffscreen=False, BoundingRectangle=(0, 0, 0, 0))
+    owner = SimpleNamespace(control=SimpleNamespace(ProcessId=42))
+    selected = SimpleNamespace(control=document, owner_handle=17, title='文章甲')
+    transport = Mock()
+    with patch.object(uiautomation, 'ControlFromHandle', return_value='shell'), \
+         patch.object(tabs, '_find_message_article_close_button', return_value=button) as lookup, \
+         patch.object(messages, 'WindowMessageTransport', return_value=transport), \
+         patch.object(article_clicker, 'invoke_accessible_action') as invoke:
+        adapter._close_message_button(selected, owner)
+    lookup.assert_called_once_with('shell', '文章甲')
+    invoke.assert_called_once_with(button)
+    transport.check_point.assert_not_called()
+
+
+def test_shell_close_button_wrong_process_is_rejected(locked):
+    import uiautomation
+    from src.modules.window import wechat_browser_tabs as tabs
+    adapter = UiaWechatBrowserTabAdapter()
+    selected = SimpleNamespace(control=SimpleNamespace(GetChildren=lambda: []), owner_handle=17, title='文章甲')
+    owner = SimpleNamespace(control=SimpleNamespace(ProcessId=42))
+    button = SimpleNamespace(ProcessId=99, IsOffscreen=False)
+    with patch.object(uiautomation, 'ControlFromHandle'), \
+         patch.object(tabs, '_find_message_article_close_button', return_value=button):
+        with pytest.raises(RuntimeError, match='目标进程'):
+            adapter._close_message_button(selected, owner)

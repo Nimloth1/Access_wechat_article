@@ -158,3 +158,16 @@ scp PW:D:/projects/d/access_wechat_article/output/weress-capture-20261011/handof
 一次真实打开/关闭/归档证据，再考虑部署，禁止因单测或扫描成功恢复声明。
 已观察到 WeChatAppEx 未开启本机调试监听；本轮未重启微信客户端或改其启动参数。
 PM 权威证据：feishu-healthchecks/awa-dispatch-repair-20261019/。
+
+
+## 2026-10-21 同代码解锁/锁屏对照：仍未通过
+
+用户在本会话授权临时锁屏。起始生产 PID 228612、Session3 未锁屏；main 与远端一致。临时加载实验分支 0e4fcf4，原 wrapper 单号冷眼泽时、limit1、timeout180、include-collected。
+
+解锁时首次真实任务 fc3b3806c1614becb68f5b4fee49aea3 已打开“绝境新生”，但失败于后台模式无法唯一确认文章标签关闭按钮；report 20261021_071832.json，applied0。只读 UIA 快照确认正文活动 Document 为文章标题，语义标题/关闭行在 render 外层且坐标为零。
+
+本提交仅保留实验关闭控件重绑：从已核验浏览器外壳按唯一精确标题行找按钮，拒绝重复标题及错误进程；零坐标不得点击。48 tests +10 subtests通过。第二次解锁任务6775fe4041954e45916bd660014e72b2仍失败于关闭动作后未确认页变化，report20261021_072320.json，applied0。不能称为关闭修复。
+
+Session3 显式锁屏后，同一打开路径再跑一次，report20261021_072554.json仍“未检测到已打开的文章标签”，applied0。失败后活动 Document仍冷眼泽时主页。另一次25秒限时短测，对精确同一文章设置内部焦点后定向原生消息点击，6秒未出现新标签，前后均locked。没有启动BRM、发微信消息、保存密码或变更锁屏策略。
+
+结论：解锁时能打开文章；锁屏下本轮两种已验证路径均未导航，关闭语义动作在解锁时也无效。该现象不能外推为所有锁屏接口均不可实现。实验不得部署生产，不再扩展同层无新证据的GUI猜测。生产恢复main原serve启动；PW保持锁屏。唯一验收仍见feishu-healthchecks/awa-dispatch-repair-20261019/verification.json。默认多号入口本轮未复跑，三个真实业务任务均为有界恢复参数入口，均未成功。
