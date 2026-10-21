@@ -58,7 +58,8 @@ function Invoke-PowerCfg {
         $stdout = $process.StandardOutput.ReadToEndAsync()
         $stderr = $process.StandardError.ReadToEndAsync()
         if (-not $process.WaitForExit(10000)) {
-            $process.Kill()
+            # 超时判定与进程退出可能同时发生，进程已退出时 Kill() 会抛异常，导致整个监控中断
+            try { $process.Kill() } catch [InvalidOperationException] { }
             $process.WaitForExit()
             return @{ exit_code = -1; text = 'powercfg query timed out after 10 seconds'; timed_out = $true }
         }
