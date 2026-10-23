@@ -52,9 +52,82 @@ def row_matches(label: str, filename: str, day) -> bool:
     normalized = ' '.join(label.split())
     # WeChat omits the year for the current year. Never infer an older year.
     dates = {f'{day.year}/{day.month}/{day.day}', f'{day.year}年{day.month}月{day.day}日'}
-    if day.year == datetime.now().year:
+    today = datetime.now().date()
+    if day.year == today.year:
         dates.add(f'{day.month}/{day.day}')
-    return any(normalized == ' '.join(filename.split()) + ' ' + value for value in dates)
+    relative = {0: '今天', 1: '昨天', 2: '前天'}.get((today - day).days)
+    if relative:
+        dates.add(relative)
+    name = ' '.join(filename.split())
+    # A previous failed receive adds this status between the intact name and date.
+    return any(normalized == name + status + value
+               for value in dates for status in (' ', ' 下载失败 '))
+
+
+def receive_button(nodes):
+    buttons = [n for n in nodes if n.ControlTypeName == 'ButtonControl'
+               and n.Name in {'接收文件', '继续下载'}]
+    if len(buttons) != 1:
+        raise ValueError('接收或续传按钮必须唯一')
+    return buttons[0]
+
+
+def download_menu_item(menu, before, pid):
+    from targeted_image_backfill import walk
+    if (menu.handle in before or menu.control.ProcessId != pid
+            or menu.control.ClassName != 'mmui::XMenu'):
+        raise ValueError('拒绝接管已有或其他进程的文件菜单')
+    items = [n for n in walk(menu.control) if n.ControlTypeName == 'MenuItemControl'
+             and n.Name == '下载']
+    if len(items) != 1:
+        raise ValueError('原生下载菜单必须唯一')
+    return items[0]
+
+
+def request_menu_download(adapter, history, row, chat):
+    """下载已核验的唯一卡片；菜单不接收激活消息，避免被Qt销毁。"""
+    import ctypes
+    from ctypes import wintypes
+    from targeted_image_backfill import (context_for, enumerate_desktop_windows, one_window,
+        rect_to_tuple, validated_window_point_click, ChatAutomationError)
+    before = {w.handle for w in enumerate_desktop_windows()}
+    context = context_for(history, chat)
+    destination, x, y = adapter._click_target(context, row)
+    user = ctypes.WinDLL('user32', use_last_error=True)
+    user.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+    user.PostMessageW.restype = wintypes.BOOL
+    user.ScreenToClient.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.POINT)]
+    user.ScreenToClient.restype = wintypes.BOOL
+    user.IsWindow.argtypes = [wintypes.HWND]
+    user.IsWindow.restype = wintypes.BOOL
+    point = wintypes.POINT(x, y)
+    if not user.ScreenToClient(destination.window.handle, ctypes.byref(point)):
+        raise ChatAutomationError('文件卡片坐标转换失败')
+    position = ((point.y & 0xffff) << 16) | (point.x & 0xffff)
+    for message, flags in ((0x0204, 2), (0x0205, 0)):
+        if not user.PostMessageW(destination.window.handle, message, flags, position):
+            raise ChatAutomationError('无法打开已核验文件卡片菜单')
+        time.sleep(.05)
+    deadline = time.monotonic() + 5
+    while True:
+        try:
+            menu = one_window('mmui::XMenu')
+            break
+        except ChatAutomationError as exc:
+            if '实际找到 0 个' not in str(exc) or time.monotonic() >= deadline:
+                raise
+            time.sleep(.2)
+    item = download_menu_item(menu, before, history.control.ProcessId)
+    menu_context = context_for(menu, chat)
+    adapter._message_transport.verify_window(menu_context)
+    try:
+        bounds = rect_to_tuple(item.BoundingRectangle)
+        validated_window_point_click(adapter, menu_context, (bounds[0]+bounds[2])//2,
+                                     (bounds[1]+bounds[3])//2, activate=False)
+    finally:
+        if user.IsWindow(menu.handle):
+            adapter._message_transport.verify_window(menu_context)
+            user.PostMessageW(menu.handle, 0x0010, 0, 0)
 
 
 def receive(export: Path, target_id: str, chat: str, timeout: float = 60) -> dict:
@@ -63,7 +136,9 @@ def receive(export: Path, target_id: str, chat: str, timeout: float = 60) -> dic
     existing = content_file(attachment)
     if existing:
         return {'target_id': target_id, 'status': 'already_present', 'path': str(existing)}
-    before_stats = {str(p): (p.stat().st_size, p.stat().st_mtime_ns) for p in Path(attachment['path']).parent.iterdir() if p.is_file()}
+    parent = Path(attachment['path']).parent
+    before_stats = ({str(p): (p.stat().st_size, p.stat().st_mtime_ns)
+                     for p in parent.iterdir() if p.is_file()} if parent.is_dir() else {})
     from targeted_image_backfill import (task_lock, WechatChatAdapter, walk, unique, history_window,
         context_for, validated_window_click, one_window, close_history, rect_to_tuple,
         enumerate_desktop_windows, ChatAutomationError)
@@ -102,23 +177,10 @@ def receive(export: Path, target_id: str, chat: str, timeout: float = 60) -> dic
                     raise ChatAutomationError('文件搜索结果不唯一，停止下载')
                 row = unique([r for r in walk(history.control) if r.ClassName == 'mmui::SearchUniqueSubtypeCellView'
                               and row_matches(r.Name, filename, day)], '重读文件身份')
-                validated_window_click(adapter, context_for(history, chat), row)
-                deadline = time.monotonic() + 5
-                while True:
-                    try:
-                        receiver = one_window('mmui::FileReceiveWindow')
-                        break
-                    except ChatAutomationError as exc:
-                        if '实际找到 0 个' not in str(exc) or time.monotonic() >= deadline:
-                            raise
-                        time.sleep(.2)
-                if receiver.handle in before:
-                    raise ChatAutomationError('拒绝接管已有文件接收窗口')
-                owned = receiver
-                nodes = walk(receiver.control)
-                unique([n for n in nodes if n.ControlTypeName == 'TextControl' and n.Name == filename], '接收文件名')
-                validated_window_click(adapter, context_for(receiver, chat), unique(
-                    [n for n in nodes if n.ControlTypeName == 'ButtonControl' and n.Name == '接收文件'], '接收按钮'))
+                if adapter._message_transport is not None:
+                    request_menu_download(adapter, history, row, chat)
+                else:
+                    validated_window_click(adapter, context_for(history, chat), row)
                 deadline = time.monotonic() + timeout
                 while time.monotonic() < deadline:
                     if adapter.cancelled():
@@ -127,9 +189,30 @@ def receive(export: Path, target_id: str, chat: str, timeout: float = 60) -> dic
                     if landed:
                         return {'target_id': target_id, 'status': ('downloaded' if before_stats.get(str(landed)) != (landed.stat().st_size, landed.stat().st_mtime_ns) else 'receiver_accepted_cached'), 'path': str(landed),
                                 'bytes': landed.stat().st_size, 'md5': attachment['md5']}
-                    labels = {n.Name for n in walk(receiver.control)}
-                    if any(('过期' in name or '已被清理' in name) or 'expired' in name.lower() for name in labels):
-                        raise ChatAutomationError('微信明确提示文件已过期')
+                    if owned is None:
+                        try:
+                            receiver = one_window('mmui::FileReceiveWindow')
+                        except ChatAutomationError as exc:
+                            if '实际找到 0 个' not in str(exc):
+                                raise
+                        else:
+                            if receiver.handle in before:
+                                raise ChatAutomationError('拒绝接管已有文件接收窗口')
+                            owned = receiver
+                            nodes = walk(receiver.control)
+                            unique([n for n in nodes if n.ControlTypeName == 'TextControl' and n.Name == filename], '接收文件名')
+                            labels = {n.Name for n in nodes}
+                            if any('过期' in n or '已被清理' in n or 'expired' in n.lower() for n in labels):
+                                raise ChatAutomationError('微信明确提示文件已过期')
+                            # The native menu may already have started the transfer.
+                            buttons = [n for n in nodes if n.ControlTypeName == 'ButtonControl'
+                                       and n.Name in {'接收文件', '继续下载'}]
+                            if buttons:
+                                validated_window_click(adapter, context_for(receiver, chat), receive_button(nodes))
+                    if owned is not None:
+                        labels = {n.Name for n in walk(owned.control)}
+                        if any('过期' in n or '已被清理' in n or 'expired' in n.lower() for n in labels):
+                            raise ChatAutomationError('微信明确提示文件已过期')
                     time.sleep(.5)
                 raise ChatAutomationError('接收后未取得符合原生大小和MD5的文件')
             finally:

@@ -72,7 +72,7 @@ class WindowMessageTransport:
             if not diagnostic['ready']:raise ChatAutomationError(diagnostic['detail'])
             return ChatContext(adapter.main,title.Name.strip())
         context = ChatContext(adapter.main,'',switching=True)
-        edit = unique(adapter._search_edits(nodes),'会话搜索框')
+        edit = self.chat_search(adapter, context, nodes)
         adapter._post_click(context,edit)
         pattern = edit.GetValuePattern()
         if pattern is None:raise ChatAutomationError('搜索框没有ValuePattern')
@@ -90,6 +90,32 @@ class WindowMessageTransport:
                 return ChatContext(adapter.main,name)
             adapter._pause(.2)
         raise ChatAutomationError('窗口消息未能打开精确会话')
+
+    def chat_search(self, adapter, context, nodes):
+        """窄布局先返回会话列表；仅接受聊天标题栏内的明确返回按钮。"""
+        edits = adapter._search_edits(nodes)
+        if edits:
+            return unique(edits, '会话搜索框')
+        backs = []
+        if not any(n.ClassName == 'mmui::ChatMasterView' for n in nodes):
+            for node in nodes:
+                if node.ControlTypeName != 'ButtonControl' or node.Name not in {'返回', 'Back', '返回上頁'}:
+                    continue
+                parent = node.GetParentControl()
+                for _ in range(8):
+                    if parent is None:
+                        break
+                    if parent.ClassName == 'mmui::ChatTitleBarMasterView':
+                        backs.append(node)
+                        break
+                    parent = parent.GetParentControl()
+        adapter._post_click(context, unique(backs, '折叠会话标题栏返回按钮'))
+        for _ in range(25):
+            edits = adapter._search_edits(adapter._nodes(context))
+            if edits:
+                return unique(edits, '会话搜索框')
+            adapter._pause(.2)
+        raise ChatAutomationError('返回后会话搜索框仍不可读')
 
     def wheel(self, adapter, context, *, older, steps=1):
         """只向已核验列表所在窗口投递滚轮，不调用物理滚轮。"""

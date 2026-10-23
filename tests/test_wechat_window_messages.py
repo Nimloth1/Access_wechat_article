@@ -67,6 +67,30 @@ def test_explicit_transport_delegates_without_foreground_activation():
     adapter._message_transport.activate.assert_called_once_with('context',force=False)
 
 
+def test_collapsed_chat_returns_via_title_before_search():
+    transport = object.__new__(WindowMessageTransport)
+    title = SimpleNamespace(ClassName='mmui::ChatTitleBarMasterView')
+    back = SimpleNamespace(ClassName='mmui::XButton', ControlTypeName='ButtonControl',
+                           Name='返回', GetParentControl=lambda: title)
+    edit = object()
+    adapter = Mock()
+    adapter._search_edits.side_effect = [[], [], [edit]]
+    assert transport.chat_search(adapter, 'context', [back]) is edit
+    adapter._post_click.assert_called_once_with('context', back)
+
+
+def test_unrelated_back_button_cannot_be_used_for_chat_search():
+    transport = object.__new__(WindowMessageTransport)
+    parent = SimpleNamespace(ClassName='Browser', GetParentControl=lambda: None)
+    back = SimpleNamespace(ClassName='Button', ControlTypeName='ButtonControl',
+                           Name='返回', GetParentControl=lambda: parent)
+    adapter = Mock()
+    adapter._search_edits.return_value = []
+    with pytest.raises(ChatAutomationError):
+        transport.chat_search(adapter, 'context', [back])
+    adapter._post_click.assert_not_called()
+
+
 def test_message_click_does_not_fall_back_to_uia_mouse():
     adapter=object.__new__(WechatChatAdapter)
     adapter._message_transport=Mock();adapter._post_click=Mock()

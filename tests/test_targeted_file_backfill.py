@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 import hashlib
 import json
 from pathlib import Path
@@ -53,9 +53,61 @@ def test_existing_hash_named_file_is_verified_and_skips_gui(tmp_path):
 def test_row_requires_exact_filename_and_unambiguous_year():
     day=datetime.now().date().replace(month=4,day=20)
     assert files.row_matches('one.pdf  4/20', 'one.pdf', day)
+    assert files.row_matches('one.pdf 下载失败 4/20', 'one.pdf', day)
+    assert not files.row_matches('one.pdf other.pdf 下载失败 4/20', 'one.pdf', day)
     assert not files.row_matches('other.pdf  4/20', 'one.pdf', day)
     assert not files.row_matches('one.pdf  4/21', 'one.pdf', day)
     assert not files.row_matches('one.pdf  4/20', 'one.pdf', day.replace(year=day.year-1))
+
+
+def test_relative_file_date_is_resolved_against_current_local_day():
+    today = datetime.now().date()
+    assert files.row_matches('one.pdf 昨天', 'one.pdf', today-timedelta(days=1))
+    assert files.row_matches('one.pdf 今天', 'one.pdf', today)
+    assert files.row_matches('one.pdf 前天', 'one.pdf', today-timedelta(days=2))
+    assert not files.row_matches('one.pdf 昨天', 'one.pdf', today-timedelta(days=2))
+
+
+@pytest.mark.parametrize('name', ['接收文件', '继续下载'])
+def test_receiver_accepts_explicit_receive_or_resume(name):
+    button = SimpleNamespace(ControlTypeName='ButtonControl', Name=name)
+    text = SimpleNamespace(ControlTypeName='TextControl', Name=name)
+    assert files.receive_button([button, text]) is button
+
+
+def test_receiver_refuses_open_and_ambiguous_actions():
+    def button(name):
+        return SimpleNamespace(ControlTypeName='ButtonControl', Name=name)
+    with pytest.raises(ValueError):
+        files.receive_button([button('打开文件')])
+    with pytest.raises(ValueError):
+        files.receive_button([button('接收文件'), button('继续下载')])
+
+
+def test_download_menu_requires_new_same_process_window_and_exact_action():
+    import targeted_image_backfill as images
+    item = SimpleNamespace(ControlTypeName='MenuItemControl', Name='下载')
+    save_as = SimpleNamespace(ControlTypeName='MenuItemControl', Name='下载到...')
+    menu = SimpleNamespace(handle=7, control=SimpleNamespace(ProcessId=42, ClassName='mmui::XMenu'))
+    with patch.object(images, 'walk', return_value=[item, save_as]):
+        assert files.download_menu_item(menu, {1}, 42) is item
+        for before, pid in [({7}, 42), ({1}, 99)]:
+            with pytest.raises(ValueError):
+                files.download_menu_item(menu, before, pid)
+    with patch.object(images, 'walk', return_value=[save_as]):
+        with pytest.raises(ValueError):
+            files.download_menu_item(menu, {1}, 42)
+
+
+def test_download_menu_refuses_input_before_failed_card_guard():
+    import targeted_image_backfill as images
+    adapter = Mock()
+    adapter._click_target.side_effect = ChatAutomationError('wrong owner')
+    with patch.object(images, 'enumerate_desktop_windows', return_value=[]), \
+         patch('ctypes.WinDLL', create=True) as user:
+        with pytest.raises(ChatAutomationError):
+            files.request_menu_download(adapter, object(), object(), 'chat')
+        user.assert_not_called()
 
 
 def test_disconnected_calendar_fits_reported_children_without_bypassing_bounds():
