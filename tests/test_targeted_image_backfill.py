@@ -139,6 +139,8 @@ def test_image_row_time_accepts_wechat_weekday_label():
     """日期筛选后微信用星期标签显示图片时间，仍能定位目标分钟。"""
     assert IMAGE_ROW.fullmatch('图片 星期五 09:00').group(1) == '09:00'
     assert IMAGE_ROW.fullmatch('图片 9月18日 09:00').group(1) == '09:00'
+    assert IMAGE_ROW.fullmatch('图片 09:00').group(1) == '09:00'
+    assert IMAGE_ROW.fullmatch('图片 09:00 other') is None
 
 
 def test_configure_output_encoding_uses_utf8_for_emoji_chat_names():

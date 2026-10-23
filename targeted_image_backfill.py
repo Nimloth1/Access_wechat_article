@@ -46,7 +46,7 @@ from src.services.wechat_attachment_inventory import load_inventory
 
 
 PREVIEW_ID = re.compile(r'^PreviewWindow_(.+)_(\d+)_(\d+)_\d+_\d+$')
-IMAGE_ROW = re.compile(r'^图片 .+ (\d{2}:\d{2})$')
+IMAGE_ROW = re.compile(r'^图片(?: .+)? (\d{2}:\d{2})$')
 ROW_DATE = re.compile(r'(?:^|\s)((?:(?:\d{4}年)?\d{1,2}月\d{1,2}日(?:\s+星期[一二三四五六日天])?'
                       r'|今天|昨天|前天|星期[一二三四五六日天])\s+\d{1,2}:\d{2})$')
 ATTEMPT_LOG = LOG_DIR / 'targeted_image_attempts.jsonl'
