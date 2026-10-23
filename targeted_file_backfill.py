@@ -74,6 +74,14 @@ def cleared_row(label: str, filename: str, day) -> bool:
         normalized.startswith(name+' '+status+' ') for status in ('已清理', '已过期'))
 
 
+def cleared_file_label(rows, filename: str, day) -> str | None:
+    """A receive may change its search card to cleared without opening a receiver."""
+    matches = [row.Name for row in rows if row_matches(row.Name, filename, day)]
+    if len(matches) > 1:
+        raise ValueError('文件状态更新后文件名和日期不再唯一')
+    return matches[0] if matches and cleared_row(matches[0], filename, day) else None
+
+
 def exact_file_row(rows, filename, day):
     matches = [row for row in rows if row_matches(row.Name, filename, day)]
     if len(matches) != 1:
@@ -204,6 +212,7 @@ def receive(export: Path, target_id: str, chat: str, timeout: float = 60, *, str
                 else:
                     validated_window_click(adapter, context_for(history, chat), row)
                 deadline = time.monotonic() + timeout
+                last_card_check = 0.0
                 while time.monotonic() < deadline:
                     if adapter.cancelled():
                         raise ChatAutomationError('已取消')
@@ -211,6 +220,13 @@ def receive(export: Path, target_id: str, chat: str, timeout: float = 60, *, str
                     if landed:
                         return {'target_id': target_id, 'status': ('downloaded' if before_stats.get(str(landed)) != (landed.stat().st_size, landed.stat().st_mtime_ns) else 'receiver_accepted_cached'), 'path': str(landed),
                                 'bytes': landed.stat().st_size, 'md5': attachment['md5']}
+                    if time.monotonic() - last_card_check >= 2:
+                        current_rows = [n for n in walk(history.control)
+                                        if n.ClassName == 'mmui::SearchUniqueSubtypeCellView']
+                        cleared = cleared_file_label(current_rows, filename, day)
+                        if cleared:
+                            raise ChatAutomationError('微信明确提示文件已过期或已清理：'+cleared)
+                        last_card_check = time.monotonic()
                     if owned is None:
                         try:
                             receiver = one_window('mmui::FileReceiveWindow')

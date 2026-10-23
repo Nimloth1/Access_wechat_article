@@ -79,6 +79,17 @@ def test_row_requires_exact_filename_and_unambiguous_year():
     assert not files.row_matches('one.pdf  4/20', 'one.pdf', day.replace(year=day.year-1))
 
 
+def test_post_receive_cleared_state_stays_bound_to_unique_filename_and_date():
+    day=datetime.now().date().replace(month=4,day=20)
+    rows=lambda *labels:[SimpleNamespace(Name=x) for x in labels]
+    assert files.cleared_file_label(rows('one.pdf 4/20'),'one.pdf',day) is None
+    assert files.cleared_file_label(rows('one.pdf 下载失败 4/20'),'one.pdf',day) is None
+    assert files.cleared_file_label(rows('one.pdf 已清理 4/20'),'one.pdf',day)=='one.pdf 已清理 4/20'
+    assert files.cleared_file_label(rows('other.pdf 已清理 4/20','one.pdf 已清理 4/21'),'one.pdf',day) is None
+    assert files.cleared_file_label(rows(),'one.pdf',day) is None
+    with pytest.raises(ValueError):files.cleared_file_label(rows('one.pdf 已清理 4/20','one.pdf 4/20'),'one.pdf',day)
+
+
 def test_relative_file_date_is_resolved_against_current_local_day():
     today = datetime.now().date()
     assert files.row_matches('one.pdf 昨天', 'one.pdf', today-timedelta(days=1))
