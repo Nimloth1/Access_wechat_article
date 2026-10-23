@@ -195,7 +195,19 @@ class WechatChatAdapter:
 
     def _locate_main(self) -> Any:
         """Locate the WeChat shell without requiring readable UIA descendants."""
-        self.main = attach_uia_control(unique(self._main_windows(), "微信主窗口"))
+        candidates = self._main_windows()
+        if len(candidates) > 1:
+            # A file receiver has the same native title and Qt class as the shell.
+            # Identify the shell by its UIA role; never choose by window order.
+            shells = []
+            for window in candidates:
+                attached = attach_uia_control(window)
+                with temporary_accessibility(attached.control.ProcessId):
+                    attached = attach_uia_control(window)
+                    if attached.control.ClassName == 'mmui::MainWindow':
+                        shells.append(window)
+            candidates = shells
+        self.main = attach_uia_control(unique(candidates, "微信主窗口"))
         return self.main
 
     def _main_windows(self) -> list[Any]:

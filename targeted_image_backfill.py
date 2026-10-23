@@ -219,6 +219,44 @@ def calendar_day_point(day, panel_bounds, *, sunday_first=False):
             round(top + (84 + 64 * row) * scale))
 
 
+def fit_calendar_popup(adapter, calendar, chat):
+    """Fit this task's popup to its reported content after a disconnected display change.
+
+    Qt can retain enlarged child layout while creating a smaller native popup.
+    Resize only that verified popup; never accept points outside its real HWND.
+    """
+    transport = vars(adapter).get('_message_transport')
+    if transport is None or calendar.control.ClassName != 'mmui::XPopover':
+        return calendar
+    context = context_for(calendar, chat)
+    bounds = transport.verify_window(context)
+    children = [rect_to_tuple(n.BoundingRectangle) for n in walk(calendar.control)[1:]]
+    children = [r for r in children if r[2] > r[0] and r[3] > r[1]]
+    if not children or all(bounds[0] <= r[0] and bounds[1] <= r[1]
+                           and r[2] <= bounds[2] and r[3] <= bounds[3] for r in children):
+        return calendar
+    if any(r[0] < bounds[0] or r[1] < bounds[1] for r in children):
+        raise ChatAutomationError('日期弹层内容超出左上边界，停止调整')
+    width = max(r[2] for r in children) - bounds[0]
+    height = max(r[3] for r in children) - bounds[1]
+    if not 0 < width <= 1200 or not 0 < height <= 1600:
+        raise ChatAutomationError('日期弹层内容尺寸异常，停止调整')
+    user32 = _user32()
+    user32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+                                   ctypes.c_int, ctypes.c_int, wintypes.UINT]
+    user32.SetWindowPos.restype = wintypes.BOOL
+    if not user32.SetWindowPos(calendar.handle, 0, bounds[0], bounds[1], width, height, 0x14):
+        raise ChatAutomationError('无法调整本任务日期弹层')
+    time.sleep(.2)
+    refreshed = one_window('mmui::XPopover')
+    if refreshed.handle != calendar.handle:
+        raise ChatAutomationError('日期弹层身份改变，停止调整')
+    actual = transport.verify_window(context_for(refreshed, chat))
+    if actual[2] < bounds[0] + width or actual[3] < bounds[1] + height:
+        raise ChatAutomationError('日期弹层未容纳完整内容')
+    return refreshed
+
+
 def select_day(adapter, history, chat, session_id, day, *, sunday_first=False):
     """在日期日历中选择一天，并核对筛选结果标题。"""
     context = context_for(history, chat)
@@ -236,6 +274,7 @@ def select_day(adapter, history, chat, session_id, day, *, sunday_first=False):
             break
     else:
         raise ChatAutomationError(f'日历年份不是 {day.year}，停止定位')
+    calendar = fit_calendar_popup(adapter, calendar, chat)
     context = context_for(calendar, chat)
     nodes = walk(calendar.control)
     month = next((node.Name for node in nodes if node.ControlTypeName == 'TextControl'
