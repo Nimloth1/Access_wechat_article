@@ -12,7 +12,10 @@ import time
 ALLOWED = {'.pdf', '.docx', '.xlsx', '.pptx', '.txt', '.csv', '.zip', '.rar', '.7z'}
 
 
-def load_target(export: Path, target_id: str) -> dict:
+def load_target(export: Path, target_id: str, *, streamed_file: bool = False) -> dict:
+    if type(streamed_file) is not bool:
+        raise ValueError('streamed_file must be an explicit boolean')
+    native_limit = (128 if streamed_file else 32) * 1024**2
     sid, mid = target_id.rsplit(':', 1)
     payload = json.loads(export.read_text(encoding='utf-8-sig'))
     messages = [m for c in payload['conversations'] if c['session_id'] == sid
@@ -23,9 +26,9 @@ def load_target(export: Path, target_id: str) -> dict:
     a = message.get('attachment') or {}
     if (a.get('kind') != 'file' or Path(a.get('filename', '')).suffix.lower() not in ALLOWED
             or not re.fullmatch('[a-fA-F0-9]{32}', a.get('md5') or '')
-            or type(a.get('size')) is not int or not 0 < a['size'] <= 32 * 1024**2
+            or type(a.get('size')) is not int or not 0 < a['size'] <= native_limit
             or not a.get('path') or not message.get('local_id')):
-        raise ValueError('file metadata absent, unsafe type, or exceeds 32 MiB')
+        raise ValueError('file metadata absent, unsafe type, or exceeds scoped native-file limit')
     return message
 
 
@@ -144,8 +147,13 @@ def request_menu_download(adapter, history, row, chat):
             user.PostMessageW(menu.handle, 0x0010, 0, 0)
 
 
-def receive(export: Path, target_id: str, chat: str, timeout: float = 60) -> dict:
-    message = load_target(export, target_id)
+def receive(export: Path, target_id: str, chat: str, timeout: float = 60, *, streamed_file: bool = False) -> dict:
+    """An explicit streamed-file caller must retain external tree/I/O/space guards.
+
+    Only native file bytes are received; content_file hashes in 1MiB blocks.
+    The CLI and daily callers keep the default 32MiB, and no viewer is opened.
+    """
+    message = load_target(export, target_id, streamed_file=streamed_file)
     attachment = message['attachment']
     existing = content_file(attachment)
     if existing:

@@ -50,6 +50,25 @@ def test_existing_hash_named_file_is_verified_and_skips_gui(tmp_path):
     assert files.content_file(files.load_target(p, 'g:1')['attachment']) is None
 
 
+def test_streamed_file_opt_in_retains_native_identity_and_default_limit(tmp_path):
+    size=33*1024**2;source=tmp_path/'native.pdf'
+    with source.open('wb') as stream:stream.write(b'%PDF-one');stream.truncate(size)
+    digest=hashlib.md5()
+    with source.open('rb') as stream:
+        for block in iter(lambda:stream.read(1024**2),b''):digest.update(block)
+    p=fixture_export(tmp_path,size=size,md5=digest.hexdigest())
+    with pytest.raises(ValueError):files.receive(p,'g:1','chat')
+    assert files.receive(p,'g:1','chat',streamed_file=True)['path']==str(source)
+    with pytest.raises(ValueError):files.load_target(p,'g:2',streamed_file=True)
+    with pytest.raises(ValueError):files.load_target(p,'g:1',streamed_file='yes')
+    for bad in [{'size':129*1024**2},{'filename':'unsafe.exe'},{'md5':'invalid'},{'local_id':None}]:
+        if 'local_id' in bad:
+            p=fixture_export(tmp_path)
+            payload=json.loads(p.read_text());payload['conversations'][0]['messages'][0]['local_id']=None;p.write_text(json.dumps(payload))
+        else:p=fixture_export(tmp_path,**bad)
+        with pytest.raises(ValueError):files.load_target(p,'g:1',streamed_file=True)
+
+
 def test_row_requires_exact_filename_and_unambiguous_year():
     day=datetime.now().date().replace(month=4,day=20)
     assert files.row_matches('one.pdf  4/20', 'one.pdf', day)
