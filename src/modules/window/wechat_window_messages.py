@@ -93,6 +93,17 @@ class WindowMessageTransport:
 
     def chat_search(self, adapter, context, nodes):
         """窄布局先返回会话列表；仅接受聊天标题栏内的明确返回按钮。"""
+        if any(n.AutomationId == 'session_list' and n.Name == '折叠的聊天' for n in nodes):
+            backs = [n for n in nodes if n.ControlTypeName == 'ButtonControl'
+                     and n.ClassName == 'mmui::ChatBackwardView' and n.Name == '返回']
+            adapter._post_click(context, unique(backs, '折叠会话列表返回按钮'))
+            for _ in range(25):
+                nodes = adapter._nodes(context)
+                if not any(n.AutomationId == 'session_list' and n.Name == '折叠的聊天' for n in nodes):
+                    break
+                adapter._pause(.2)
+            else:
+                raise ChatAutomationError('未能返回正常会话列表')
         edits = adapter._search_edits(nodes)
         if edits:
             return unique(edits, '会话搜索框')

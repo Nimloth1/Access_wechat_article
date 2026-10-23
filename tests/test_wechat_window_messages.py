@@ -91,6 +91,27 @@ def test_unrelated_back_button_cannot_be_used_for_chat_search():
     adapter._post_click.assert_not_called()
 
 
+def test_folded_chat_list_returns_before_using_global_search():
+    transport=object.__new__(WindowMessageTransport)
+    folded=SimpleNamespace(AutomationId='session_list',Name='折叠的聊天')
+    back=SimpleNamespace(AutomationId='button',ControlTypeName='ButtonControl',
+                         ClassName='mmui::ChatBackwardView',Name='返回')
+    edit=object();adapter=Mock()
+    adapter._nodes.return_value=[];adapter._search_edits.return_value=[edit]
+    assert transport.chat_search(adapter,'context',[folded,back]) is edit
+    adapter._post_click.assert_called_once_with('context',back)
+    adapter._search_edits.assert_called_once_with([])
+
+
+def test_folded_chat_return_refuses_ambiguous_or_unrelated_back():
+    transport=object.__new__(WindowMessageTransport)
+    folded=SimpleNamespace(AutomationId='session_list',Name='折叠的聊天')
+    unrelated=SimpleNamespace(AutomationId='button',ControlTypeName='ButtonControl',ClassName='Browser',Name='返回')
+    adapter=Mock()
+    with pytest.raises(ChatAutomationError):transport.chat_search(adapter,'context',[folded,unrelated])
+    adapter._post_click.assert_not_called()
+
+
 def test_message_click_does_not_fall_back_to_uia_mouse():
     adapter=object.__new__(WechatChatAdapter)
     adapter._message_transport=Mock();adapter._post_click=Mock()
