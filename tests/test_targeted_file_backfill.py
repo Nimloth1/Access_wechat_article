@@ -147,3 +147,16 @@ def test_explicit_cleared_row_requires_exact_filename_and_date():
     assert not cleared_row('report.pdf 已清理 2026/4/9','report.pdf',day)
     assert not cleared_row('report.pdf 下载失败 2026/4/10','report.pdf',day)
     assert not cleared_row('report.pdf 2026/4/10','report.pdf',day)
+
+
+def test_exact_name_and_date_remain_unique_among_other_search_results():
+    from types import SimpleNamespace
+    from datetime import date
+    from targeted_file_backfill import exact_file_row
+    expected=SimpleNamespace(Name='report.pdf 已清理 2026/4/10')
+    rows=[SimpleNamespace(Name='report.pdf 2026/4/9'),expected,SimpleNamespace(Name='other.pdf 2026/4/10')]
+    assert exact_file_row(rows,'report.pdf',date(2026,4,10)) is expected
+    with pytest.raises(ValueError,match='唯一'):
+        exact_file_row(rows+[expected],'report.pdf',date(2026,4,10))
+    with pytest.raises(ValueError,match='唯一'):
+        exact_file_row(rows,'missing.pdf',date(2026,4,10))

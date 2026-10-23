@@ -71,6 +71,13 @@ def cleared_row(label: str, filename: str, day) -> bool:
         normalized.startswith(name+' '+status+' ') for status in ('已清理', '已过期'))
 
 
+def exact_file_row(rows, filename, day):
+    matches = [row for row in rows if row_matches(row.Name, filename, day)]
+    if len(matches) != 1:
+        raise ValueError(f'文件名和日期必须唯一，实际找到 {len(matches)} 个')
+    return matches[0]
+
+
 def receive_button(nodes):
     buttons = [n for n in nodes if n.ControlTypeName == 'ButtonControl'
                and n.Name in {'接收文件', '继续下载'}]
@@ -178,12 +185,10 @@ def receive(export: Path, target_id: str, chat: str, timeout: float = 60) -> dic
                         break
                     last = labels
                     time.sleep(.25)
-                row = unique([r for r in rows if row_matches(r.Name, filename, day)], '文件名和日期')
-                # A second occurrence of this filename cannot be disambiguated by order.
-                if len(rows) != 1:
-                    raise ChatAutomationError('文件搜索结果不唯一，停止下载')
-                row = unique([r for r in walk(history.control) if r.ClassName == 'mmui::SearchUniqueSubtypeCellView'
-                              and row_matches(r.Name, filename, day)], '重读文件身份')
+                row = exact_file_row(rows, filename, day)
+                # Other names or dates are irrelevant; equal name AND date must stay unique.
+                row = exact_file_row([r for r in walk(history.control)
+                                      if r.ClassName == 'mmui::SearchUniqueSubtypeCellView'], filename, day)
                 if cleared_row(row.Name, filename, day):
                     raise ChatAutomationError('微信明确提示文件已过期或已清理：'+row.Name)
                 if adapter._message_transport is not None:
