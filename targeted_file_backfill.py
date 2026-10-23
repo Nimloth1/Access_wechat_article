@@ -191,7 +191,7 @@ def receive(export: Path, target_id: str, chat: str, timeout: float = 60, *, str
                 validated_window_click(adapter, context_for(history, chat), tab)
                 edit = unique([n for n in walk(history.control) if n.ControlTypeName == 'EditControl'], '文件搜索框')
                 validated_window_click(adapter, context_for(history, chat), edit)
-                edit.GetValuePattern().SetValue(filename)
+                edit.GetValuePattern().SetValue(' '.join(filename.split()))
                 last = None
                 deadline = time.monotonic() + 8
                 while time.monotonic() < deadline:
