@@ -61,7 +61,14 @@ def row_matches(label: str, filename: str, day) -> bool:
     name = ' '.join(filename.split())
     # A previous failed receive adds this status between the intact name and date.
     return any(normalized == name + status + value
-               for value in dates for status in (' ', ' 下载失败 '))
+               for value in dates for status in (' ', ' 下载失败 ', ' 已清理 ', ' 已过期 '))
+
+
+def cleared_row(label: str, filename: str, day) -> bool:
+    name = ' '.join(filename.split())
+    normalized = ' '.join(label.split())
+    return row_matches(label, filename, day) and any(
+        normalized.startswith(name+' '+status+' ') for status in ('已清理', '已过期'))
 
 
 def receive_button(nodes):
@@ -177,6 +184,8 @@ def receive(export: Path, target_id: str, chat: str, timeout: float = 60) -> dic
                     raise ChatAutomationError('文件搜索结果不唯一，停止下载')
                 row = unique([r for r in walk(history.control) if r.ClassName == 'mmui::SearchUniqueSubtypeCellView'
                               and row_matches(r.Name, filename, day)], '重读文件身份')
+                if cleared_row(row.Name, filename, day):
+                    raise ChatAutomationError('微信明确提示文件已过期或已清理：'+row.Name)
                 if adapter._message_transport is not None:
                     request_menu_download(adapter, history, row, chat)
                 else:

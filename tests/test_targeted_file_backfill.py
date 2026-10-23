@@ -136,3 +136,14 @@ def test_calendar_refuses_unbounded_target():
         with pytest.raises(ChatAutomationError,match='尺寸异常'):
             images.fit_calendar_popup(adapter,cal,'chat')
         user.assert_not_called()
+def test_explicit_cleared_row_requires_exact_filename_and_date():
+    from datetime import date
+    from targeted_file_backfill import cleared_row, row_matches
+    day=date(2026,4,10)
+    assert row_matches('report.pdf 已清理 2026/4/10','report.pdf',day)
+    assert cleared_row('report.pdf 已清理 2026/4/10','report.pdf',day)
+    assert cleared_row('report.pdf 已过期 2026/4/10','report.pdf',day)
+    assert not cleared_row('other.pdf 已清理 2026/4/10','report.pdf',day)
+    assert not cleared_row('report.pdf 已清理 2026/4/9','report.pdf',day)
+    assert not cleared_row('report.pdf 下载失败 2026/4/10','report.pdf',day)
+    assert not cleared_row('report.pdf 2026/4/10','report.pdf',day)
