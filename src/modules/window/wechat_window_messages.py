@@ -1,6 +1,7 @@
 # encoding: UTF-8
 # version: 1.0 @20261018: 锁屏下向同会话微信的已核验窗口投递消息;
 # version: 1.1 @20261026: 搜索列表未出现时重新点击搜索框并重输，有限重试;
+# version: 1.2 @20261026: 轮询中控件树重建抛 COMError 时视为未就绪继续等待;
 """只操作同会话微信 HWND，不激活系统前台、不模拟鼠标键盘。"""
 import ctypes
 from ctypes import wintypes
@@ -10,6 +11,9 @@ from src.modules.window.wechat_chat_adapter import ChatContext,walk,unique,local
 from src.modules.window.wechat_home_window_finder import rect_to_tuple
 from src.modules.window.window_diagnostics import _Reader
 from src.services.chat_attachment_service import ChatAutomationError
+
+# 切换会话时控件树正在重建，遍历途中元素失效会抛 COMError；非 Windows 下没有该类型。
+COMError = getattr(ctypes, 'COMError', OSError)
 
 
 class WindowMessageTransport:
@@ -82,7 +86,8 @@ class WindowMessageTransport:
             adapter._pause(.3)
             pattern.SetValue('');pattern.SetValue(name)
             for _ in range(15):
-                lists = [n for n in walk(adapter.main.control) if n.AutomationId=='search_list']
+                try:lists = [n for n in walk(adapter.main.control) if n.AutomationId=='search_list']
+                except COMError:lists = []
                 if len(lists)==1:break
                 adapter._pause(.2)
             if lists:break
@@ -90,7 +95,8 @@ class WindowMessageTransport:
         match = unique(local_chat_matches(listing.GetChildren(),name),'精确会话')
         adapter._post_click(context,match,keep_parent_active=True)
         for _ in range(25):
-            titles = [n for n in walk(adapter.main.control) if n.AutomationId.endswith('current_chat_name_label')]
+            try:titles = [n for n in walk(adapter.main.control) if n.AutomationId.endswith('current_chat_name_label')]
+            except COMError:titles = []
             if len(titles)==1 and titles[0].Name.strip()==name:
                 return ChatContext(adapter.main,name)
             adapter._pause(.2)

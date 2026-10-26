@@ -2,7 +2,7 @@
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 import pytest
-from src.modules.window.wechat_window_messages import WindowMessageTransport
+from src.modules.window.wechat_window_messages import WindowMessageTransport, COMError
 from src.modules.window.wechat_chat_adapter import WechatChatAdapter
 from src.services.chat_attachment_service import ChatAutomationError
 
@@ -164,3 +164,17 @@ def test_search_list_never_appears_fails_after_bounded_retries():
             transport.open_chat(adapter, '180k拼团')
     assert adapter._post_click.call_count == 3
     assert pattern.SetValue.call_count == 6
+
+
+def test_title_poll_tolerates_com_error_while_chat_switches():
+    transport, adapter, edit, pattern, walk = _search_fixture(1)
+    failures = []
+    def flaky(control):
+        nodes = walk(control)
+        if nodes and getattr(nodes[0], 'AutomationId', '') == 'current_chat_name_label' and not failures:
+            failures.append(1)
+            raise COMError(-2147220991, '事件无法调用任何订户')
+        return nodes
+    with patch('src.modules.window.wechat_window_messages.walk', side_effect=flaky):
+        context = transport.open_chat(adapter, '180k拼团')
+    assert context.name == '180k拼团' and failures == [1]
