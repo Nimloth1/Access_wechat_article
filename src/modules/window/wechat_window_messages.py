@@ -1,5 +1,6 @@
 # encoding: UTF-8
 # version: 1.0 @20261018: 锁屏下向同会话微信的已核验窗口投递消息;
+# version: 1.1 @20261026: 搜索列表未出现时重新点击搜索框并重输，有限重试;
 """只操作同会话微信 HWND，不激活系统前台、不模拟鼠标键盘。"""
 import ctypes
 from ctypes import wintypes
@@ -73,14 +74,18 @@ class WindowMessageTransport:
             return ChatContext(adapter.main,title.Name.strip())
         context = ChatContext(adapter.main,'',switching=True)
         edit = self.chat_search(adapter, context, nodes)
-        adapter._post_click(context,edit)
         pattern = edit.GetValuePattern()
         if pattern is None:raise ChatAutomationError('搜索框没有ValuePattern')
-        pattern.SetValue('');pattern.SetValue(name)
-        for _ in range(15):
-            lists = [n for n in walk(adapter.main.control) if n.AutomationId=='search_list']
-            if len(lists)==1:break
-            adapter._pause(.2)
+        # 投递的点击是异步的；焦点未到位时写值，微信不弹搜索列表，故重新点击并重输。
+        for _ in range(3):
+            adapter._post_click(context,edit)
+            adapter._pause(.3)
+            pattern.SetValue('');pattern.SetValue(name)
+            for _ in range(15):
+                lists = [n for n in walk(adapter.main.control) if n.AutomationId=='search_list']
+                if len(lists)==1:break
+                adapter._pause(.2)
+            if lists:break
         listing = unique(lists,'搜索列表')
         match = unique(local_chat_matches(listing.GetChildren(),name),'精确会话')
         adapter._post_click(context,match,keep_parent_active=True)

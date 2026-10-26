@@ -125,3 +125,42 @@ def test_message_click_does_not_fall_back_to_uia_mouse():
 def test_unsupported_routes_fail_before_any_global_input(method,args):
     adapter=object.__new__(WechatChatAdapter);adapter._message_transport=Mock()
     with pytest.raises(ChatAutomationError,match='后台模式'):getattr(adapter,method)(*args)
+
+
+def _search_fixture(list_after_inputs):
+    """搜索列表只在第 N 次写入后出现；返回 transport、adapter、edit 和打补丁的 walk。"""
+    transport = object.__new__(WindowMessageTransport)
+    pattern = Mock()
+    edit = Mock();edit.GetValuePattern.return_value = pattern
+    row = SimpleNamespace(Name='180k拼团', ControlTypeName='ListItemControl', GetChildren=lambda: [])
+    header = SimpleNamespace(Name='群聊', ControlTypeName='TextControl', GetChildren=lambda: [])
+    listing = SimpleNamespace(AutomationId='search_list', GetChildren=lambda: [header, row])
+    title = SimpleNamespace(AutomationId='current_chat_name_label', Name='180k拼团')
+    adapter = Mock();adapter.diagnose.return_value = {'ready': True, 'detail': ''}
+    transport.chat_search = Mock(return_value=edit)
+    clicked = []
+    adapter._post_click.side_effect = lambda context, control, **kw: clicked.append(control)
+    def walk(control):
+        if control is row:return [row]
+        if row in clicked:return [title]
+        inputs = sum(1 for c in pattern.SetValue.call_args_list if c.args[0])
+        return [listing] if list_after_inputs and inputs >= list_after_inputs else []
+    return transport, adapter, edit, pattern, walk
+
+
+def test_search_list_missing_after_first_input_reclicks_and_retypes():
+    transport, adapter, edit, pattern, walk = _search_fixture(2)
+    with patch('src.modules.window.wechat_window_messages.walk', side_effect=walk):
+        context = transport.open_chat(adapter, '180k拼团')
+    assert context.name == '180k拼团'
+    assert [c.args[1] for c in adapter._post_click.call_args_list][:2] == [edit, edit]
+    assert [c.args[0] for c in pattern.SetValue.call_args_list] == ['', '180k拼团', '', '180k拼团']
+
+
+def test_search_list_never_appears_fails_after_bounded_retries():
+    transport, adapter, edit, pattern, walk = _search_fixture(0)
+    with patch('src.modules.window.wechat_window_messages.walk', side_effect=walk):
+        with pytest.raises(ChatAutomationError, match='搜索列表需要唯一匹配，实际找到 0 个'):
+            transport.open_chat(adapter, '180k拼团')
+    assert adapter._post_click.call_count == 3
+    assert pattern.SetValue.call_count == 6
