@@ -34,10 +34,14 @@ def fixture_export(tmp_path, **updates):
     return p
 
 
-@pytest.mark.parametrize('updates', [{'filename':'one.exe'}, {'md5':None}, {'size':0}, {'size':33*1024**2}, {'path':None}])
+@pytest.mark.parametrize('updates', [{'filename':'one.exe'}, {'md5':None}, {'size':0}, {'size':101*1024**2}, {'path':None}])
 def test_bad_native_metadata_refuses_gui(tmp_path, updates):
     with pytest.raises(ValueError):
         files.load_target(fixture_export(tmp_path, **updates), 'g:1')
+
+
+def test_default_limit_accepts_100mib_native_file(tmp_path):
+    assert files.load_target(fixture_export(tmp_path, size=100*1024**2), 'g:1')['attachment']['size'] == 100*1024**2
 
 
 def test_existing_hash_named_file_is_verified_and_skips_gui(tmp_path):
@@ -51,7 +55,7 @@ def test_existing_hash_named_file_is_verified_and_skips_gui(tmp_path):
 
 
 def test_streamed_file_opt_in_retains_native_identity_and_default_limit(tmp_path):
-    size=33*1024**2;source=tmp_path/'native.pdf'
+    size=101*1024**2;source=tmp_path/'native.pdf'
     with source.open('wb') as stream:stream.write(b'%PDF-one');stream.truncate(size)
     digest=hashlib.md5()
     with source.open('rb') as stream:
