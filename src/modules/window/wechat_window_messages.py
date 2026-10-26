@@ -12,8 +12,9 @@ from src.modules.window.wechat_home_window_finder import rect_to_tuple
 from src.modules.window.window_diagnostics import _Reader
 from src.services.chat_attachment_service import ChatAutomationError
 
-# 切换会话时控件树正在重建，遍历途中元素失效会抛 COMError；非 Windows 下没有该类型。
-COMError = getattr(ctypes, 'COMError', OSError)
+# 切换会话时控件树正在重建，遍历途中元素失效会抛 COMError；它只在 _ctypes 里，非 Windows 下没有。
+try:from _ctypes import COMError
+except ImportError:COMError = OSError
 
 
 class WindowMessageTransport:
