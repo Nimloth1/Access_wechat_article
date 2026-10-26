@@ -173,7 +173,7 @@ def test_title_poll_tolerates_com_error_while_chat_switches():
         nodes = walk(control)
         if nodes and getattr(nodes[0], 'AutomationId', '') == 'current_chat_name_label' and not failures:
             failures.append(1)
-            raise COMError(-2147220991, '事件无法调用任何订户')
+            raise COMError(-2147220991, '事件无法调用任何订户', (None, None, None, 0, None))
         return nodes
     with patch('src.modules.window.wechat_window_messages.walk', side_effect=flaky):
         context = transport.open_chat(adapter, '180k拼团')
