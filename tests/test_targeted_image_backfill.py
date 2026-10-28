@@ -231,6 +231,53 @@ def test_date_selection_rejects_rows_without_target_attachment_date(label):
             wait_for_date_heading('chat-id', '2026年10月9日')
 
 
+@pytest.mark.parametrize('label', [
+    '图片 17:05',
+    '文件 17:05',
+    '聊天记录\n群聊的聊天记录\n17:05',
+])
+def test_date_selection_accepts_time_only_row_when_target_is_today(label):
+    """稀疏群筛到当天时沿用旧日期标题，当天附件行只显示时分。"""
+    history = SimpleNamespace(control=object())
+    old = SimpleNamespace(ControlTypeName='TextControl', Name='2026年10月26日')
+    listing = SimpleNamespace(ControlTypeName='ListControl', AutomationId='search_message_list',
+                              GetChildren=lambda: [SimpleNamespace(Name=label)])
+    with patch('targeted_image_backfill.one_window', return_value=history), \
+            patch('targeted_image_backfill.walk', return_value=[old, listing]), \
+            patch('targeted_image_backfill.date', wraps=date) as clock, \
+            patch('targeted_image_backfill.time.sleep'):
+        clock.today.return_value = date(2026, 10, 28)
+        assert wait_for_date_heading('chat-id', '2026年10月28日') is history
+
+
+@pytest.mark.parametrize('today, attempts', [(date(2026, 3, 24), 1), (date(2026, 3, 25), 2)])
+def test_select_day_skips_sunday_first_retry_for_today(today, attempts):
+    """当天筛选未匹配时不改按周日首列点到别的日期。"""
+    def node(kind, name='', cls='', bounds=(0, 0, 30, 30)):
+        return SimpleNamespace(ControlTypeName=kind, Name=name, ClassName=cls,
+                               BoundingRectangle=bounds)
+    tab = node('TabItemControl', '日期')
+    panel = node('PaneControl', cls='mmui::DateNumPanel', bounds=(0, 50, 424, 470))
+    history = SimpleNamespace(handle=1, control=object())
+    calendar = SimpleNamespace(handle=2, control=node('WindowControl', cls='mmui::XPopover'))
+    nodes = [node('TextControl', '2026年'), node('TextControl', '3月'), panel]
+    user32 = Mock()
+    user32.ScreenToClient.return_value = True
+    user32.PostMessageW.return_value = True
+    with patch('targeted_image_backfill.one_window', return_value=calendar), \
+            patch('targeted_image_backfill.walk', side_effect=lambda control:
+                  [tab] if control is history.control else nodes), \
+            patch('targeted_image_backfill.wait_for_date_heading',
+                  side_effect=ChatAutomationError('页面日期=2026年3月22日')) as wait, \
+            patch('targeted_image_backfill._user32', return_value=user32), \
+            patch('targeted_image_backfill.date', wraps=date) as clock, \
+            patch('targeted_image_backfill.time.sleep'):
+        clock.today.return_value = today
+        with pytest.raises(ChatAutomationError, match='页面日期'):
+            select_day(Mock(), history, '测试群', 'chat-id', date(2026, 3, 24))
+    assert wait.call_count == attempts
+
+
 def test_expired_attempts_only_skips_confirmed_expiry(tmp_path):
     """缩略图未补成原图时仍可重试，微信明确过期的消息才跳过。"""
     journal = tmp_path / 'attempts.jsonl'

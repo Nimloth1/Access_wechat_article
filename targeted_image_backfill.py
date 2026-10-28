@@ -49,6 +49,7 @@ PREVIEW_ID = re.compile(r'^PreviewWindow_(.+)_(\d+)_(\d+)_\d+_\d+$')
 IMAGE_ROW = re.compile(r'^图片(?: .+)? (\d{2}:\d{2})$')
 ROW_DATE = re.compile(r'(?:^|\s)((?:(?:\d{4}年)?\d{1,2}月\d{1,2}日(?:\s+星期[一二三四五六日天])?'
                       r'|今天|昨天|前天|星期[一二三四五六日天])\s+\d{1,2}:\d{2})$')
+ROW_TIME_ONLY = re.compile(r'(?:^|\s)\d{1,2}:\d{2}$')
 ATTEMPT_LOG = LOG_DIR / 'targeted_image_attempts.jsonl'
 
 
@@ -338,7 +339,8 @@ def select_day(adapter, history, chat, session_id, day, *, sunday_first=False):
     try:
         return wait_for_date_heading(session_id, heading)
     except ChatAutomationError:
-        if sunday_first:
+        # 当天未匹配不是星期列错位，按周日首列重试只会点到别的日期。
+        if sunday_first or day == date.today():
             raise
         print(f'{day}: 日期筛选未匹配，按周日首列重试', flush=True)
         return select_day(adapter, history, chat, session_id, day, sunday_first=True)
@@ -366,6 +368,9 @@ def wait_for_date_heading(session_id, heading):
                     continue
                 stamp = ROW_DATE.search(row.Name)
                 if stamp and target_day is not None and message_day(stamp.group(1), today) == target_day:
+                    return history
+                # 微信只给当天消息显示纯时分；目标日是今天时它就是目标日的附件。
+                if not stamp and target_day == today and ROW_TIME_ONLY.search(row.Name):
                     return history
         observed.update(name for name in labels
                         if re.fullmatch(r'\d{4}年\d{1,2}月\d{1,2}日', name))
