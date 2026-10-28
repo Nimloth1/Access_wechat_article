@@ -4,7 +4,7 @@ from collections.abc import Callable, Iterable
 import ctypes
 from ctypes import wintypes
 import platform
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import time
 from typing import Any
 
@@ -17,6 +17,17 @@ WECHAT_HOME_PROCESS = "wechatappex.exe"
 WECHAT_CHROME_CLASS_MARKER = "chrome_widgetwin"
 
 _USER32 = ctypes.windll.user32 if platform.system() == "Windows" else None
+_KERNEL32 = None
+if platform.system() == "Windows":
+    # 独立实例，避免改动全局 windll.kernel32 的签名；64 位句柄需显式 restype。
+    _KERNEL32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _KERNEL32.OpenProcess.restype = wintypes.HANDLE
+    _KERNEL32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    _KERNEL32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+    _KERNEL32.QueryFullProcessImageNameW.argtypes = (
+        wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD))
+    _KERNEL32.CloseHandle.argtypes = (wintypes.HANDLE,)
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 _ENUM_WINDOWS_PROC = (
     ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
     if platform.system() == "Windows"
@@ -152,6 +163,8 @@ def enumerate_win32_windows(*, user32: Any | None = None) -> list[WindowInfo]:
         return []
 
     windows: list[WindowInfo] = []
+    # 同一进程常有几十个顶层窗口；一次枚举内按 PID 只查一次进程名。
+    process_names: dict[int, str] = {}
 
     @_ENUM_WINDOWS_PROC
     def callback(handle: int, _lparam: int) -> bool:
@@ -165,7 +178,10 @@ def enumerate_win32_windows(*, user32: Any | None = None) -> list[WindowInfo]:
             resolved_handle,
             ctypes.byref(process_id),
         )
-        process_name = _process_name(int(process_id.value))
+        resolved_pid = int(process_id.value)
+        if resolved_pid not in process_names:
+            process_names[resolved_pid] = _process_name(resolved_pid)
+        process_name = process_names[resolved_pid]
         normalized_process = process_name.lower()
         if (
             not title
@@ -294,12 +310,32 @@ def _window_rect(user32: Any, handle: int) -> tuple[int, int, int, int]:
 def _process_name(process_id: int) -> str:
     if process_id <= 0:
         return ""
+    image_name = _process_image_name(process_id)
+    if image_name:
+        return image_name
     try:
         import psutil
 
         return Path(str(psutil.Process(process_id).name() or "")).name
     except Exception:
         return ""
+
+
+def _process_image_name(process_id: int) -> str:
+    """用受限查询权限读映像名；psutil 对挂起的 Office 自动化进程每次要约 0.1 秒。"""
+    if _KERNEL32 is None:
+        return ""
+    handle = _KERNEL32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, process_id)
+    if not handle:
+        return ""
+    try:
+        buffer = ctypes.create_unicode_buffer(32768)
+        size = wintypes.DWORD(len(buffer))
+        if not _KERNEL32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
+            return ""
+        return PureWindowsPath(buffer.value).name
+    finally:
+        _KERNEL32.CloseHandle(handle)
 
 
 def _is_minimized_window(handle: int, *, user32: Any | None = None) -> bool:

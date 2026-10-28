@@ -97,5 +97,61 @@ class WechatHomeWindowFinderTests(unittest.TestCase):
                 finder.find_wechat_home_window(enumerate_windows=lambda: [window])
 
 
+    @unittest.skipUnless(finder._ENUM_WINDOWS_PROC is not None, "需要 Windows ctypes 回调")
+    def test_win32_enumeration_resolves_each_process_once(self) -> None:
+        """同一进程的多个顶层窗口只查询一次进程名。"""
+        class FakeUser32:
+            def EnumWindows(self, callback, _lparam):
+                for handle in (101, 102, 103):
+                    callback(handle, 0)
+                return True
+
+            def GetWindowTextLengthW(self, _handle):
+                return 0
+
+            def GetWindowTextW(self, _handle, _buffer, _length):
+                return 0
+
+            def GetClassNameW(self, _handle, _buffer, _length):
+                return 0
+
+            def GetWindowThreadProcessId(self, _handle, process_id):
+                process_id._obj.value = 4242
+                return 1
+
+            def GetWindowRect(self, _handle, _rect):
+                return 0
+
+            def IsWindowVisible(self, _handle):
+                return 1
+
+            def IsIconic(self, _handle):
+                return 0
+
+        with patch.object(finder, "_process_name", return_value="Weixin.exe") as process_name:
+            windows = finder.enumerate_win32_windows(user32=FakeUser32())
+
+        self.assertEqual([w.handle for w in windows], [101, 102, 103])
+        process_name.assert_called_once_with(4242)
+
+    def test_process_name_prefers_image_name_over_psutil(self) -> None:
+        """映像名可读时不走 psutil：它对挂起的 Office 进程每次约 0.1 秒。"""
+        with (
+            patch.object(finder, "_process_image_name", return_value="Weixin.exe"),
+            patch("psutil.Process") as process,
+        ):
+            self.assertEqual(finder._process_name(4242), "Weixin.exe")
+        process.assert_not_called()
+
+    def test_process_name_falls_back_to_psutil(self) -> None:
+        """映像名查询失败时仍用 psutil。"""
+        with (
+            patch.object(finder, "_process_image_name", return_value=""),
+            patch("psutil.Process") as process,
+        ):
+            process.return_value.name.return_value = "WeChatAppEx.exe"
+            self.assertEqual(finder._process_name(4242), "WeChatAppEx.exe")
+
+
 if __name__ == "__main__":
     unittest.main()
