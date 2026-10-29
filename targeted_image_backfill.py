@@ -451,7 +451,7 @@ def write_diagnostic(path, event, **data):
 
 def run_day(adapter, history, chat, session_id, day, targets, export_root, export_chat, limit,
             *, locate_only=False, diagnostic_log=None):
-    """列表末尾仍缺目标时重建查询一次，不在同一结果集上空滚。"""
+    """列表末尾仍缺目标时重建查询一次，不在同一结果集上空滚；返回处理数和当前记录窗口。"""
     handled = 0
     for attempt in range(2):
         handled += scan_day(adapter, history, chat, session_id, day, targets,
@@ -467,7 +467,7 @@ def run_day(adapter, history, chat, session_id, day, targets, export_root, expor
                              remaining_keys=sorted(item['key'] for item in targets.values()))
             close_history(adapter, chat, session_id)
             history = history_window(adapter, adapter.open_chat(chat), chat, session_id)
-    return handled
+    return handled, history
 
 
 def scan_day(adapter, history, chat, session_id, day, targets, export_root, export_chat, limit,
@@ -651,10 +651,13 @@ def main():
                     if args.max_items and handled >= args.max_items:
                         break
                     print(f'{day}: 缺口 {len(targets)} 张', flush=True)
-                    handled += run_day(adapter, history, args.chat, session_id, day, targets,
-                                       args.export_root, export_chat,
-                                       args.max_items - handled if args.max_items else 0,
-                                       locate_only=args.locate_only, diagnostic_log=args.diagnostic_log)
+                    # 重建查询会关掉旧记录窗口，下一天必须用新窗口。
+                    count, history = run_day(adapter, history, args.chat, session_id, day, targets,
+                                             args.export_root, export_chat,
+                                             args.max_items - handled if args.max_items else 0,
+                                             locate_only=args.locate_only,
+                                             diagnostic_log=args.diagnostic_log)
+                    handled += count
                     if targets:
                         print(f'{day}: 尚未定位 {len(targets)} 张', flush=True)
                 print(f'本次已核验 {handled} 张；重新运行会按当前落盘状态选缺口。', flush=True)

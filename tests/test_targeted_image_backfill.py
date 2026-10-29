@@ -516,9 +516,10 @@ def test_stalled_date_query_rebuilds_window_and_verifies_preview_without_downloa
             patch.object(backfill, 'validated_window_click') as download, \
             patch.object(backfill, 'current_state') as state, \
             patch.object(backfill, 'record_attempt') as attempt, patch.object(backfill.time, 'sleep'):
-        count = backfill.run_day(adapter, old, '群', 'chat-id', date(2026, 10, 15), targets,
-                                 tmp_path, '群', 0, locate_only=True, diagnostic_log=evidence)
+        count, current = backfill.run_day(adapter, old, '群', 'chat-id', date(2026, 10, 15), targets,
+                                          tmp_path, '群', 0, locate_only=True, diagnostic_log=evidence)
     assert count == 1 and not targets
+    assert current.control == 'fresh'
     close.assert_called_once_with(adapter, '群', 'chat-id')
     history.assert_called_once()
     download.assert_not_called()
@@ -543,10 +544,12 @@ def test_query_rebuild_is_bounded_and_respects_limit_or_cancel(handled, limit, c
     with patch.object(backfill, 'scan_day', return_value=handled) as scan, \
             patch.object(backfill, 'close_history') as close, \
             patch.object(backfill, 'history_window', return_value=SimpleNamespace(handle=2)):
-        backfill.run_day(adapter, SimpleNamespace(handle=1), '群', 'chat', date(2026, 10, 15),
-                         targets, None, '群', limit)
+        _, history = backfill.run_day(adapter, SimpleNamespace(handle=1), '群', 'chat', date(2026, 10, 15),
+                                      targets, None, '群', limit)
     assert scan.call_count == scans
     assert close.call_count == scans - 1
+    # 重建后旧窗口已关闭，必须把新窗口交回给下一天。
+    assert history.handle == (2 if scans == 2 else 1)
     assert targets
 
 
@@ -561,6 +564,34 @@ def test_preview_image_rejects_wrong_session_or_unparseable_identity(automation_
             patch.object(backfill, 'one_window', return_value=preview):
         with pytest.raises(ChatAutomationError, match='无法与目标群对应'):
             preview_image(Mock(), SimpleNamespace(control=object()), '群', row, 'chat-id')
+
+
+def test_main_passes_rebuilt_history_window_to_next_day(tmp_path):
+    """前一天重建查询后旧窗口已关闭，下一天必须用新窗口。"""
+    options = SimpleNamespace(chat='群', export_chat=None, export_root=tmp_path,
+                              since=date(2026, 10, 29), max_items=0, target_ids_file=None,
+                              locate_only=False, retry_expired=True, diagnostic_log=None)
+    items = [{'session_id': 'chat', 'message_id': n, 'kind': 'image', 'state': 'thumbnail',
+              'timestamp': stamp, 'local_id': n, 'key': f'chat:{n}:{stamp}'}
+             for n, stamp in [(1, 1793170800), (2, 1793289000)]]  # 相隔 30 多小时，任何时区都分属两天
+    adapter = Mock()
+    adapter.compatibility.return_value = nullcontext()
+    first, rebuilt = SimpleNamespace(handle=1), SimpleNamespace(handle=2)
+    seen = []
+
+    def run(adapter, history, *args, **kwargs):
+        seen.append(history)
+        return 1, rebuilt
+
+    with patch.object(backfill, 'parse_args', return_value=options), \
+            patch.object(backfill, 'load_inventory', return_value=('chat', items)), \
+            patch.object(backfill, 'task_lock', return_value=nullcontext()), \
+            patch.object(backfill, 'WechatChatAdapter', return_value=adapter), \
+            patch.object(backfill, 'close_preview'), patch.object(backfill, 'close_history'), \
+            patch.object(backfill, 'history_window', return_value=first), \
+            patch.object(backfill, 'run_day', side_effect=run):
+        backfill.main()
+    assert seen == [first, rebuilt]
 
 
 @pytest.mark.parametrize('located', [False, True])
@@ -582,7 +613,7 @@ def test_locate_cli_includes_originals_and_requires_actual_location(tmp_path, lo
         assert args[5] == {(item['timestamp'], item['local_id']): item}
         if located:
             args[5].clear()
-        return int(located)
+        return int(located), args[1]
 
     with patch.object(backfill, 'parse_args', return_value=options), \
             patch.object(backfill, 'load_inventory', return_value=('chat', [item])), \
