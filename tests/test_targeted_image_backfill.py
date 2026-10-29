@@ -289,6 +289,17 @@ def test_expired_attempts_only_skips_confirmed_expiry(tmp_path):
         assert [entry['result'] for entry in entries] == ['thumbnail', 'expired']
 
 
+def test_current_state_finds_image_in_previous_day_export(tmp_path):
+    # 北京时间 23:50 的图片在东京时间已是次日，仍在前一天的日导出里。
+    message = {'timestamp': 1793202631, 'local_id': 4241763, 'message_id': 'm1',
+               'attachment': {'kind': 'image'}}
+    payload = {'conversations': [{'session_name': '群', 'session_id': 's1', 'messages': [message]}]}
+    (tmp_path / 'wechat_date_json_20261028.json').write_text(json.dumps(payload), encoding='utf-8')
+    expected = backfill.load_inventory(tmp_path, '群')[1][0]['state']
+
+    assert backfill.current_state(tmp_path, '群', date(2026, 10, 29), 4241763, 1793202631) == expected
+
+
 def test_validated_window_click_checks_owner_then_posts_client_click():
     """窗口消息点击前仍执行前台和坐标归属校验。"""
     control = SimpleNamespace(BoundingRectangle=(110, 220, 130, 240))

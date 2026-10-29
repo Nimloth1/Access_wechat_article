@@ -30,7 +30,7 @@ import argparse
 from collections import defaultdict
 import ctypes
 from ctypes import wintypes
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 import json
 import re
 from pathlib import Path
@@ -415,7 +415,8 @@ def preview_image(adapter, history, chat, row, session_id):
 
 def current_state(export_root, chat, day, local_id, timestamp):
     """从清单重新核验一条图片是否已生成原图。"""
-    _, items = load_inventory(export_root, chat, since=day, until=day)
+    # day 是本机日期，日导出按北京时间分天；本机在东八区以东时消息可能落在前一天的导出里。
+    _, items = load_inventory(export_root, chat, since=day - timedelta(days=1), until=day)
     matches = [item for item in items if item['local_id'] == local_id and
                item['timestamp'] == timestamp and item['kind'] == 'image']
     return unique(matches, '清单图片')['state']
